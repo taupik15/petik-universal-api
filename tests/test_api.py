@@ -29,7 +29,7 @@ def test_health_endpoint_and_version():
     response = client.get("/health")
     assert response.status_code == 200
     assert response.json()["status"] == "healthy"
-    assert response.json()["version"] == "1.4.0"
+    assert response.json()["version"] == "1.5.0"
     assert "javascriptRuntime" in response.json()
 
 
@@ -356,3 +356,8 @@ def test_preview_not_blocked_by_busy_download_slot_or_download_rate_limit(monkey
             assert r.status_code == 200
     finally:
         api.download_slots.release()
+
+
+def test_health_reports_ytdlp_version():
+    body = client.get("/health").json()
+    assert body["ytdlpVersion"] and body["ytdlpVersion"] != ""
