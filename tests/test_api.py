@@ -29,7 +29,7 @@ def test_health_endpoint_and_version():
     response = client.get("/health")
     assert response.status_code == 200
     assert response.json()["status"] == "healthy"
-    assert response.json()["version"] == "1.2.0"
+    assert response.json()["version"] == "1.3.0"
     assert "javascriptRuntime" in response.json()
 
 
@@ -297,3 +297,36 @@ def test_download_options_respect_quality_limit(monkeypatch, tmp_path):
     assert filename == "Video.mp4"
     assert "height<=720" in captured["format"]
     assert captured["postprocessors"] == []
+
+
+def test_preview_endpoint_forwards_range_and_streams_bytes(monkeypatch):
+    from io import BytesIO
+
+    class Headers(dict):
+        def get(self, key, default=None):
+            return super().get(key, default)
+
+    class FakeUpstream(BytesIO):
+        status = 206
+        headers = Headers({
+            "Content-Type": "video/mp4", "Content-Length": "4",
+            "Content-Range": "bytes 0-3/10", "Accept-Ranges": "bytes",
+        })
+
+    captured = {}
+    no_rate_limit(monkeypatch)
+    monkeypatch.setattr(api, "_preview_source", lambda _url: ("https://cdn.example/video.mp4", {}))
+    def fake_urlopen(request, timeout=30):
+        captured["range"] = request.headers.get("Range")
+        return FakeUpstream(b"test")
+    monkeypatch.setattr(api.urllib.request, "urlopen", fake_urlopen)
+
+    response = client.get(
+        "/api/preview",
+        params={"url": "https://www.instagram.com/reel/ABC123/"},
+        headers={"Range": "bytes=0-3"},
+    )
+    assert response.status_code == 206
+    assert response.content == b"test"
+    assert response.headers["content-range"] == "bytes 0-3/10"
+    assert captured["range"] == "bytes=0-3"
