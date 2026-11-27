@@ -7,16 +7,18 @@ import secrets
 import tempfile
 import threading
 import time
+import urllib.error
+import urllib.request
 from collections import defaultdict, deque
 from pathlib import Path
 from urllib.parse import urlparse
 
 from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse, JSONResponse
+from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 from yt_dlp import YoutubeDL
 
-APP_VERSION = "1.2.0"
+APP_VERSION = "1.3.0"
 MAX_FILE_BYTES = int(os.getenv("MAX_FILE_MB", "140")) * 1024 * 1024
 FILE_TTL_SECONDS = int(os.getenv("FILE_TTL_SECONDS", "1800"))
 MAX_DURATION_SECONDS = int(os.getenv("MAX_DURATION_SECONDS", "3600"))
@@ -65,6 +67,7 @@ download_slots = threading.BoundedSemaphore(MAX_CONCURRENT)
 active_files: dict[str, tuple[Path, str, float]] = {}
 rate_events: dict[str, deque[float]] = defaultdict(deque)
 state_lock = threading.Lock()
+preview_cache: dict[str, tuple[str, dict, float]] = {}
 
 
 def _base_url(request: Request) -> str:
@@ -500,6 +503,81 @@ def health():
         "javascriptRuntime": "deno" if shutil.which("deno") else "missing",
     }
 
+
+
+def _preview_source(url: str) -> tuple[str, dict]:
+    """Resolve and briefly cache a browser-playable progressive media URL."""
+    now = time.time()
+    with state_lock:
+        cached = preview_cache.get(url)
+        if cached and cached[2] > now:
+            return cached[0], cached[1]
+    info = _extract_info(url)
+    media_url = _preview_url(info, _normalise_and_validate(url)[1])
+    if not media_url:
+        raise RuntimeError("Sumber tidak menyediakan stream video langsung untuk pratinjau.")
+    headers = {str(k): str(v) for k, v in (info.get("http_headers") or {}).items()}
+    headers.setdefault("User-Agent", "Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) AppleWebKit/605.1.15 Version/17.0 Mobile/15E148 Safari/604.1")
+    with state_lock:
+        preview_cache[url] = (media_url, headers, now + 240)
+        for key, value in list(preview_cache.items()):
+            if value[2] <= now:
+                preview_cache.pop(key, None)
+    return media_url, headers
+
+
+@app.get("/api/preview")
+def preview_media(request: Request, url: str):
+    """Range-aware media proxy so Safari can play, pause and seek inline previews."""
+    limited = _acquire(request)
+    if limited:
+        return limited
+    upstream = None
+    try:
+        normalised, error = _normalise_request({"url": url})
+        if error:
+            download_slots.release()
+            return error
+        source_url, _platform = normalised
+        media_url, upstream_headers = _preview_source(source_url)
+        headers = dict(upstream_headers)
+        range_header = request.headers.get("range")
+        if range_header:
+            headers["Range"] = range_header
+        req = urllib.request.Request(media_url, headers=headers, method="GET")
+        try:
+            upstream = urllib.request.urlopen(req, timeout=30)
+        except urllib.error.HTTPError as exc:
+            upstream = exc
+        status = getattr(upstream, "status", 200)
+        content_type = upstream.headers.get("Content-Type", "video/mp4")
+        response_headers = {
+            "Accept-Ranges": upstream.headers.get("Accept-Ranges", "bytes"),
+            "Content-Type": content_type,
+            "Cache-Control": "private, max-age=60",
+            "X-Content-Type-Options": "nosniff",
+        }
+        for key in ("Content-Length", "Content-Range"):
+            value = upstream.headers.get(key)
+            if value:
+                response_headers[key] = value
+        def stream():
+            try:
+                while True:
+                    chunk = upstream.read(256 * 1024)
+                    if not chunk:
+                        break
+                    yield chunk
+            finally:
+                upstream.close()
+                download_slots.release()
+        return StreamingResponse(stream(), status_code=status, headers=response_headers, media_type=None)
+    except Exception as exc:
+        if upstream is not None:
+            try: upstream.close()
+            except Exception: pass
+        download_slots.release()
+        return JSONResponse({"success": False, "error": str(exc)[:300]}, status_code=502)
 
 @app.post("/api/inspect")
 def inspect_media(payload: dict, request: Request):
