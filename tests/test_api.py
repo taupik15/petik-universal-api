@@ -29,7 +29,7 @@ def test_health_endpoint_and_version():
     response = client.get("/health")
     assert response.status_code == 200
     assert response.json()["status"] == "healthy"
-    assert response.json()["version"] == "1.6.1"
+    assert response.json()["version"] == "1.6.2"
     assert "javascriptRuntime" in response.json()
 
 
@@ -627,7 +627,7 @@ def test_instagram_public_graphql_normalizes_photo_carousel_and_skips_video():
         "https://scontent.cdninstagram.com/a.jpg",
         "https://scontent.cdninstagram.com/c.jpg",
     ]
-    assert [item["id"] for item in items] == [1, 2]
+    assert [item["id"] for item in items] == [1, 3]
 
 
 def test_instagram_public_fallback_uses_anonymous_graphql_session(monkeypatch):
@@ -639,33 +639,44 @@ def test_instagram_public_fallback_uses_anonymous_graphql_session(monkeypatch):
     }}}
     class FakeResponse:
         status_code = 200
+        url = "https://www.instagram.com/"
+        text = '<script id="__eqmc">{"l":"anon-lsd"}</script>'
         def __init__(self, data=None): self._data = data
         def json(self): return self._data
     class FakeSession:
-        def __init__(self): self.cookies = {"csrftoken": "anonymous"}; self.calls = []
+        def __init__(self, **kwargs): self.cookies = {"csrftoken": "anonymous"}; self.calls = []; self.kwargs = kwargs
         def get(self, url, **kwargs):
-            self.calls.append((url, kwargs))
-            return FakeResponse(payload) if "graphql/query" in url else FakeResponse()
+            self.calls.append(("GET", url, kwargs))
+            if "get_ruling_for_content" in url: return FakeResponse({"status": "ok"})
+            return FakeResponse()
+        def post(self, url, **kwargs):
+            self.calls.append(("POST", url, kwargs))
+            return FakeResponse(payload)
+        def close(self): pass
     class FakeCurl:
         last_session = None
         @classmethod
-        def Session(cls):
-            cls.last_session = FakeSession()
+        def Session(cls, **kwargs):
+            cls.last_session = FakeSession(**kwargs)
             return cls.last_session
     monkeypatch.setattr(api, "curl_requests", FakeCurl)
     monkeypatch.setattr(api, "HAS_CURL_CFFI", True)
     items = api._instagram_public_gallery("https://www.instagram.com/p/ABC123/")
     assert len(items) == 2
-    assert len(FakeCurl.last_session.calls) == 2
-    assert FakeCurl.last_session.impersonate == "chrome124"
+    assert len(FakeCurl.last_session.calls) == 4
+    assert FakeCurl.last_session.kwargs == {"impersonate": "chrome"}
+    assert any(call[0] == "POST" and "api/graphql" in call[1] for call in FakeCurl.last_session.calls)
     assert "cookies.txt" not in str(FakeCurl.last_session.calls)
 
 
 def test_health_reports_gallery_and_public_fallback_capabilities():
     body = client.get("/health").json()
-    assert body["version"] == "1.6.1"
+    assert body["version"] == "1.6.2"
     assert "threads" in body["galleryPlatforms"]
     assert body["threadsPhotoResolver"] == "public-page-json"
+    assert body["instagramPhotoResolver"] == "gallery-dl+logged-out-graphql+page-json"
+    assert body["facebookPhotoResolver"] == "gallery-dl+logged-out-page-html"
+    assert isinstance(body["socialPublicFallbackAvailable"], bool)
     assert isinstance(body["instagramPublicFallbackAvailable"], bool)
 
 
@@ -721,3 +732,152 @@ def test_threads_stream_rejects_unsafe_initial_host_before_network_request():
         else:
             raise AssertionError("Unsafe initial host must be rejected")
     assert calls == []
+
+
+
+def test_instagram_shortcode_to_numeric_media_id_matches_base64_alphabet():
+    assert api._instagram_shortcode_to_media_id("ABC") == str(0 * 64 * 64 + 1 * 64 + 2)
+
+
+def test_instagram_product_payload_parser_handles_carousel_and_video_mixture():
+    media = {"carousel_media": [
+        {"image_versions2": {"candidates": [
+            {"url": "https://scontent.cdninstagram.com/small.jpg", "width": 320, "height": 320},
+            {"url": "https://scontent.cdninstagram.com/large.jpg?format=jpg", "width": 1080, "height": 1080},
+        ]}},
+        {"video_versions": [{"url": "https://video.cdninstagram.com/clip.mp4"}],
+         "image_versions2": {"candidates": [{"url": "https://scontent.cdninstagram.com/poster.jpg", "width": 640, "height": 640}]}},
+        {"image_versions2": {"candidates": [{"url": "https://scontent.cdninstagram.com/second.webp?fm=webp", "width": 900, "height": 1200}]}},
+    ]}
+    items = api._instagram_photo_items(media)
+    assert [item["url"] for item in items] == [
+        "https://scontent.cdninstagram.com/large.jpg?format=jpg",
+        "https://scontent.cdninstagram.com/second.webp?fm=webp",
+    ]
+    assert [item["id"] for item in items] == [1, 3]
+
+
+def test_instagram_current_graphql_payload_unwraps_logged_out_media():
+    product = {"image_versions2": {"candidates": [{"url": "https://scontent.cdninstagram.com/one.jpg", "width": 900, "height": 900}]}}
+    root = {"data": {"xig_polaris_media": {"if_not_gated_logged_out": product}}}
+    assert api._instagram_find_product_info(root) == product
+
+
+def test_facebook_public_html_parser_extracts_deduplicated_cdn_photos():
+    html = ('''<html><head>
+      <meta property="og:image" content="https://scontent.xx.fbcdn.net/v/t39.30808-6/a.jpg?stp=abc&amp;oe=123">
+      <meta property="og:image" content="https://scontent.xx.fbcdn.net/v/t39.30808-6/a.jpg?stp=abc&amp;oe=123">
+    </head><body><script>"image_uri":"https:\\/\\/scontent.xx.fbcdn.net\\/v\\/t39.30808-6\\/b.webp?format=webp&amp;oe=999"</script></body></html>''')
+    items = api._facebook_photo_items_from_html(html)
+    assert len(items) == 2
+    assert items[0]["extension"] == "jpg"
+    assert items[1]["extension"] == "webp"
+
+
+def test_social_media_hosts_allow_only_meta_image_cdns():
+    assert api._safe_social_media_url("https://scontent.xx.fbcdn.net/photo.jpg")
+    assert api._safe_social_media_url("https://scontent.cdninstagram.com/photo.jpg")
+    assert not api._safe_social_media_url("https://example.com/photo.jpg")
+    assert not api._safe_social_media_url("http://scontent.xx.fbcdn.net/photo.jpg")
+    assert not api._safe_social_media_url("https://127.0.0.1/photo.jpg")
+
+
+
+def test_inspect_falls_back_to_instagram_photo_resolver_after_no_video_error(monkeypatch):
+    no_rate_limit(monkeypatch)
+    monkeypatch.setattr(api, "_extract_info", lambda _url: (_ for _ in ()).throw(RuntimeError("There is no video in this post")))
+    monkeypatch.setattr(api, "_gallery_list_images", lambda _url, _platform: [])
+    monkeypatch.setattr(api, "_instagram_public_gallery", lambda _url: sample_photo_items())
+    response = client.post("/api/inspect", json={"url": "https://www.instagram.com/p/ABC123/"})
+    assert response.status_code == 200
+    assert response.json()["galleryAvailable"] is True
+    assert len(response.json()["photoItems"]) == 2
+
+
+def test_inspect_falls_back_to_facebook_public_page_resolver(monkeypatch):
+    no_rate_limit(monkeypatch)
+    monkeypatch.setattr(api, "_extract_info", lambda _url: (_ for _ in ()).throw(RuntimeError("Unsupported URL")))
+    monkeypatch.setattr(api, "_gallery_list_images", lambda _url, _platform: [])
+    monkeypatch.setattr(api, "_facebook_public_gallery", lambda _url: sample_photo_items())
+    response = client.post("/api/inspect", json={"url": "https://www.facebook.com/photo/?fbid=123"})
+    assert response.status_code == 200
+    assert response.json()["galleryAvailable"] is True
+    assert response.json()["service"] == "facebook"
+
+
+def test_instagram_photo_error_is_reported_as_gallery_access_issue():
+    result = api._extract_error(RuntimeError("There is no video in this post"), "instagram")
+    assert result.status_code == 502
+    assert result.body
+    assert b"Petik sudah mencoba extractor foto" in result.body
+
+
+def test_social_gallery_download_fetches_meta_cdn_and_checks_image_bytes(monkeypatch, tmp_path):
+    import httpx
+    image_bytes = b"\xff\xd8\xff" + b"petik-social-test-jpeg"
+    transport = httpx.MockTransport(lambda request: httpx.Response(
+        200, headers={"Content-Type": "image/jpeg"}, content=image_bytes, request=request
+    ))
+    original_client = httpx.Client
+    monkeypatch.setattr(api, "TEMP_ROOT", tmp_path)
+    monkeypatch.setattr(api.httpx, "Client", lambda **kwargs: original_client(transport=transport, **kwargs))
+    items = [{"id": 1, "url": "https://scontent.cdninstagram.com/test.jpg", "extension": "jpg"}]
+    folder, files = api._download_social_gallery_items(
+        "https://www.instagram.com/p/ABC123/", "instagram", items, [1]
+    )
+    assert len(files) == 1
+    assert files[0].read_bytes() == image_bytes
+    assert files[0].suffix == ".jpg"
+    import shutil as _shutil
+    _shutil.rmtree(folder, ignore_errors=True)
+
+
+def test_social_media_stream_rejects_redirect_to_unapproved_host():
+    import httpx
+    calls = []
+    def handler(request):
+        calls.append(str(request.url))
+        return httpx.Response(302, headers={"Location": "https://example.com/private.jpg"}, request=request)
+    with httpx.Client(transport=httpx.MockTransport(handler), follow_redirects=False) as client_http:
+        try:
+            with api._safe_social_stream(client_http, "https://scontent.xx.fbcdn.net/photo.jpg"):
+                pass
+        except RuntimeError as exc:
+            assert "Pengalihan CDN" in str(exc)
+        else:
+            raise AssertionError("External CDN redirect must be rejected")
+    assert len(calls) == 1
+
+
+
+def test_instagram_gallery_download_routes_through_public_cdn_items(monkeypatch, tmp_path):
+    no_rate_limit(monkeypatch)
+    monkeypatch.setattr(api, "TEMP_ROOT", tmp_path)
+    calls = []
+    def fake_download(url, platform, items, indices):
+        calls.append((url, platform, [item["id"] for item in items], indices))
+        folder = tmp_path / "instagram-download"
+        folder.mkdir(exist_ok=True)
+        file_path = folder / "foto-001.jpg"
+        file_path.write_bytes(b"\xff\xd8\xfftest")
+        return folder, [file_path]
+    monkeypatch.setattr(api, "_gallery_list_images", lambda _url, _platform: [{
+        "id": 1, "url": "https://scontent.cdninstagram.com/photo.jpg", "extension": "jpg"
+    }])
+    monkeypatch.setattr(api, "_download_social_gallery_items", fake_download)
+    monkeypatch.setattr(api, "_download_gallery_files", lambda *_args: (_ for _ in ()).throw(AssertionError("fallback not expected")))
+    monkeypatch.setattr(api, "_store_file", lambda *_args: "test-token")
+    response = client.post("/api/gallery/download", json={
+        "url": "https://www.instagram.com/p/ABC123/", "indices": [1], "zip": True
+    })
+    assert response.status_code == 200
+    assert response.json()["status"] == "tunnel"
+    assert response.json()["service"] == "instagram"
+    assert calls and calls[0][1:] == ("instagram", [1], [1])
+
+
+
+def test_facebook_unsupported_url_gets_public_access_message():
+    result = api._extract_error(RuntimeError("Unsupported URL"), "facebook")
+    assert result.status_code == 502
+    assert b"Facebook tidak mengembalikan data media publik" in result.body
