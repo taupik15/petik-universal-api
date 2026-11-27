@@ -16,22 +16,21 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, JSONResponse
 from yt_dlp import YoutubeDL
 
-APP_VERSION = "1.0.0"
+APP_VERSION = "1.1.0"
 MAX_FILE_BYTES = int(os.getenv("MAX_FILE_MB", "140")) * 1024 * 1024
 FILE_TTL_SECONDS = int(os.getenv("FILE_TTL_SECONDS", "1800"))
 MAX_DURATION_SECONDS = int(os.getenv("MAX_DURATION_SECONDS", "3600"))
 MAX_CONCURRENT = max(1, int(os.getenv("MAX_CONCURRENT_DOWNLOADS", "1")))
-RATE_LIMIT_COUNT = max(1, int(os.getenv("RATE_LIMIT_COUNT", "8")))
+RATE_LIMIT_COUNT = max(1, int(os.getenv("RATE_LIMIT_COUNT", "20")))
 RATE_LIMIT_WINDOW = max(60, int(os.getenv("RATE_LIMIT_WINDOW_SECONDS", "300")))
 TEMP_ROOT = Path(os.getenv("TEMP_DIR", "/tmp/petik-media"))
 TEMP_ROOT.mkdir(parents=True, exist_ok=True)
 
 SERVICES = [
     "youtube", "instagram", "facebook", "tiktok", "twitter",
-    "reddit", "vimeo", "pinterest", "soundcloud", "telegram", "threads",
+    "reddit", "vimeo", "pinterest", "soundcloud", "telegram", "threads", "snapchat",
 ]
 
-# Only accept URLs from the platforms explicitly supported by this service.
 HOSTS = {
     "youtube.com", "youtu.be", "youtube-nocookie.com",
     "instagram.com", "instagr.am",
@@ -44,10 +43,15 @@ HOSTS = {
     "soundcloud.com",
     "t.me", "telegram.me",
     "threads.net", "threads.com",
+    "snapchat.com",
 }
 
 app = FastAPI(title="Petik Universal Extractor API", version=APP_VERSION)
-allowed_origins = [item.strip() for item in os.getenv("ALLOWED_ORIGINS", "https://taupik15.github.io").split(",") if item.strip()]
+allowed_origins = [
+    item.strip()
+    for item in os.getenv("ALLOWED_ORIGINS", "https://taupik15.github.io").split(",")
+    if item.strip()
+]
 app.add_middleware(
     CORSMiddleware,
     allow_origins=allowed_origins,
@@ -73,9 +77,8 @@ def _base_url(request: Request) -> str:
 
 
 def _client_key(request: Request) -> str:
-    # Render/Cloudflare supply the connecting IP. This is used only for a soft per-IP limit.
-    return (request.headers.get("cf-connecting-ip") or request.headers.get("x-forwarded-for", "").split(",", 1)[0].strip()
-            or (request.client.host if request.client else "unknown"))[:80]
+    forwarded = request.headers.get("x-forwarded-for", "").strip()
+    return (request.headers.get("cf-connecting-ip") or (forwarded.split(",")[-1].strip() if forwarded else "") or (request.client.host if request.client else "unknown"))[:80]
 
 
 def _rate_limited(key: str) -> bool:
@@ -96,12 +99,10 @@ def _cleanup_expired() -> None:
         expired = [token for token, (_, _, expiry) in active_files.items() if expiry <= now]
         for token in expired:
             path, _, _ = active_files.pop(token)
-            try:
-                shutil.rmtree(path.parent, ignore_errors=True)
-            except Exception:
-                pass
-    # Also clear abandoned temporary job folders left after an interrupted extraction.
-    cutoff = now - FILE_TTL_SECONDS
+            shutil.rmtree(path.parent, ignore_errors=True)
+    # A download may legitimately run near the one-hour media-duration cap.
+    # Keep abandoned in-progress folders longer than that cap before pruning.
+    cutoff = now - max(FILE_TTL_SECONDS * 2, MAX_DURATION_SECONDS + 3600)
     for folder in TEMP_ROOT.iterdir():
         try:
             if folder.is_dir() and folder.stat().st_mtime < cutoff:
@@ -127,7 +128,6 @@ def _normalise_and_validate(raw_url: str) -> tuple[str, str]:
     platform = "other"
     if host == "t.me" or host.endswith(".t.me") or host == "telegram.me":
         platform = "telegram"
-        # Telegram's public web extractor accepts channel/post_id links only.
         match = re.fullmatch(r"/(?:s/)?([A-Za-z0-9_]{3,})/(\d+)/?", path)
         if not match or match.group(1).lower() == "c":
             raise ValueError("Telegram hanya mendukung tautan postingan channel publik, misalnya t.me/channel/123.")
@@ -144,7 +144,7 @@ def _normalise_and_validate(raw_url: str) -> tuple[str, str]:
         platform = "pinterest"
     elif host == "soundcloud.com" or host.endswith(".soundcloud.com"):
         platform = "soundcloud"
-    elif host == "youtube.com" or host.endswith(".youtube.com") or host == "youtu.be" or host == "youtube-nocookie.com":
+    elif host == "youtube.com" or host.endswith(".youtube.com") or host in {"youtu.be", "youtube-nocookie.com"}:
         platform = "youtube"
     elif host == "instagram.com" or host.endswith(".instagram.com") or host == "instagr.am":
         platform = "instagram"
@@ -154,6 +154,8 @@ def _normalise_and_validate(raw_url: str) -> tuple[str, str]:
         platform = "tiktok"
     elif host in {"x.com", "twitter.com"} or host.endswith(".twitter.com"):
         platform = "twitter"
+    elif host == "snapchat.com" or host.endswith(".snapchat.com"):
+        platform = "snapchat"
     return value, platform
 
 
@@ -161,27 +163,123 @@ def _safe_filename(info: dict, suffix: str) -> str:
     title = str(info.get("title") or info.get("id") or "petik")
     title = re.sub(r"[\\/:*?\"<>|\x00-\x1f]+", " ", title)
     title = re.sub(r"\s+", " ", title).strip(" .")[:100] or "petik"
-    return f"{title}.{suffix}"
+    safe_suffix = re.sub(r"[^a-z0-9]+", "", suffix.lower()) or "bin"
+    return f"{title}.{safe_suffix}"
+
+
+def _yt_common_options() -> dict:
+    options = {
+        "noplaylist": True,
+        "quiet": True,
+        "no_warnings": True,
+        "ignoreerrors": False,
+        "retries": 2,
+        "extractor_retries": 2,
+        "socket_timeout": 25,
+        "cachedir": False,
+        "playlist_items": "1",
+    }
+    deno_path = shutil.which("deno")
+    if deno_path:
+        options["js_runtimes"] = {"deno": {"path": deno_path}}
+    return options
+
+
+def _extract_info(url: str) -> dict:
+    options = _yt_common_options()
+    options.update({"skip_download": True, "extract_flat": False})
+    with YoutubeDL(options) as ydl:
+        info = ydl.extract_info(url, download=False)
+    if not info:
+        raise RuntimeError("Platform tidak mengembalikan informasi media.")
+    if info.get("_type") == "playlist":
+        entries = [entry for entry in (info.get("entries") or []) if entry]
+        if not entries:
+            raise RuntimeError("Postingan tidak memiliki media yang bisa diproses.")
+        info = entries[0]
+    duration = info.get("duration")
+    if duration and duration > MAX_DURATION_SECONDS:
+        raise RuntimeError(f"Durasi melebihi batas {MAX_DURATION_SECONDS // 60} menit.")
+    return info
+
+
+def _available_options(info: dict, platform: str) -> tuple[list[dict], list[dict]]:
+    if platform == "soundcloud":
+        return [], [{"id": "best", "label": "MP3 · kualitas terbaik"}]
+
+    formats = info.get("formats") or []
+    heights: set[int] = set()
+    has_video = bool(info.get("vcodec") and info.get("vcodec") != "none")
+    has_audio = bool(info.get("acodec") and info.get("acodec") != "none")
+    for fmt in formats:
+        if fmt.get("acodec") and fmt.get("acodec") != "none":
+            has_audio = True
+        if fmt.get("vcodec") and fmt.get("vcodec") != "none":
+            has_video = True
+            height = fmt.get("height")
+            if isinstance(height, (int, float)) and 0 < height <= 4320:
+                heights.add(int(height))
+    # The user chooses an upper bound; yt-dlp picks the best available format under it.
+    video_options = [{"id": "max", "label": "Terbaik yang tersedia"}] if has_video else []
+    for height in sorted(heights, reverse=True):
+        video_options.append({"id": str(height), "label": f"Maksimal {height}p"})
+    audio_options = [{"id": "best", "label": "MP3 · kualitas terbaik"}] if has_audio else []
+    return video_options, audio_options
+
+
+def _safe_thumbnail(info: dict) -> str | None:
+    thumb = info.get("thumbnail")
+    if not isinstance(thumb, str):
+        return None
+    try:
+        parsed = urlparse(thumb)
+        return thumb if parsed.scheme in {"http", "https"} and parsed.hostname else None
+    except Exception:
+        return None
+
+
+def _inspect_payload(url: str, platform: str) -> dict:
+    info = _extract_info(url)
+    videos, audios = _available_options(info, platform)
+    title = str(info.get("title") or info.get("id") or "Media")[:300]
+    return {
+        "success": True,
+        "status": "ready",
+        "service": platform,
+        "title": title,
+        "author": str(info.get("uploader") or info.get("channel") or info.get("artist") or "")[:180] or None,
+        "duration": info.get("duration"),
+        "thumbnail": _safe_thumbnail(info),
+        "videoOptions": videos,
+        "audioOptions": audios,
+        "defaultVideoQuality": "max",
+        "defaultAudioQuality": "best",
+    }
 
 
 def _download_media(url: str, mode: str, quality: str) -> tuple[Path, str, dict]:
     job_dir = Path(tempfile.mkdtemp(prefix="job-", dir=TEMP_ROOT))
     outtmpl = str(job_dir / "%(id)s.%(ext)s")
-    quality = quality if quality in {"max", "1080", "720", "480", "360"} else "720"
+    quality = str(quality or "max").strip().lower()
+    if quality not in {"max", "best"}:
+        try:
+            height_limit = int(quality)
+            if not 144 <= height_limit <= 4320:
+                quality = "max"
+        except ValueError:
+            quality = "max"
     if mode == "audio":
         fmt = "bestaudio/best"
         postprocessors = [{
             "key": "FFmpegExtractAudio",
             "preferredcodec": "mp3",
-            "preferredquality": "192",
+            "preferredquality": "0",
         }]
     else:
-        if quality == "max":
+        if quality in {"max", "best"}:
             fmt = "bestvideo+bestaudio/best"
         else:
-            fmt = f"bestvideo[height<={quality}]+bestaudio/best[height<={quality}]/best"
-        # Let yt-dlp choose a compatible output container; forcing a remux can
-        # fail on source codecs/containers that MP4 cannot safely carry.
+            fmt = f"bestvideo[height<={quality}]+bestaudio/best[height<={quality}]"
         postprocessors = []
 
     def duration_filter(info: dict, *, incomplete: bool) -> str | None:
@@ -190,28 +288,21 @@ def _download_media(url: str, mode: str, quality: str) -> tuple[Path, str, dict]
             return f"Durasi melebihi batas {MAX_DURATION_SECONDS // 60} menit."
         return None
 
-    options = {
+    options = _yt_common_options()
+    options.update({
         "format": fmt,
         "outtmpl": outtmpl,
-        "noplaylist": True,
-        "quiet": True,
-        "no_warnings": True,
-        "ignoreerrors": False,
-        "retries": 1,
-        "extractor_retries": 1,
-        "socket_timeout": 25,
-        "max_filesize": MAX_FILE_BYTES,
         "match_filter": duration_filter,
+        "max_filesize": MAX_FILE_BYTES,
         "merge_output_format": "mp4",
         "postprocessors": postprocessors,
         "restrictfilenames": True,
         "windowsfilenames": True,
-        "cachedir": False,
         "overwrites": True,
         "noprogress": True,
         "concurrent_fragment_downloads": 3,
-        "fragment_retries": 1,
-    }
+        "fragment_retries": 2,
+    })
 
     try:
         with YoutubeDL(options) as ydl:
@@ -227,23 +318,87 @@ def _download_media(url: str, mode: str, quality: str) -> tuple[Path, str, dict]
         shutil.rmtree(job_dir, ignore_errors=True)
         raise
 
-    candidates = [p for p in job_dir.rglob("*") if p.is_file() and p.suffix.lower() not in {".jpg", ".jpeg", ".webp", ".json", ".description", ".vtt", ".srt", ".part"}]
+    candidates = [
+        path for path in job_dir.rglob("*")
+        if path.is_file() and path.suffix.lower() not in {
+            ".jpg", ".jpeg", ".webp", ".json", ".description", ".vtt", ".srt", ".part"
+        }
+    ]
     if not candidates:
         shutil.rmtree(job_dir, ignore_errors=True)
-        raise RuntimeError("Extractor berhasil membaca tautan, tetapi berkas media tidak terbentuk.")
-    file_path = max(candidates, key=lambda p: p.stat().st_size)
+        raise RuntimeError("Extractor membaca tautan, tetapi berkas media tidak terbentuk.")
+    file_path = max(candidates, key=lambda path: path.stat().st_size)
     size = file_path.stat().st_size
     if size <= 0 or size > MAX_FILE_BYTES:
         shutil.rmtree(job_dir, ignore_errors=True)
-        raise RuntimeError("Ukuran berkas di luar batas Petik (maksimal 140 MB).")
+        raise RuntimeError(f"Ukuran berkas di luar batas Petik (maksimal {MAX_FILE_BYTES // (1024 * 1024)} MB).")
     if mode == "audio" and file_path.suffix.lower() != ".mp3":
-        # The postprocessor should have produced MP3; fail instead of returning the wrong media type.
         shutil.rmtree(job_dir, ignore_errors=True)
         raise RuntimeError("Konversi audio MP3 tidak selesai. Coba lagi atau pilih video.")
     if mode == "video" and file_path.suffix.lower() not in {".mp4", ".m4v", ".mov", ".webm", ".mkv"}:
         shutil.rmtree(job_dir, ignore_errors=True)
         raise RuntimeError("Format video hasil ekstraksi tidak didukung.")
     return file_path, _safe_filename(info, "mp3" if mode == "audio" else file_path.suffix.lstrip(".")), info
+
+
+def _store_file(path: Path, filename: str) -> str:
+    token = secrets.token_urlsafe(24)
+    expiry = time.time() + FILE_TTL_SECONDS
+    with state_lock:
+        active_files[token] = (path, filename, expiry)
+    return token
+
+
+def _error(code: str, message: str, status_code: int = 502, service: str | None = None):
+    context = {"message": message[:350]}
+    if service:
+        context["service"] = service
+    return JSONResponse({"status": "error", "error": {"code": code, "context": context}}, status_code=status_code)
+
+
+def _extract_error(exc: Exception, platform: str):
+    message = str(exc)[:350] or "Media tidak tersedia."
+    lowered = message.lower()
+    code = "error.api.content.video.unavailable"
+    if "unsupported url" in lowered or "not supported" in lowered or "belum didukung" in lowered:
+        code = "error.api.link.unsupported"
+    elif "too many requests" in lowered or "429" in lowered or "rate limit" in lowered:
+        code = "error.api.rate.limit"
+    elif "private" in lowered or "login" in lowered or "not available" in lowered or "deleted" in lowered:
+        code = "error.api.content.video.unavailable"
+    return _error(code, message, 502, platform)
+
+
+def _acquire(request: Request):
+    _cleanup_expired()
+    if _rate_limited(_client_key(request)):
+        return _error("error.api.rate.limit", "Terlalu banyak permintaan. Tunggu sebentar, lalu coba lagi.", 429)
+    if not download_slots.acquire(blocking=False):
+        return _error("error.api.rate.limit", "Server sedang memproses unduhan lain. Coba lagi sebentar.", 429)
+    return None
+
+
+def _normalise_request(payload: dict):
+    try:
+        return _normalise_and_validate(str(payload.get("url") or "")), None
+    except ValueError as exc:
+        return None, _error("error.api.link.unsupported", str(exc), 400)
+
+
+def _run_download(url: str, platform: str, mode: str, quality: str, request: Request):
+    try:
+        path, filename, info = _download_media(url, mode, quality)
+        token = _store_file(path, filename)
+        return {
+            "status": "tunnel",
+            "url": f"{_base_url(request)}/api/file/{token}",
+            "filename": filename,
+            "service": platform,
+            "title": info.get("title"),
+            "quality": quality,
+        }
+    except Exception as exc:
+        return _extract_error(exc, platform)
 
 
 @app.get("/")
@@ -254,6 +409,7 @@ def server_info(request: Request):
             "url": _base_url(request),
             "services": SERVICES,
             "durationLimit": MAX_DURATION_SECONDS,
+            "features": ["inspect", "quality-picker", "audio-mp3", "temporary-tunnel"],
         },
         "git": {"remote": "Petik Universal Extractor"},
     }
@@ -261,51 +417,65 @@ def server_info(request: Request):
 
 @app.get("/health")
 def health():
-    return {"success": True, "status": "healthy", "version": APP_VERSION, "engine": "yt-dlp+ffmpeg"}
+    return {
+        "success": True,
+        "status": "healthy",
+        "version": APP_VERSION,
+        "engine": "yt-dlp+ffmpeg",
+        "javascriptRuntime": "deno" if shutil.which("deno") else "missing",
+    }
+
+
+@app.post("/api/inspect")
+def inspect_media(payload: dict, request: Request):
+    limited = _acquire(request)
+    if limited:
+        return limited
+    try:
+        normalised, error = _normalise_request(payload)
+        if error:
+            return error
+        url, platform = normalised
+        try:
+            return _inspect_payload(url, platform)
+        except Exception as exc:
+            return _extract_error(exc, platform)
+    finally:
+        download_slots.release()
+
+
+@app.post("/api/download")
+def download_media(payload: dict, request: Request):
+    limited = _acquire(request)
+    if limited:
+        return limited
+    try:
+        normalised, error = _normalise_request(payload)
+        if error:
+            return error
+        url, platform = normalised
+        mode = "audio" if payload.get("mode") == "audio" else "video"
+        if mode == "audio" and platform == "soundcloud":
+            mode = "audio"
+        quality = str(payload.get("quality") or ("best" if mode == "audio" else "max"))
+        return _run_download(url, platform, mode, quality, request)
+    finally:
+        download_slots.release()
 
 
 @app.post("/")
 def cobalt_compatible_extract(payload: dict, request: Request):
-    _cleanup_expired()
-    client_key = _client_key(request)
-    if _rate_limited(client_key):
-        return JSONResponse({"status": "error", "error": {"code": "error.api.rate.limit"}}, status_code=429)
-    if not download_slots.acquire(blocking=False):
-        return JSONResponse({"status": "error", "error": {"code": "error.api.rate.limit"}}, status_code=429)
+    limited = _acquire(request)
+    if limited:
+        return limited
     try:
-        try:
-            url, platform = _normalise_and_validate(str(payload.get("url") or ""))
-        except ValueError as exc:
-            return JSONResponse({"status": "error", "error": {"code": "error.api.link.unsupported", "context": {"message": str(exc)}}}, status_code=400)
-        # SoundCloud is an audio platform: return an MP3 even when the UI is
-        # left in its default video mode. The frontend identifies it by filename.
+        normalised, error = _normalise_request(payload)
+        if error:
+            return error
+        url, platform = normalised
         mode = "audio" if payload.get("downloadMode") == "audio" or platform == "soundcloud" else "video"
         quality = str(payload.get("videoQuality") or "720")
-        try:
-            path, filename, info = _download_media(url, mode, quality)
-        except Exception as exc:
-            message = str(exc)[:350] or "Media tidak tersedia."
-            code = "error.api.content.video.unavailable"
-            lowered = message.lower()
-            if "unsupported url" in lowered or "not supported" in lowered or "belum didukung" in lowered:
-                code = "error.api.link.unsupported"
-            elif "private" in lowered or "login" in lowered or "not available" in lowered or "deleted" in lowered:
-                code = "error.api.content.video.unavailable"
-            elif "too many requests" in lowered or "429" in lowered:
-                code = "error.api.rate.limit"
-            return JSONResponse({"status": "error", "error": {"code": code, "context": {"message": message, "service": platform}}}, status_code=502)
-
-        token = secrets.token_urlsafe(24)
-        expiry = time.time() + FILE_TTL_SECONDS
-        with state_lock:
-            active_files[token] = (path, filename, expiry)
-        return {
-            "status": "tunnel",
-            "url": f"{_base_url(request)}/api/file/{token}",
-            "filename": filename,
-            "service": platform,
-            "title": info.get("title"),
-        }
+        return _run_download(url, platform, mode, quality, request)
     finally:
         download_slots.release()
 
