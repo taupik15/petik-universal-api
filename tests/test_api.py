@@ -29,7 +29,7 @@ def test_health_endpoint_and_version():
     response = client.get("/health")
     assert response.status_code == 200
     assert response.json()["status"] == "healthy"
-    assert response.json()["version"] == "1.1.0"
+    assert response.json()["version"] == "1.2.0"
     assert "javascriptRuntime" in response.json()
 
 
@@ -103,9 +103,40 @@ def test_inspect_returns_actual_format_choices(monkeypatch):
     body = response.json()
     assert body["status"] == "ready"
     assert body["title"] == "Demo video"
+    assert body["previewUrl"] is None
     assert body["videoOptions"][0]["id"] == "max"
     assert {item["id"] for item in body["videoOptions"]} >= {"720", "1080", "360"}
     assert body["audioOptions"] == [{"id": "best", "label": "MP3 · kualitas terbaik"}]
+
+
+
+def test_inspect_exposes_progressive_video_preview_url(monkeypatch):
+    no_rate_limit(monkeypatch)
+    monkeypatch.setattr(api, "_extract_info", lambda _url: {
+        "id": "demo", "title": "Demo video", "duration": 84,
+        "thumbnail": "https://img.example/thumb.jpg",
+        "formats": [
+            {"format_id": "137", "height": 1080, "vcodec": "avc1", "acodec": "none", "ext": "mp4", "url": "https://cdn.example/video-only.mp4"},
+            {"format_id": "18", "height": 360, "vcodec": "avc1", "acodec": "mp4a", "ext": "mp4", "url": "https://cdn.example/progressive-360.mp4"},
+            {"format_id": "22", "height": 720, "vcodec": "avc1", "acodec": "mp4a", "ext": "mp4", "url": "https://cdn.example/progressive-720.mp4"},
+        ],
+    })
+    response = client.post("/api/inspect", json={"url": "https://vimeo.com/123456"})
+    assert response.status_code == 200
+    assert response.json()["previewUrl"] == "https://cdn.example/progressive-720.mp4"
+
+
+def test_inspect_supports_direct_social_video_url_without_formats(monkeypatch):
+    no_rate_limit(monkeypatch)
+    monkeypatch.setattr(api, "_extract_info", lambda _url: {
+        "id": "thread", "title": "Threads clip", "ext": "mp4",
+        "url": "https://cdn.example/thread-video.mp4", "thumbnail": "https://img.example/thread.jpg",
+    })
+    response = client.post("/api/inspect", json={"url": "https://threads.net/@sample/post/ABC123"})
+    assert response.status_code == 200
+    body = response.json()
+    assert body["videoOptions"]
+    assert body["previewUrl"] == "https://cdn.example/thread-video.mp4"
 
 
 def test_inspect_audio_only_media_disables_video(monkeypatch):
