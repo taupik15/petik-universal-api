@@ -16,7 +16,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, JSONResponse
 from yt_dlp import YoutubeDL
 
-APP_VERSION = "1.1.0"
+APP_VERSION = "1.2.0"
 MAX_FILE_BYTES = int(os.getenv("MAX_FILE_MB", "140")) * 1024 * 1024
 FILE_TTL_SECONDS = int(os.getenv("FILE_TTL_SECONDS", "1800"))
 MAX_DURATION_SECONDS = int(os.getenv("MAX_DURATION_SECONDS", "3600"))
@@ -203,28 +203,102 @@ def _extract_info(url: str) -> dict:
     return info
 
 
+def _media_formats(info: dict) -> list[dict]:
+    """Return yt-dlp formats, including formats nested in requested downloads."""
+    formats = list(info.get("formats") or [])
+    for key in ("requested_formats", "requested_downloads"):
+        value = info.get(key) or []
+        if isinstance(value, dict):
+            value = [value]
+        if isinstance(value, list):
+            formats.extend(item for item in value if isinstance(item, dict))
+    if info.get("url") and not formats:
+        formats.append(info)
+    return formats
+
+
+def _codec_present(value) -> bool:
+    return bool(value and str(value).lower() != "none")
+
+
 def _available_options(info: dict, platform: str) -> tuple[list[dict], list[dict]]:
     if platform == "soundcloud":
         return [], [{"id": "best", "label": "MP3 · kualitas terbaik"}]
 
-    formats = info.get("formats") or []
+    formats = _media_formats(info)
     heights: set[int] = set()
-    has_video = bool(info.get("vcodec") and info.get("vcodec") != "none")
-    has_audio = bool(info.get("acodec") and info.get("acodec") != "none")
+    has_video = _codec_present(info.get("vcodec"))
+    has_audio = _codec_present(info.get("acodec"))
+    video_extensions = {"mp4", "webm", "mov", "m4v", "mkv", "flv", "3gp"}
+    audio_extensions = {"mp3", "m4a", "aac", "wav", "flac", "ogg", "opus", "weba"}
     for fmt in formats:
-        if fmt.get("acodec") and fmt.get("acodec") != "none":
+        if _codec_present(fmt.get("acodec")):
             has_audio = True
-        if fmt.get("vcodec") and fmt.get("vcodec") != "none":
+        if _codec_present(fmt.get("vcodec")):
             has_video = True
             height = fmt.get("height")
             if isinstance(height, (int, float)) and 0 < height <= 4320:
                 heights.add(int(height))
+    # Some social extractors expose a single direct URL instead of a formats array.
+    # Infer the media type from its extension only when codec metadata is absent.
+    ext = str(info.get("ext") or "").lower()
+    if info.get("url") and not has_video and not has_audio:
+        if ext in video_extensions or (not ext and platform != "soundcloud"):
+            has_video = True
+        elif ext in audio_extensions or platform == "soundcloud":
+            has_audio = True
     # The user chooses an upper bound; yt-dlp picks the best available format under it.
     video_options = [{"id": "max", "label": "Terbaik yang tersedia"}] if has_video else []
     for height in sorted(heights, reverse=True):
         video_options.append({"id": str(height), "label": f"Maksimal {height}p"})
     audio_options = [{"id": "best", "label": "MP3 · kualitas terbaik"}] if has_audio else []
     return video_options, audio_options
+
+
+def _safe_preview_url(value) -> str | None:
+    if not isinstance(value, str):
+        return None
+    try:
+        parsed = urlparse(value)
+        return value if parsed.scheme in {"http", "https"} and parsed.hostname else None
+    except Exception:
+        return None
+
+
+def _preview_url(info: dict, platform: str) -> str | None:
+    """Choose a browser-friendly progressive stream for inline video preview."""
+    if platform == "soundcloud":
+        return None
+    formats = _media_formats(info)
+    candidates = []
+    for fmt in formats:
+        url = _safe_preview_url(fmt.get("url"))
+        if not url or not _codec_present(fmt.get("vcodec")):
+            continue
+        if not _codec_present(fmt.get("acodec")):
+            continue
+        ext = str(fmt.get("ext") or "").lower()
+        protocol = str(fmt.get("protocol") or "").lower()
+        if ext in {"m3u8", "mpd"} or "m3u8" in protocol or "dash" in protocol:
+            continue
+        height = fmt.get("height")
+        height = int(height) if isinstance(height, (int, float)) and height > 0 else 0
+        # Prefer MP4 and a practical preview size; never construct or rewrite URLs.
+        candidates.append((0 if ext == "mp4" else 1, 0 if 0 < height <= 720 else 1, -min(height or 720, 720), url))
+    if candidates:
+        candidates.sort()
+        return candidates[0][3]
+
+    # A few extractors publish only one combined direct media URL on the root info.
+    root_url = _safe_preview_url(info.get("url"))
+    if root_url and _codec_present(info.get("vcodec")) and _codec_present(info.get("acodec")):
+        return root_url
+    ext = str(info.get("ext") or "").lower()
+    if root_url and ext in {"mp4", "webm", "mov", "m4v"} and not _codec_present(info.get("acodec")):
+        return root_url
+    if root_url and not _codec_present(info.get("vcodec")) and not _codec_present(info.get("acodec")) and ext not in {"mp3", "m4a", "aac", "wav", "flac", "ogg", "opus", "m3u8", "mpd"}:
+        return root_url
+    return None
 
 
 def _safe_thumbnail(info: dict) -> str | None:
@@ -250,6 +324,7 @@ def _inspect_payload(url: str, platform: str) -> dict:
         "author": str(info.get("uploader") or info.get("channel") or info.get("artist") or "")[:180] or None,
         "duration": info.get("duration"),
         "thumbnail": _safe_thumbnail(info),
+        "previewUrl": _preview_url(info, platform),
         "videoOptions": videos,
         "audioOptions": audios,
         "defaultVideoQuality": "max",
