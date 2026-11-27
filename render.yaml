@@ -20,3 +20,9 @@ services:
         value: "300"
       - key: YTDLP_AUTO_UPDATE
         value: "1"
+      - key: MAX_GALLERY_ITEMS
+        value: "20"
+      - key: MAX_GALLERY_FILE_MB
+        value: "20"
+      - key: MAX_GALLERY_TOTAL_MB
+        value: "60"

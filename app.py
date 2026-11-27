@@ -4,21 +4,29 @@ import os
 import re
 import shutil
 import secrets
+import subprocess
 import tempfile
 import threading
 import time
+import zipfile
 import urllib.error
 import urllib.request
 from collections import defaultdict, deque
 from pathlib import Path
-from urllib.parse import urlparse
+from urllib.parse import urlparse, unquote
 
 from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 from yt_dlp import YoutubeDL
 
-APP_VERSION = "1.5.0"
+APP_VERSION = "1.6.0"
+MAX_GALLERY_ITEMS = max(1, min(30, int(os.getenv("MAX_GALLERY_ITEMS", "20"))))
+MAX_GALLERY_SOURCE_ITEMS = MAX_GALLERY_ITEMS * 2  # Mixed carousels can contain video entries between photos.
+MAX_GALLERY_FILE_BYTES = int(os.getenv("MAX_GALLERY_FILE_MB", "20")) * 1024 * 1024
+MAX_GALLERY_TOTAL_BYTES = int(os.getenv("MAX_GALLERY_TOTAL_MB", "60")) * 1024 * 1024
+GALLERY_PLATFORMS = {"instagram", "facebook", "twitter", "pinterest", "reddit"}
+IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".webp", ".gif", ".avif", ".heic"}
 MAX_FILE_BYTES = int(os.getenv("MAX_FILE_MB", "140")) * 1024 * 1024
 FILE_TTL_SECONDS = int(os.getenv("FILE_TTL_SECONDS", "1800"))
 MAX_DURATION_SECONDS = int(os.getenv("MAX_DURATION_SECONDS", "3600"))
@@ -253,6 +261,7 @@ def _available_options(info: dict, platform: str) -> tuple[list[dict], list[dict
     has_audio = _codec_present(info.get("acodec"))
     video_extensions = {"mp4", "webm", "mov", "m4v", "mkv", "flv", "3gp"}
     audio_extensions = {"mp3", "m4a", "aac", "wav", "flac", "ogg", "opus", "weba"}
+    image_extensions = {"jpg", "jpeg", "png", "webp", "gif", "avif", "heic"}
     for fmt in formats:
         if _codec_present(fmt.get("acodec")):
             has_audio = True
@@ -265,7 +274,9 @@ def _available_options(info: dict, platform: str) -> tuple[list[dict], list[dict
     # Infer the media type from its extension only when codec metadata is absent.
     ext = str(info.get("ext") or "").lower()
     if info.get("url") and not has_video and not has_audio:
-        if ext in video_extensions or (not ext and platform != "soundcloud"):
+        if ext in image_extensions:
+            pass
+        elif ext in video_extensions or (not ext and platform != "soundcloud"):
             has_video = True
         elif ext in audio_extensions or platform == "soundcloud":
             has_audio = True
@@ -338,24 +349,139 @@ def _safe_thumbnail(info: dict) -> str | None:
         return None
 
 
+def _gallery_command() -> str | None:
+    return shutil.which("gallery-dl")
+
+
+def _parse_gallery_urls(output: str) -> list[dict]:
+    """Convert gallery-dl's -g output into a small, safe image manifest.
+
+    IDs retain the original extractor position so mixed photo/video carousels
+    can be downloaded with gallery-dl's --range option without index drift.
+    """
+    found: list[dict] = []
+    seen: set[str] = set()
+    source_index = 0
+    for raw in (output or "").splitlines():
+        value = raw.strip().strip('"')
+        if not value.startswith(("https://", "http://")):
+            continue
+        source_index += 1
+        if source_index > MAX_GALLERY_SOURCE_ITEMS:
+            break
+        try:
+            parsed = urlparse(value)
+            if parsed.scheme != "https" or not parsed.hostname:
+                continue
+            suffix = Path(unquote(parsed.path)).suffix.lower()
+            if suffix not in IMAGE_EXTENSIONS or value in seen:
+                continue
+            seen.add(value)
+            filename = Path(unquote(parsed.path)).name or f"foto-{len(found) + 1}{suffix}"
+            found.append({
+                "id": source_index,
+                "url": value,
+                "thumbnail": value,
+                "extension": suffix.lstrip("."),
+                "filename": filename[:160],
+                "label": f"Foto {len(found) + 1}",
+                "kind": "image",
+            })
+            if len(found) >= MAX_GALLERY_ITEMS:
+                break
+        except Exception:
+            continue
+    return found
+
+
+def _gallery_list_images(url: str, platform: str) -> list[dict]:
+    if platform not in GALLERY_PLATFORMS:
+        return []
+    executable = _gallery_command()
+    if not executable:
+        return []
+    command = [executable, "--config-ignore", "--no-input", "--no-colors", "--quiet",
+               "--range", f"1-{MAX_GALLERY_SOURCE_ITEMS}", "--get-urls", "--", url]
+    try:
+        result = subprocess.run(command, capture_output=True, text=True, encoding="utf-8",
+                                errors="replace", timeout=40, check=False)
+        if result.returncode not in (0, 1):
+            return []
+        return _parse_gallery_urls(result.stdout)
+    except (OSError, subprocess.TimeoutExpired):
+        return []
+
+
 def _inspect_payload(url: str, platform: str) -> dict:
-    info = _extract_info(url)
-    videos, audios = _available_options(info, platform)
-    title = str(info.get("title") or info.get("id") or "Media")[:300]
+    info: dict | None = None
+    extraction_error: Exception | None = None
+    try:
+        info = _extract_info(url)
+    except Exception as exc:
+        extraction_error = exc
+
+    photo_items = _gallery_list_images(url, platform)
+    if info is None and not photo_items:
+        if extraction_error:
+            raise extraction_error
+        raise RuntimeError("Tidak ada media yang bisa diambil dari tautan ini.")
+
+    videos, audios = _available_options(info, platform) if info else ([], [])
+    title = str((info or {}).get("title") or (f"Galeri foto · {platform.title()}" if photo_items else "Media"))[:300]
     return {
         "success": True,
         "status": "ready",
         "service": platform,
         "title": title,
-        "author": str(info.get("uploader") or info.get("channel") or info.get("artist") or "")[:180] or None,
-        "duration": info.get("duration"),
-        "thumbnail": _safe_thumbnail(info),
-        "previewUrl": _preview_url(info, platform),
+        "author": str((info or {}).get("uploader") or (info or {}).get("channel") or (info or {}).get("artist") or "")[:180] or None,
+        "duration": (info or {}).get("duration"),
+        "thumbnail": _safe_thumbnail(info or {}) or (photo_items[0]["thumbnail"] if photo_items else None),
+        "previewUrl": _preview_url(info, platform) if info else None,
         "videoOptions": videos,
         "audioOptions": audios,
+        "photoItems": photo_items,
+        "galleryAvailable": bool(photo_items),
+        "galleryLimit": MAX_GALLERY_ITEMS,
         "defaultVideoQuality": "max",
         "defaultAudioQuality": "best",
     }
+
+
+def _download_gallery_files(url: str, indices: list[int]) -> tuple[Path, list[Path]]:
+    executable = _gallery_command()
+    if not executable:
+        raise RuntimeError("Mesin galeri belum terpasang pada server. Pastikan gallery-dl selesai dipasang saat deployment.")
+    if not indices or len(indices) > MAX_GALLERY_ITEMS:
+        raise ValueError(f"Pilih 1 sampai {MAX_GALLERY_ITEMS} foto.")
+    if any(type(index) is not int or index < 1 or index > MAX_GALLERY_ITEMS for index in indices):
+        raise ValueError("Nomor foto yang dipilih tidak valid.")
+    job_dir = Path(tempfile.mkdtemp(prefix="gallery-", dir=TEMP_ROOT))
+    command = [executable, "--config-ignore", "--no-input", "--no-colors", "--quiet",
+               "--no-mtime", "--no-skip", "--filesize-max", f"{max(1, MAX_GALLERY_FILE_BYTES // (1024 * 1024))}M",
+               "--range", f"1-{MAX_GALLERY_SOURCE_ITEMS}", "--filter",
+               "num in (" + ",".join(str(i) for i in indices) + ")",
+               "--directory", str(job_dir), "--filename", "{num:>03}.{extension}", "--", url]
+    try:
+        result = subprocess.run(command, capture_output=True, text=True, encoding="utf-8",
+                                errors="replace", timeout=150, check=False)
+        files = sorted(path for path in job_dir.rglob("*") if path.is_file() and path.suffix.lower() in IMAGE_EXTENSIONS)
+        if result.returncode not in (0, 1) or not files:
+            detail = (result.stderr or result.stdout or "Extractor galeri tidak menemukan foto.").strip().splitlines()[-1][:240]
+            raise RuntimeError(detail or "Gagal mengunduh foto dari sumber.")
+        if len(files) > len(indices):
+            files = files[:len(indices)]
+        total = 0
+        for file_path in files:
+            size = file_path.stat().st_size
+            total += size
+            if size <= 0 or size > MAX_GALLERY_FILE_BYTES:
+                raise RuntimeError("Ada foto yang melebihi batas ukuran per berkas.")
+            if total > MAX_GALLERY_TOTAL_BYTES:
+                raise RuntimeError("Total foto melebihi batas ukuran unduhan galeri.")
+        return job_dir, files
+    except Exception:
+        shutil.rmtree(job_dir, ignore_errors=True)
+        raise
 
 
 def _download_media(url: str, mode: str, quality: str) -> tuple[Path, str, dict]:
@@ -510,7 +636,7 @@ def server_info(request: Request):
             "url": _base_url(request),
             "services": SERVICES,
             "durationLimit": MAX_DURATION_SECONDS,
-            "features": ["inspect", "quality-picker", "audio-mp3", "temporary-tunnel"],
+            "features": ["inspect", "quality-picker", "audio-mp3", "photo-gallery", "multi-image-selection", "zip-download", "temporary-tunnel"],
         },
         "git": {"remote": "Petik Universal Extractor"},
     }
@@ -524,14 +650,28 @@ def _ytdlp_version() -> str:
         return "unknown"
 
 
+def _gallery_version() -> str:
+    executable = _gallery_command()
+    if not executable:
+        return "missing"
+    try:
+        result = subprocess.run([executable, "--version"], capture_output=True, text=True, timeout=5, check=False)
+        return (result.stdout or result.stderr or "unknown").strip()[:40]
+    except Exception:
+        return "unknown"
+
+
 @app.get("/health")
 def health():
     return {
         "success": True,
         "status": "healthy",
         "version": APP_VERSION,
-        "engine": "yt-dlp+ffmpeg",
+        "engine": "yt-dlp+gallery-dl+ffmpeg",
         "ytdlpVersion": _ytdlp_version(),
+        "galleryDlAvailable": bool(_gallery_command()),
+        "galleryDlVersion": _gallery_version(),
+        "maxGalleryItems": MAX_GALLERY_ITEMS,
         "javascriptRuntime": "deno" if shutil.which("deno") else "missing",
     }
 
@@ -630,6 +770,57 @@ def inspect_media(payload: dict, request: Request):
         download_slots.release()
 
 
+@app.post("/api/gallery/download")
+def download_gallery(payload: dict, request: Request):
+    limited = _acquire(request)
+    if limited:
+        return limited
+    job_dir: Path | None = None
+    try:
+        normalised, error = _normalise_request(payload)
+        if error:
+            return error
+        url, platform = normalised
+        if platform not in GALLERY_PLATFORMS:
+            return _error("error.api.gallery.unsupported", "Platform ini belum memiliki extractor galeri foto Petik.", 400, platform)
+        raw_indices = payload.get("indices")
+        if not isinstance(raw_indices, list) or not raw_indices or len(raw_indices) > MAX_GALLERY_ITEMS:
+            return _error("error.api.gallery.selection", f"Pilih 1 sampai {MAX_GALLERY_ITEMS} foto.", 400, platform)
+        if any(type(value) is not int or value < 1 or value > MAX_GALLERY_SOURCE_ITEMS for value in raw_indices) or len(set(raw_indices)) != len(raw_indices):
+            return _error("error.api.gallery.selection", "Daftar pilihan foto tidak valid.", 400, platform)
+        job_dir, files = _download_gallery_files(url, raw_indices)
+        zip_requested = bool(payload.get("zip"))
+        if zip_requested:
+            archive = job_dir / "petik-foto.zip"
+            with zipfile.ZipFile(archive, "w", compression=zipfile.ZIP_STORED) as bundle:
+                for index, file_path in enumerate(files, 1):
+                    suffix = file_path.suffix.lower()
+                    bundle.write(file_path, arcname=f"foto-{index:03d}{suffix}")
+            token = _store_file(archive, "petik-foto.zip")
+            job_dir = None  # The temporary archive folder is retained until its token expires.
+            return {"status": "tunnel", "url": f"{_base_url(request)}/api/file/{token}",
+                    "filename": "petik-foto.zip", "count": len(files), "service": platform}
+
+        file_results = []
+        for file_path in files:
+            single_dir = Path(tempfile.mkdtemp(prefix="gallery-file-", dir=TEMP_ROOT))
+            target = single_dir / (file_path.name[:140] or f"foto{file_path.suffix.lower()}")
+            shutil.copy2(file_path, target)
+            token = _store_file(target, target.name)
+            file_results.append({"url": f"{_base_url(request)}/api/file/{token}", "filename": target.name})
+        shutil.rmtree(job_dir, ignore_errors=True)
+        job_dir = None
+        return {"status": "ready", "files": file_results, "count": len(file_results), "service": platform}
+    except ValueError as exc:
+        return _error("error.api.gallery.selection", str(exc), 400)
+    except Exception as exc:
+        return _extract_error(exc, "gallery")
+    finally:
+        if job_dir is not None:
+            shutil.rmtree(job_dir, ignore_errors=True)
+        download_slots.release()
+
+
 @app.post("/api/download")
 def download_media(payload: dict, request: Request):
     limited = _acquire(request)
@@ -679,7 +870,7 @@ def download_file(token: str):
         shutil.rmtree(path.parent, ignore_errors=True)
         return JSONResponse({"success": False, "error": "Berkas sudah kedaluwarsa."}, status_code=410)
     suffix = path.suffix.lower()
-    media_type = "audio/mpeg" if suffix == ".mp3" else "video/mp4" if suffix in {".mp4", ".m4v"} else "application/octet-stream"
+    media_type = "audio/mpeg" if suffix == ".mp3" else "video/mp4" if suffix in {".mp4", ".m4v"} else "application/zip" if suffix == ".zip" else "image/jpeg" if suffix in {".jpg", ".jpeg"} else "image/png" if suffix == ".png" else "application/octet-stream"
     return FileResponse(
         path,
         media_type=media_type,
