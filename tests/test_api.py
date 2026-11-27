@@ -29,7 +29,7 @@ def test_health_endpoint_and_version():
     response = client.get("/health")
     assert response.status_code == 200
     assert response.json()["status"] == "healthy"
-    assert response.json()["version"] == "1.5.0"
+    assert response.json()["version"] == "1.6.0"
     assert "javascriptRuntime" in response.json()
 
 
@@ -361,3 +361,148 @@ def test_preview_not_blocked_by_busy_download_slot_or_download_rate_limit(monkey
 def test_health_reports_ytdlp_version():
     body = client.get("/health").json()
     assert body["ytdlpVersion"] and body["ytdlpVersion"] != ""
+
+
+def sample_photo_items():
+    return [
+        {"id": 1, "url": "https://cdn.example/photo-1.jpg", "thumbnail": "https://cdn.example/photo-1.jpg", "extension": "jpg", "filename": "photo-1.jpg", "label": "Foto 1", "kind": "image"},
+        {"id": 2, "url": "https://cdn.example/photo-2.webp", "thumbnail": "https://cdn.example/photo-2.webp", "extension": "webp", "filename": "photo-2.webp", "label": "Foto 2", "kind": "image"},
+    ]
+
+
+def test_gallery_url_parser_filters_non_images_and_duplicates():
+    output = "\n".join([
+        "https://cdn.example/a.jpg?token=one",
+        "https://cdn.example/a.jpg?token=one",
+        "https://cdn.example/video.mp4",
+        "http://cdn.example/not-secure.jpg",
+        "https://cdn.example/b.webp",
+    ])
+    items = api._parse_gallery_urls(output)
+    assert [item["extension"] for item in items] == ["jpg", "webp"]
+    assert [item["id"] for item in items] == [1, 5]
+
+
+def test_inspect_returns_photo_gallery_when_video_extractor_fails(monkeypatch):
+    no_rate_limit(monkeypatch)
+    def unavailable(_url):
+        raise RuntimeError("Unsupported URL")
+    monkeypatch.setattr(api, "_extract_info", unavailable)
+    monkeypatch.setattr(api, "_gallery_list_images", lambda _url, _platform: sample_photo_items())
+    response = client.post("/api/inspect", json={"url": "https://www.instagram.com/p/ABC123/"})
+    assert response.status_code == 200
+    body = response.json()
+    assert body["status"] == "ready"
+    assert body["videoOptions"] == []
+    assert body["audioOptions"] == []
+    assert len(body["photoItems"]) == 2
+    assert body["galleryAvailable"] is True
+
+
+def test_inspect_combines_video_and_photo_gallery(monkeypatch):
+    no_rate_limit(monkeypatch)
+    monkeypatch.setattr(api, "_extract_info", lambda _url: {
+        "id": "mixed", "title": "Mixed post", "formats": [
+            {"format_id": "18", "height": 360, "vcodec": "avc1", "acodec": "mp4a", "ext": "mp4", "url": "https://cdn.example/video.mp4"}
+        ]
+    })
+    monkeypatch.setattr(api, "_gallery_list_images", lambda _url, _platform: sample_photo_items())
+    response = client.post("/api/inspect", json={"url": "https://www.instagram.com/p/ABC123/"})
+    assert response.status_code == 200
+    body = response.json()
+    assert body["videoOptions"]
+    assert len(body["photoItems"]) == 2
+
+
+def test_gallery_download_zip_endpoint(monkeypatch, tmp_path):
+    no_rate_limit(monkeypatch)
+    def fake_gallery(_url, indices):
+        assert indices == [1, 2]
+        folder = tmp_path / "gallery-job"
+        folder.mkdir()
+        first, second = folder / "001.jpg", folder / "002.webp"
+        first.write_bytes(b"first-photo")
+        second.write_bytes(b"second-photo")
+        return folder, [first, second]
+    monkeypatch.setattr(api, "_download_gallery_files", fake_gallery)
+    response = client.post("/api/gallery/download", json={
+        "url": "https://www.instagram.com/p/ABC123/", "indices": [1, 2], "zip": True
+    })
+    assert response.status_code == 200
+    body = response.json()
+    assert body["status"] == "tunnel"
+    assert body["filename"] == "petik-foto.zip"
+    file_response = client.get(body["url"])
+    assert file_response.status_code == 200
+    assert file_response.headers["content-type"] == "application/zip"
+    import io, zipfile
+    with zipfile.ZipFile(io.BytesIO(file_response.content)) as archive:
+        assert archive.namelist() == ["foto-001.jpg", "foto-002.webp"]
+
+def test_gallery_download_individual_files_endpoint(monkeypatch, tmp_path):
+    no_rate_limit(monkeypatch)
+    def fake_gallery(_url, _indices):
+        folder = tmp_path / "gallery-job-individual"
+        folder.mkdir()
+        first, second = folder / "001.jpg", folder / "002.webp"
+        first.write_bytes(b"first-photo")
+        second.write_bytes(b"second-photo")
+        return folder, [first, second]
+    monkeypatch.setattr(api, "_download_gallery_files", fake_gallery)
+    response = client.post("/api/gallery/download", json={
+        "url": "https://www.facebook.com/photo/?fbid=123", "indices": [1, 2], "zip": False
+    })
+    assert response.status_code == 200
+    body = response.json()
+    assert body["status"] == "ready"
+    assert body["count"] == 2
+    for item in body["files"]:
+        file_response = client.get(item["url"])
+        assert file_response.status_code == 200
+
+def test_gallery_download_rejects_invalid_indices(monkeypatch):
+    no_rate_limit(monkeypatch)
+    response = client.post("/api/gallery/download", json={
+        "url": "https://www.instagram.com/p/ABC123/", "indices": [0, 999], "zip": True
+    })
+    assert response.status_code == 400
+    assert response.json()["error"]["code"] == "error.api.gallery.selection"
+
+
+def test_gallery_download_command_uses_only_requested_indices(monkeypatch, tmp_path):
+    captured = {}
+    def fake_run(command, **kwargs):
+        captured["command"] = command
+        folder = Path(command[command.index("--directory") + 1])
+        folder.mkdir(parents=True, exist_ok=True)
+        (folder / "002.jpg").write_bytes(b"photo-two")
+        (folder / "005.webp").write_bytes(b"photo-five")
+        return types.SimpleNamespace(returncode=0, stdout="", stderr="")
+    monkeypatch.setattr(api, "_gallery_command", lambda: "/usr/bin/gallery-dl")
+    monkeypatch.setattr(api, "TEMP_ROOT", tmp_path)
+    monkeypatch.setattr(api.subprocess, "run", fake_run)
+    folder, files = api._download_gallery_files("https://www.instagram.com/p/ABC123/", [2, 5])
+    assert len(files) == 2
+    command = captured["command"]
+    assert command[command.index("--range") + 1] == f"1-{api.MAX_GALLERY_SOURCE_ITEMS}"
+    assert command[command.index("--filter") + 1] == "num in (2,5)"
+    assert "--no-skip" in command
+    assert "--filesize-max" in command
+    assert command[-1] == "https://www.instagram.com/p/ABC123/"
+    import shutil as _shutil
+    _shutil.rmtree(folder, ignore_errors=True)
+
+
+def test_inspect_does_not_mislabel_direct_jpg_as_video(monkeypatch):
+    no_rate_limit(monkeypatch)
+    monkeypatch.setattr(api, "_extract_info", lambda _url: {
+        "id": "photo", "title": "A photo", "ext": "jpg",
+        "url": "https://cdn.example/photo.jpg"
+    })
+    monkeypatch.setattr(api, "_gallery_list_images", lambda _url, _platform: sample_photo_items())
+    response = client.post("/api/inspect", json={"url": "https://www.instagram.com/p/ABC123/"})
+    assert response.status_code == 200
+    body = response.json()
+    assert body["videoOptions"] == []
+    assert body["audioOptions"] == []
+    assert len(body["photoItems"]) == 2
