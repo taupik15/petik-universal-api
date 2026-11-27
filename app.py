@@ -32,7 +32,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 from yt_dlp import YoutubeDL
 
-APP_VERSION = "1.6.1"
+APP_VERSION = "1.6.2"
 MAX_GALLERY_ITEMS = max(1, min(30, int(os.getenv("MAX_GALLERY_ITEMS", "20"))))
 MAX_GALLERY_SOURCE_ITEMS = MAX_GALLERY_ITEMS * 2  # Mixed carousels can contain video entries between photos.
 MAX_GALLERY_FILE_BYTES = int(os.getenv("MAX_GALLERY_FILE_MB", "20")) * 1024 * 1024
@@ -40,6 +40,8 @@ MAX_GALLERY_TOTAL_BYTES = int(os.getenv("MAX_GALLERY_TOTAL_MB", "60")) * 1024 * 
 GALLERY_PLATFORMS = {"instagram", "facebook", "twitter", "pinterest", "reddit"}
 THREADS_PAGE_HOSTS = {"threads.net", "threads.com"}
 THREADS_MEDIA_SUFFIXES = (".cdninstagram.com", ".fbcdn.net", ".threads.net", ".threads.com", ".fbsbx.com")
+SOCIAL_MEDIA_SUFFIXES = (".cdninstagram.com", ".fbcdn.net", ".fbsbx.com")
+INSTAGRAM_GRAPHQL_DOC_ID = "27130156389949648"  # Current public post query used by yt-dlp InstagramIE
 THREADS_MAX_PAGE_BYTES = 3 * 1024 * 1024
 THREADS_CRAWLER_UA = "Mozilla/5.0 (compatible; Googlebot/2.1; +http://www.google.com/bot.html)"
 IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".webp", ".gif", ".avif", ".heic"}
@@ -473,23 +475,76 @@ def _gallery_list_images(url: str, platform: str) -> list[dict]:
         return []
 
 
-def _instagram_photo_items(media: dict) -> list[dict]:
-    """Normalize public Instagram GraphQL media into photo items only."""
-    sidecar = media.get("edge_sidecar_to_children")
-    edges = sidecar.get("edges") if isinstance(sidecar, dict) else None
-    nodes = [edge.get("node") for edge in edges if isinstance(edge, dict) and isinstance(edge.get("node"), dict)] if isinstance(edges, list) else [media]
+def _safe_social_media_url(value: str) -> bool:
+    try:
+        parsed = urlparse(value)
+        host = (parsed.hostname or "").lower().rstrip(".")
+        return bool(
+            parsed.scheme == "https" and host and not parsed.username and not parsed.password
+            and any(host.endswith(suffix) for suffix in SOCIAL_MEDIA_SUFFIXES)
+            and (parsed.port is None or parsed.port == 443)
+        )
+    except Exception:
+        return False
+
+
+def _instagram_shortcode_to_media_id(shortcode: str) -> str:
+    """Convert an Instagram shortcode to its numeric media ID (base64 alphabet)."""
+    if len(shortcode) > 28:
+        shortcode = shortcode[:-28]
+    alphabet = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_"
+    value = 0
+    for char in shortcode:
+        try:
+            digit = alphabet.index(char)
+        except ValueError as exc:
+            raise ValueError("Kode postingan Instagram tidak valid.") from exc
+        value = value * 64 + digit
+    if value <= 0:
+        raise ValueError("Kode postingan Instagram tidak valid.")
+    return str(value)
+
+
+def _instagram_photo_items(media: dict | list) -> list[dict]:
+    """Normalize Instagram logged-out GraphQL/product media into photo items."""
+    if isinstance(media, list):
+        nodes = media
+    elif isinstance(media, dict) and isinstance(media.get("carousel_media"), list):
+        nodes = media["carousel_media"]
+    else:
+        sidecar = media.get("edge_sidecar_to_children") if isinstance(media, dict) else None
+        edges = sidecar.get("edges") if isinstance(sidecar, dict) else None
+        nodes = [edge.get("node") for edge in edges if isinstance(edge, dict) and isinstance(edge.get("node"), dict)] if isinstance(edges, list) else [media]
+
     photos: list[dict] = []
     seen: set[str] = set()
-    for node in nodes:
-        if not isinstance(node, dict) or node.get("is_video") is True or node.get("video_url"):
+    for source_index, node in enumerate(nodes, 1):
+        if not isinstance(node, dict):
             continue
-        image_url = node.get("display_url") or node.get("display_src")
-        if not isinstance(image_url, str) or not _safe_threads_media_url(image_url):
+        # Do not expose video posters as downloadable photos in mixed carousels.
+        if node.get("is_video") is True or str(node.get("media_type") or "") == "2" or node.get("video_url") or node.get("video_versions"):
+            continue
+
+        image_url = node.get("display_url") or node.get("display_src") or node.get("thumbnail_src")
+        if not isinstance(image_url, str) or not _safe_social_media_url(image_url):
+            image_url = None
+
+        if not image_url:
             versions = node.get("image_versions2")
             candidates = versions.get("candidates") if isinstance(versions, dict) else []
-            candidates = [item for item in candidates if isinstance(item, dict) and isinstance(item.get("url"), str) and _safe_threads_media_url(item["url"])]
-            image_url = max(candidates, key=lambda item: int(item.get("width") or 0) * int(item.get("height") or 0)).get("url") if candidates else None
-        if not image_url:
+            if not isinstance(candidates, list):
+                candidates = []
+            candidates = [item for item in candidates if isinstance(item, dict) and isinstance(item.get("url"), str) and _safe_social_media_url(item["url"])]
+            # Older GraphQL payloads expose display_resources instead.
+            resources = node.get("display_resources")
+            if not candidates and isinstance(resources, list):
+                candidates = [item for item in resources if isinstance(item, dict) and isinstance(item.get("src"), str) and _safe_social_media_url(item["src"])]
+                candidates = [{"url": item["src"], "width": item.get("config_width") or item.get("width") or 0,
+                               "height": item.get("config_height") or item.get("height") or 0} for item in candidates]
+            best = max(candidates, key=lambda item: int(item.get("width") or 0) * int(item.get("height") or 0)) if candidates else None
+            image_url = best.get("url") if best else None
+
+        if not isinstance(image_url, str) or not _safe_social_media_url(image_url):
             continue
         canonical = image_url.split("?", 1)[0]
         if canonical in seen:
@@ -497,7 +552,7 @@ def _instagram_photo_items(media: dict) -> list[dict]:
         seen.add(canonical)
         suffix = _image_extension_from_url(image_url) or ".jpg"
         photos.append({
-            "id": len(photos) + 1,
+            "id": source_index,
             "url": image_url,
             "thumbnail": image_url,
             "extension": suffix.lstrip("."),
@@ -510,54 +565,183 @@ def _instagram_photo_items(media: dict) -> list[dict]:
     return photos
 
 
+def _instagram_find_product_info(root: object) -> dict | list | None:
+    """Walk Instagram page JSON and locate the logged-out product payload."""
+    stack = [root]
+    visited = 0
+    while stack and visited < 200_000:
+        value = stack.pop()
+        visited += 1
+        if isinstance(value, dict):
+            media = value.get("xig_polaris_media")
+            if isinstance(media, dict):
+                product = media.get("if_not_gated_logged_out")
+                if isinstance(product, (dict, list)):
+                    return product
+            # Legacy/older page JSON variants.
+            for key in ("xdt_shortcode_media", "shortcode_media"):
+                candidate = value.get(key)
+                if isinstance(candidate, dict):
+                    return candidate
+            stack.extend(value.values())
+        elif isinstance(value, list):
+            stack.extend(value)
+    return None
+
+
+
+def _is_meta_page_url(value: str, platform: str) -> bool:
+    try:
+        parsed = urlparse(value)
+        host = (parsed.hostname or "").lower().rstrip(".")
+        if parsed.scheme != "https" or not host or parsed.username or parsed.password or parsed.port not in (None, 443):
+            return False
+        if platform == "instagram":
+            return host == "instagram.com" or host.endswith(".instagram.com")
+        return host in {"facebook.com", "fb.com", "fb.watch", "fb.me"} or host.endswith(".facebook.com")
+    except Exception:
+        return False
+
+
+def _curl_meta_page_get(session, url: str, *, headers: dict, timeout: int, platform: str, params: dict | None = None):
+    """Fetch an Instagram/Facebook page while restricting redirects to that platform."""
+    current = url
+    current_params = params
+    for _ in range(5):
+        if not _is_meta_page_url(current, platform):
+            raise RuntimeError("Pengalihan halaman Meta ke host di luar platform ditolak.")
+        response = session.get(current, headers=headers, timeout=timeout, params=current_params, allow_redirects=False)
+        current_params = None
+        if response.status_code in (301, 302, 303, 307, 308):
+            location = getattr(response, "headers", {}).get("location")
+            if not location:
+                raise RuntimeError("Halaman Meta mengirim pengalihan tanpa alamat tujuan.")
+            target = urljoin(current, location)
+            if not _is_meta_page_url(target, platform):
+                raise RuntimeError("Pengalihan halaman Meta ke host di luar platform ditolak.")
+            current = target
+            continue
+        final_url = str(getattr(response, "url", current))
+        if not _is_meta_page_url(final_url, platform):
+            raise RuntimeError("Host akhir halaman Meta tidak termasuk daftar yang diizinkan.")
+        return response
+    raise RuntimeError("Terlalu banyak pengalihan halaman Meta.")
+
 def _instagram_public_gallery(url: str) -> list[dict]:
-    """Best-effort anonymous public-post fallback; no account cookies or login."""
+    """Best-effort Instagram public resolver following the current yt-dlp logged-out query."""
     if not HAS_CURL_CFFI or curl_requests is None:
         return []
     match = re.search(r"instagram\.com/(?:p|reel|tv)/([A-Za-z0-9_-]+)", url)
     if not match:
         return []
     shortcode = match.group(1)
+    try:
+        media_id = _instagram_shortcode_to_media_id(shortcode)
+    except ValueError:
+        return []
+
     session = None
     try:
-        session = curl_requests.Session()
-        # This creates only an anonymous request session; no user account/session is supplied.
-        session.impersonate = "chrome124"
+        # curl_cffi accepts impersonation in Session(...); assigning a property later
+        # does not configure the underlying TLS/browser fingerprint.
+        session = curl_requests.Session(impersonate="chrome")
         headers = {
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
             "Accept": "text/html,application/xhtml+xml,application/json;q=0.9,*/*;q=0.8",
+            "Accept-Language": "en-US,en;q=0.9",
         }
-        page = session.get(url, headers=headers, timeout=14)
+        home = _curl_meta_page_get(session, "https://www.instagram.com/", headers=headers, timeout=14, platform="instagram")
+        home_html = str(getattr(home, "text", "") or "")
+        page = _curl_meta_page_get(session, url, headers=headers, timeout=14, platform="instagram")
         if page.status_code != 200:
+            print(f"[instagram-public-gallery] post page HTTP {page.status_code}")
             return []
-        csrf = dict(session.cookies).get("csrftoken", "")
-        variables = {
-            "shortcode": shortcode,
-            "child_comment_count": 3,
-            "fetch_comment_count": 40,
-            "parent_comment_count": 24,
-            "has_threaded_comments": True,
-        }
-        response = session.get(
-            "https://www.instagram.com/graphql/query/",
-            params={
-                "doc_id": "8845758582119845",
-                "variables": json.dumps(variables, separators=(",", ":")),
-            },
-            headers={
-                "X-CSRFToken": csrf,
-                "X-Requested-With": "XMLHttpRequest",
-                "Referer": url,
-                "Accept": "application/json",
-            },
-            timeout=14,
-        )
-        if response.status_code != 200:
-            return []
-        payload = response.json()
-        data = payload.get("data") if isinstance(payload, dict) else None
-        media = (data or {}).get("xdt_shortcode_media") or (data or {}).get("shortcode_media") if isinstance(data, dict) else None
-        return _instagram_photo_items(media) if isinstance(media, dict) else []
+        page_html = str(getattr(page, "text", "") or "")
+        combined_html = home_html + "\n" + page_html
+
+        # The current logged-out query initializes its LSD token on the home page.
+        lsd = ""
+        eqmc = re.search(r'<script\b[^>]*\bid=["\']__eqmc["\'][^>]*>(.*?)</script>', combined_html, re.I | re.S)
+        if eqmc:
+            try:
+                eqmc_data = json.loads(eqmc.group(1))
+                lsd = str(eqmc_data.get("l") or "") if isinstance(eqmc_data, dict) else ""
+            except Exception:
+                pass
+        if not lsd:
+            lsd_match = re.search(r'\["LSD",\[\],\{"token":"([^"\\]+)', combined_html)
+            lsd = lsd_match.group(1) if lsd_match else ""
+
+        try:
+            csrf = session.cookies.get("csrftoken")
+        except Exception:
+            csrf = None
+        api_check = None
+        try:
+            api_check = _curl_meta_page_get(
+                session,
+                "https://www.instagram.com/api/v1/web/get_ruling_for_content/",
+                params={"content_type": "MEDIA", "target_id": media_id},
+                headers={**headers, "X-IG-App-ID": "936619743392459", "X-ASBD-ID": "359341",
+                         "X-IG-WWW-Claim": "0", "Origin": "https://www.instagram.com", "Referer": url}, timeout=12, platform="instagram",
+            )
+        except Exception as exc:
+            print(f"[instagram-public-gallery] access check: {str(exc)[:180]}")
+        if api_check is not None and api_check.status_code == 200:
+            try:
+                if (api_check.json() or {}).get("status") != "ok":
+                    csrf = None
+            except Exception:
+                csrf = None
+
+        if lsd:
+            try:
+                response = session.post(
+                    "https://www.instagram.com/api/graphql",
+                    data={
+                        "lsd": lsd,
+                        "fb_api_caller_class": "RelayModern",
+                        "fb_api_req_friendly_name": "PolarisLoggedOutDesktopWWWPostRootContentQuery",
+                        "server_timestamps": "true",
+                        "variables": json.dumps({"media_id": media_id}, separators=(",", ":")),
+                        "doc_id": INSTAGRAM_GRAPHQL_DOC_ID,
+                    },
+                    headers={
+                        **headers,
+                        "X-IG-App-ID": "936619743392459",
+                        "X-ASBD-ID": "359341",
+                        "X-IG-WWW-Claim": "0",
+                        "Origin": "https://www.instagram.com",
+                        "X-FB-Friendly-Name": "PolarisLoggedOutDesktopWWWPostRootContentQuery",
+                        "X-CSRFToken": csrf or "",
+                        "X-FB-LSD": lsd,
+                        "X-Requested-With": "XMLHttpRequest",
+                        "Referer": url,
+                        "Accept": "*/*",
+                    }, timeout=14, allow_redirects=False,
+                )
+                if response.status_code == 200 and _is_meta_page_url(str(getattr(response, "url", "https://www.instagram.com/api/graphql")), "instagram"):
+                    payload = response.json()
+                    product = _instagram_find_product_info(payload)
+                    if product:
+                        photos = _instagram_photo_items(product)
+                        if photos:
+                            return photos
+            except Exception as exc:
+                print(f"[instagram-public-gallery] GraphQL: {str(exc)[:240]}")
+
+        # The page itself can contain the same prefetched JSON when GraphQL is disabled.
+        for raw_json in re.findall(r'<script\b[^>]*\bdata-sjs[^>]*>(\{.+?\})</script>', page_html, re.I | re.S):
+            try:
+                product = _instagram_find_product_info(json.loads(html_lib.unescape(raw_json)))
+                if product:
+                    photos = _instagram_photo_items(product)
+                    if photos:
+                        return photos
+            except Exception:
+                continue
+        print("[instagram-public-gallery] no public photo payload was exposed")
+        return []
     except Exception as exc:
         print(f"[instagram-public-gallery] {str(exc)[:240]}")
         return []
@@ -568,6 +752,92 @@ def _instagram_public_gallery(url: str) -> list[dict]:
         except Exception:
             pass
 
+
+def _facebook_photo_items_from_html(page_html: str) -> list[dict]:
+    """Collect public Facebook CDN image URLs from OG metadata and page JSON."""
+    if not isinstance(page_html, str) or not page_html:
+        return []
+    html_text = html_lib.unescape(page_html)
+    html_text = (html_text.replace(r"\/", "/").replace(r"\u0026", "&")
+                 .replace(r"\u003d", "=").replace(r"\u003A", ":").replace(r"\u003a", ":"))
+    candidates: list[str] = []
+
+    # Prefer Open Graph images, which normally identify the specific shared post/photo.
+    for tag in re.findall(r"<meta\b[^>]*>", html_text, re.I):
+        prop = re.search(r"\b(?:property|name)\s*=\s*([\"'])(.*?)\1", tag, re.I)
+        content = re.search(r"\bcontent\s*=\s*([\"'])(.*?)\1", tag, re.I)
+        if prop and content and prop.group(2).lower() in {"og:image", "og:image:url", "twitter:image"}:
+            candidates.append(html_lib.unescape(content.group(2)))
+
+    # Public Facebook embeds may place additional carousel images in page JSON.
+    for match in re.findall(r"https?://[^\"'<>\s\\]+", html_text):
+        value = match.rstrip("),.;]")
+        if _safe_social_media_url(value):
+            candidates.append(value)
+
+    photos: list[dict] = []
+    seen: set[str] = set()
+    source_index = 0
+    for value in candidates:
+        value = value.replace("&amp;", "&")
+        if not _safe_social_media_url(value):
+            continue
+        suffix = _image_extension_from_url(value)
+        if not suffix:
+            continue
+        parsed = urlparse(value)
+        dedupe = f"{(parsed.hostname or '').lower()}{unquote(parsed.path).lower()}"
+        if dedupe in seen:
+            continue
+        seen.add(dedupe)
+        source_index += 1
+        filename = Path(unquote(parsed.path)).name
+        if not Path(filename).suffix:
+            filename = f"foto-{source_index:03d}{suffix}"
+        photos.append({
+            "id": source_index, "url": value, "thumbnail": value,
+            "extension": suffix.lstrip("."), "filename": filename[:160],
+            "label": f"Foto {source_index}", "kind": "image",
+        })
+        if len(photos) >= MAX_GALLERY_ITEMS:
+            break
+    return photos
+
+
+def _facebook_public_gallery(url: str) -> list[dict]:
+    """Best-effort logged-out Facebook post/photo page parser; no account cookies."""
+    if not HAS_CURL_CFFI or curl_requests is None:
+        return []
+    session = None
+    try:
+        session = curl_requests.Session(impersonate="chrome")
+        headers = {
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
+            "Accept": "text/html,application/xhtml+xml,application/json;q=0.9,*/*;q=0.8",
+            "Accept-Language": "en-US,en;q=0.9",
+        }
+        response = _curl_meta_page_get(session, url, headers=headers, timeout=16, platform="facebook")
+        final_url = str(getattr(response, "url", url))
+        if response.status_code != 200:
+            print(f"[facebook-public-gallery] page HTTP {response.status_code}")
+            return []
+        page_html = str(getattr(response, "text", "") or "")
+        if "login/?" in final_url.lower() or "login" in page_html[:5000].lower() and "og:image" not in page_html[:5000].lower():
+            print("[facebook-public-gallery] Facebook returned a login wall")
+            return []
+        photos = _facebook_photo_items_from_html(page_html)
+        if not photos:
+            print("[facebook-public-gallery] no public CDN image URLs found")
+        return photos
+    except Exception as exc:
+        print(f"[facebook-public-gallery] {str(exc)[:240]}")
+        return []
+    finally:
+        try:
+            if session is not None:
+                session.close()
+        except Exception:
+            pass
 
 def _safe_threads_media_url(value: str) -> bool:
     try:
@@ -783,6 +1053,81 @@ def _looks_like_image(data: bytes, content_type: str) -> bool:
     return False
 
 
+
+@contextmanager
+def _safe_social_stream(client: httpx.Client, url: str):
+    """Download a media URL while allowing redirects only to known Meta CDNs."""
+    current = url
+    for _ in range(5):
+        if not _safe_social_media_url(current):
+            raise RuntimeError("Alamat CDN media tidak lolos pemeriksaan keamanan.")
+        with client.stream("GET", current) as response:
+            if response.status_code in (301, 302, 303, 307, 308):
+                location = response.headers.get("location")
+                if not location:
+                    raise RuntimeError("CDN mengirim pengalihan tanpa alamat tujuan.")
+                target = urljoin(current, location)
+                if not _safe_social_media_url(target):
+                    raise RuntimeError("Pengalihan CDN ke host di luar daftar aman ditolak.")
+                current = target
+                continue
+            if not _safe_social_media_url(str(response.url)):
+                raise RuntimeError("Host CDN tujuan tidak termasuk daftar aman.")
+            yield response
+            return
+    raise RuntimeError("Terlalu banyak pengalihan dari CDN media.")
+
+
+def _download_social_gallery_items(url: str, platform: str, items: list[dict], indices: list[int]) -> tuple[Path, list[Path]]:
+    if not indices or len(indices) > MAX_GALLERY_ITEMS:
+        raise ValueError(f"Pilih 1 sampai {MAX_GALLERY_ITEMS} foto.")
+    chosen_indices = set(indices)
+    chosen = [item for item in items if item.get("id") in chosen_indices]
+    if len(chosen) != len(indices):
+        raise RuntimeError("Foto tidak lagi tersedia atau indeks galeri berubah. Ambil ulang tautannya.")
+
+    job_dir = Path(tempfile.mkdtemp(prefix=f"{platform}-gallery-", dir=TEMP_ROOT))
+    downloaded: list[Path] = []
+    total_bytes = 0
+    referer = "https://www.instagram.com/" if platform == "instagram" else "https://www.facebook.com/"
+    headers = {
+        "User-Agent": "Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) AppleWebKit/605.1.15 Version/17.0 Mobile/15E148 Safari/604.1",
+        "Referer": referer,
+        "Accept": "image/avif,image/webp,image/apng,image/*,*/*;q=0.8",
+    }
+    try:
+        with httpx.Client(timeout=httpx.Timeout(30.0, connect=10.0), follow_redirects=False, headers=headers) as client:
+            for position, item in enumerate(chosen, 1):
+                if not _safe_social_media_url(str(item.get("url") or "")):
+                    raise RuntimeError("Alamat CDN foto tidak lolos pemeriksaan keamanan.")
+                with _safe_social_stream(client, item["url"]) as response:
+                    if not response.is_success:
+                        raise RuntimeError(f"CDN foto gagal diakses (HTTP {response.status_code}).")
+                    content_type = (response.headers.get("content-type") or "").split(";", 1)[0].lower()
+                    if not content_type.startswith("image/"):
+                        raise RuntimeError("Sumber tidak mengembalikan data foto yang valid.")
+                    parts: list[bytes] = []
+                    size = 0
+                    for chunk in response.iter_bytes():
+                        size += len(chunk)
+                        if size > MAX_GALLERY_FILE_BYTES:
+                            raise RuntimeError("Ada foto yang melebihi batas ukuran per berkas.")
+                        parts.append(chunk)
+                data = b"".join(parts)
+                if not _looks_like_image(data, content_type):
+                    raise RuntimeError("Isi berkas dari CDN bukan gambar yang valid.")
+                total_bytes += len(data)
+                if total_bytes > MAX_GALLERY_TOTAL_BYTES:
+                    raise RuntimeError("Total foto melebihi batas ukuran unduhan galeri.")
+                ext = _extension_from_mime(content_type) or str(item.get("extension") or "jpg").lstrip(".")
+                path = job_dir / f"foto-{position:03d}.{ext}"
+                path.write_bytes(data)
+                downloaded.append(path)
+        return job_dir, downloaded
+    except Exception:
+        shutil.rmtree(job_dir, ignore_errors=True)
+        raise
+
 def _download_threads_gallery_files(url: str, indices: list[int]) -> tuple[Path, list[Path]]:
     if not indices or len(indices) > MAX_GALLERY_ITEMS:
         raise ValueError(f"Pilih 1 sampai {MAX_GALLERY_ITEMS} foto.")
@@ -844,6 +1189,8 @@ def _inspect_payload(url: str, platform: str) -> dict:
         photo_items = _gallery_list_images(url, platform)
         if not photo_items and platform == "instagram":
             photo_items = _instagram_public_gallery(url)
+        elif not photo_items and platform == "facebook":
+            photo_items = _facebook_public_gallery(url)
     if info is None and not photo_items:
         if extraction_error:
             raise extraction_error
@@ -1010,7 +1357,13 @@ def _extract_error(exc: Exception, platform: str):
     original = str(exc)[:500] or "Media tidak tersedia."
     lowered = original.lower()
     code = "error.api.content.video.unavailable"
-    if "unsupported url" in lowered or "not supported" in lowered or "belum didukung" in lowered:
+    if "there is no video in this post" in lowered or "no video in this post" in lowered:
+        code = "error.api.gallery.unavailable"
+        message = "Postingan Instagram ini tidak menyediakan stream video. Petik sudah mencoba extractor foto, tetapi server belum menerima data foto publik. Pastikan postingan bisa dibuka tanpa login; Instagram juga dapat membatasi akses dari server."
+    elif platform == "facebook" and any(term in lowered for term in ("unsupported url", "no formats", "no media", "not supported")):
+        code = "error.api.gallery.unavailable"
+        message = "Facebook tidak mengembalikan data media publik yang bisa dibaca Petik. Periksa apakah tautan dapat dibuka tanpa login; beberapa postingan atau album membatasi akses anonim dari server."
+    elif "unsupported url" in lowered or "not supported" in lowered or "belum didukung" in lowered:
         code = "error.api.link.unsupported"
         message = "Jenis tautan ini belum didukung oleh extractor yang tersedia."
     elif "too many requests" in lowered or "429" in lowered or "rate limit" in lowered:
@@ -1111,6 +1464,9 @@ def health():
         "galleryDlVersion": _gallery_version(),
         "galleryPlatforms": sorted(GALLERY_PLATFORMS | {"threads"}),
         "threadsPhotoResolver": "public-page-json",
+        "instagramPhotoResolver": "gallery-dl+logged-out-graphql+page-json",
+        "facebookPhotoResolver": "gallery-dl+logged-out-page-html",
+        "socialPublicFallbackAvailable": HAS_CURL_CFFI,
         "instagramPublicFallbackAvailable": HAS_CURL_CFFI,
         "maxGalleryItems": MAX_GALLERY_ITEMS,
         "javascriptRuntime": "deno" if shutil.which("deno") else "missing",
@@ -1231,6 +1587,28 @@ def download_gallery(payload: dict, request: Request):
             return _error("error.api.gallery.selection", "Daftar pilihan foto tidak valid.", 400, platform)
         if platform == "threads":
             job_dir, files = _download_threads_gallery_files(url, raw_indices)
+        elif platform in {"instagram", "facebook"}:
+            items = _gallery_list_images(url, platform)
+            if not items and platform == "instagram":
+                items = _instagram_public_gallery(url)
+            elif not items and platform == "facebook":
+                items = _facebook_public_gallery(url)
+            if items:
+                try:
+                    job_dir, files = _download_social_gallery_items(url, platform, items, raw_indices)
+                except Exception as direct_error:
+                    # If a CDN rejects the direct anonymous fetch, retain the
+                    # upstream gallery-dl downloader as a second chance.
+                    try:
+                        job_dir, files = _download_gallery_files(url, raw_indices)
+                    except Exception as fallback_error:
+                        raise RuntimeError(
+                            f"Unduhan CDN gagal ({str(direct_error)[:140]}). Fallback gallery-dl juga gagal ({str(fallback_error)[:140]})."
+                        ) from fallback_error
+            else:
+                # Some gallery-dl extractors can download content not exposed
+                # by the logged-out page fallback; preserve that path.
+                job_dir, files = _download_gallery_files(url, raw_indices)
         else:
             job_dir, files = _download_gallery_files(url, raw_indices)
         zip_requested = bool(payload.get("zip"))

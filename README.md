@@ -1,6 +1,6 @@
 # Petik Universal Extractor API
 
-Backend Petik v1.6.1 berbasis FastAPI, yt-dlp, gallery-dl, curl-cffi (fallback Instagram), Deno/EJS, HTTPX, dan FFmpeg. API mendukung dua pola:
+Backend Petik v1.6.2 berbasis FastAPI, yt-dlp, gallery-dl, curl-cffi (fallback Instagram), Deno/EJS, HTTPX, dan FFmpeg. API mendukung dua pola:
 
 - Native Petik: `POST /api/inspect` memeriksa metadata, format video/audio, dan galeri foto; `POST /api/download` memproses video/audio.
 - Galeri foto: `POST /api/gallery/download` mengunduh indeks foto terpilih sebagai file individual atau satu ZIP.
@@ -13,7 +13,7 @@ Backend Petik v1.6.1 berbasis FastAPI, yt-dlp, gallery-dl, curl-cffi (fallback I
 3. Pastikan `Dockerfile`, `app.py`, `requirements.txt`, dan `render.yaml` berada langsung di root.
 4. Di Render, buka Blueprint `petik-universal-api`, lalu jalankan Manual Sync / Apply jika diminta.
 5. Tunggu deploy berstatus **Live**.
-6. Tes `https://NAMA-LAYANAN.onrender.com/health`; versi yang baru harus menampilkan `1.6.1`, `galleryDlAvailable: true`, serta `galleryDlVersion` yang terdeteksi.
+6. Tes `https://NAMA-LAYANAN.onrender.com/health`; versi yang baru harus menampilkan `1.6.2`, `galleryDlAvailable: true`, serta `galleryDlVersion` yang terdeteksi.
 7. Tes URL root `/`; daftar `cobalt.services` harus memuat layanan yang ditawarkan.
 
 ## Platform dan batas dukungan
@@ -26,8 +26,9 @@ Batasan khusus:
 - Snapchat Spotlight adalah best-effort; extractor yt-dlp pernah dilaporkan gagal akibat perubahan Next.js data pada beberapa tautan.
 - Telegram hanya mendukung postingan channel/grup publik, misalnya `t.me/nama_channel/123`. Tautan privat, invite, chat pribadi, konten protected, dan `t.me/c/...` tidak didukung.
 - Threads: galeri foto/carousel memakai resolver halaman publik tanpa login. Resolver mengambil JSON yang dirender pada halaman post dan memilih post berdasarkan shortcode. Ini rapuh terhadap perubahan HTML/JSON Meta; jika payload tidak lagi tampil untuk pengunjung publik, ekstraksi akan gagal dengan aman. Foto dan video tetap dipisahkan.
-- Instagram: galeri foto mencoba gallery-dl, lalu fallback GraphQL anonim menggunakan curl-cffi untuk postingan publik. Fallback ini mengikuti pendekatan request anonim yang juga dipakai proyek open-source DownSnap; tidak memakai akun, username/password, atau cookie sesi pengguna. Sesi HTTP anonim hanya dipakai untuk mengambil token CSRF publik sementara. GraphQL `doc_id` dapat berubah dan Instagram dapat menampilkan login wall atau membatasi IP server, sehingga ini best-effort.
-- Facebook, X/Twitter, Pinterest, dan Reddit: galeri memakai gallery-dl. Extractor upstream dapat meminta login, cookie, atau OAuth pada sebagian konten/versi platform. Petik tidak mengirim cookie akun pengguna; jika sumber menolak akses tanpa login, unduhan memang tidak akan berhasil.
+- Instagram: galeri foto mencoba gallery-dl, lalu resolver logged-out GraphQL terbaru dan JSON halaman publik menggunakan curl-cffi. Tidak memakai akun, username/password, atau cookie sesi pengguna. Resolver ini tetap best-effort: Meta dapat mengganti query internal, menampilkan login wall, memberi rate limit, atau membatasi IP server.
+- Facebook: galeri foto mencoba gallery-dl, lalu resolver HTML publik yang membaca metadata Open Graph dan URL CDN gambar yang tertanam di halaman. Ini paling sesuai untuk foto yang ditampilkan langsung oleh halaman publik; album/carousel tidak dijamin terambil lengkap bila Facebook tidak menyertakan semua URL di HTML.
+- X/Twitter, Pinterest, dan Reddit: galeri tetap menggunakan gallery-dl. Extractor upstream dapat meminta login, cookie, atau OAuth pada sebagian konten/versi platform. Petik tidak mengirim cookie akun pengguna; jika sumber menolak akses tanpa login, unduhan memang tidak akan berhasil.
 - Tidak ada API komersial, Apify, token API pihak ketiga, atau login akun media sosial yang ditambahkan. Story Instagram/Facebook bukan bagian dari galeri post dan tidak dijanjikan tersedia.
 - Dailymotion dan LinkedIn sekarang dikenali saat validasi tautan dan diserahkan ke yt-dlp; ini bukan jaminan semua jenis post LinkedIn/Dailymotion berhasil.
 - Media privat, paywalled, age-gated, atau yang hanya dapat dibuka dengan sesi login tidak didukung.
@@ -47,20 +48,28 @@ Batasan khusus:
 
 ## Tes
 
-Folder `tests/` berisi 44 tes offline untuk validasi platform, endpoint inspect dan URL preview progresif, deteksi direct-media URL, parser CDN dengan ekstensi query, parser galeri Threads/Instagram, keamanan host CDN dan redirect, indeks carousel campuran, endpoint download, kompatibilitas Cobalt, tunnel file, format MP3, filter durasi, dan kualitas video. Tes tiruan tidak membuktikan keberhasilan unduhan langsung dari situs sumber.
+Folder `tests/` berisi 56 tes offline untuk validasi platform, endpoint inspect dan URL preview progresif, deteksi direct-media URL, parser CDN dengan ekstensi query, parser galeri Threads/Instagram, keamanan host CDN dan redirect, indeks carousel campuran, endpoint download, kompatibilitas Cobalt, tunnel file, format MP3, filter durasi, dan kualitas video. Tes tiruan tidak membuktikan keberhasilan unduhan langsung dari situs sumber.
 
 
-## Perubahan v1.6.1 (revisi berbasis API v1.6)
+## Perubahan v1.6.2 (perbaikan Instagram dan Facebook publik)
 
-- Memperbaiki parser URL galeri agar membaca ekstensi gambar dari path maupun parameter query CDN (`format`, `fm`, `ext`, `mime_type`, dan nama file), sambil tetap menolak URL HTTP atau URL yang tidak bisa dipastikan sebagai gambar.
-- Memperbaiki batas indeks galeri untuk carousel campuran: indeks sumber foto/video kini boleh sampai `MAX_GALLERY_SOURCE_ITEMS`, bukan hanya jumlah foto yang terlihat.
-- Menambahkan resolver foto/carousel Threads dari JSON halaman publik; URL postingan `/share/` dapat dipadankan melalui canonical `og:url`. Unduhan foto Threads memakai host CDN allowlist, validasi MIME/magic bytes, batas ukuran, dan redirect yang dibatasi.
-- Menambahkan fallback galeri Instagram tanpa sesi akun: gallery-dl dicoba dahulu, lalu GraphQL publik anonim dengan `curl-cffi`. Fallback ini best-effort karena GraphQL internal dapat berubah atau dibatasi.
-- Menambahkan pengenalan domain Dailymotion, `dai.ly`, dan LinkedIn.
-- Menambahkan HTTPX sebagai dependensi eksplisit dan `curl-cffi` untuk fallback Instagram.
-- Memperbaiki `/health` untuk melaporkan versi gallery-dl melalui metadata paket jika CLI tidak menuliskan versi ke stdout.
-- Memperjelas pesan error ekstraksi agar status login wall, pembatasan, URL tidak didukung, dan timeout tidak seluruhnya berubah menjadi pesan generik.
-- Video/audio dan antarmuka galeri yang ada tetap dipertahankan.
+- Memutakhirkan resolver Instagram anonim agar mengikuti query logged-out `PolarisLoggedOutDesktopWWWPostRootContentQuery`: shortcode dikonversi ke media ID numerik, token LSD/CSRF dibaca dari sesi anonim, dan respons `xig_polaris_media.if_not_gated_logged_out` dinormalisasi.
+- Memperbaiki konfigurasi TLS impersonation `curl-cffi`: fingerprint browser diberikan saat membuat `Session(impersonate="chrome")`, bukan dengan mengisi atribut sesi sesudahnya.
+- Menambahkan fallback Instagram dari JSON halaman publik ketika respons GraphQL tidak menyediakan objek media.
+- Memperluas parser Instagram untuk `carousel_media`, `image_versions2`, `display_resources`, serta media video di sela-sela foto; poster video tidak dianggap foto.
+- Menambahkan fallback Facebook publik berbasis metadata Open Graph dan URL CDN gambar yang tertanam di HTML halaman, tanpa login atau cookie akun.
+- Menambahkan unduhan langsung dari CDN Instagram/Facebook yang sudah lolos allowlist HTTPS, validasi redirect, MIME/magic bytes, dan batas ukuran. `gallery-dl` tetap menjadi jalur awal dan fallback unduhan.
+- Menambahkan status resolver di `/health` dan pesan lebih jelas ketika Instagram hanya mengembalikan error karena tidak ada stream video dan tidak ada data foto publik yang berhasil dibaca.
+- Mempertahankan resolver Threads yang sudah ada serta fitur video/audio dan galeri frontend.
+- Menambahkan tes offline untuk query GraphQL terbaru, fallback Facebook, unduhan CDN, batas host, dan jalur API; tes fixture bukan bukti live extraction dari Meta.
+
+## Perubahan yang diwarisi dari v1.6.1
+
+- Parser CDN membaca ekstensi gambar dari path maupun parameter query (`format`, `fm`, `ext`, `mime_type`, dan nama file), sambil menolak URL HTTP atau URL yang tidak bisa dipastikan sebagai gambar.
+- Batas indeks galeri mengakomodasi carousel campuran foto/video.
+- Threads menggunakan resolver halaman publik untuk URL `/share/`, termasuk pemilihan foto dan download dengan pembatasan host CDN.
+- Instagram sebelumnya telah memiliki fallback GraphQL anonim; pada v1.6.2, query tersebut diperbarui agar sesuai pola logged-out extractor saat ini.
+- Dailymotion dan LinkedIn dikenali saat validasi tautan dan diserahkan ke yt-dlp; ini bukan jaminan semua jenis post berhasil.
 
 ## Perubahan yang diwarisi dari v1.5
 
