@@ -1,0 +1,16 @@
+services:
+  - type: web
+    name: petik-universal-api
+    runtime: docker
+    plan: free
+    dockerfilePath: ./Dockerfile
+    healthCheckPath: /health
+    envVars:
+      - key: MAX_FILE_MB
+        value: "140"
+      - key: MAX_DURATION_SECONDS
+        value: "3600"
+      - key: FILE_TTL_SECONDS
+        value: "1800"
+      - key: MAX_CONCURRENT_DOWNLOADS
+        value: "1"
