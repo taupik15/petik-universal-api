@@ -29,7 +29,7 @@ def test_health_endpoint_and_version():
     response = client.get("/health")
     assert response.status_code == 200
     assert response.json()["status"] == "healthy"
-    assert response.json()["version"] == "1.6.0"
+    assert response.json()["version"] == "1.6.1"
     assert "javascriptRuntime" in response.json()
 
 
@@ -53,6 +53,8 @@ def test_twelve_platforms_are_recognised():
         "https://soundcloud.com/artist/track": "soundcloud",
         "https://t.me/sample_channel/123": "telegram",
         "https://www.threads.net/@sample/post/ABC123": "threads",
+        "https://www.dailymotion.com/video/x123abc": "dailymotion",
+        "https://www.linkedin.com/posts/example_123": "linkedin",
         "https://www.snapchat.com/spotlight/abc123": "snapchat",
     }
     for url, expected in samples.items():
@@ -506,3 +508,216 @@ def test_inspect_does_not_mislabel_direct_jpg_as_video(monkeypatch):
     assert body["videoOptions"] == []
     assert body["audioOptions"] == []
     assert len(body["photoItems"]) == 2
+
+
+def test_gallery_url_parser_reads_image_format_from_query_and_keeps_source_ids():
+    output = "\n".join([
+        "https://cdn.example/item-one?token=abc&format=jpeg",
+        "https://cdn.example/clip.mp4?token=abc",
+        "https://cdn.example/item-two?fm=webp&sig=xyz",
+        "https://cdn.example/item-three?mime_type=image%2Fpng&sig=xyz",
+    ])
+    items = api._parse_gallery_urls(output)
+    assert [item["id"] for item in items] == [1, 3, 4]
+    assert [item["extension"] for item in items] == ["jpeg", "webp", "png"]
+
+
+def test_gallery_download_accepts_source_index_above_visible_photo_limit(monkeypatch, tmp_path):
+    captured = {}
+    def fake_run(command, **kwargs):
+        captured["command"] = command
+        folder = Path(command[command.index("--directory") + 1])
+        folder.mkdir(parents=True, exist_ok=True)
+        (folder / "025.jpg").write_bytes(b"photo-25")
+        return types.SimpleNamespace(returncode=0, stdout="", stderr="")
+    monkeypatch.setattr(api, "_gallery_command", lambda: "/usr/bin/gallery-dl")
+    monkeypatch.setattr(api, "TEMP_ROOT", tmp_path)
+    monkeypatch.setattr(api.subprocess, "run", fake_run)
+    folder, files = api._download_gallery_files("https://www.instagram.com/p/ABC123/", [25])
+    assert len(files) == 1
+    assert captured["command"][captured["command"].index("--filter") + 1] == "num in (25)"
+    import shutil as _shutil
+    _shutil.rmtree(folder, ignore_errors=True)
+
+
+def _threads_fixture_html():
+    return '''<html><head><meta property="og:url" content="https://www.threads.com/@demo/post/THREAD123"></head>
+    <body><script type="application/json" data-sjs>
+    {"data":{"post":{"code":"THREAD123","media_type":8,"carousel_media":[
+      {"media_type":1,"image_versions2":{"candidates":[
+        {"url":"https://scontent.cdninstagram.com/small.jpg","width":320,"height":320},
+        {"url":"https://scontent.cdninstagram.com/large.jpg?format=jpg","width":1080,"height":1080}]}},
+      {"media_type":2,"video_versions":[{"url":"https://video.cdninstagram.com/clip.mp4"}],
+       "image_versions2":{"candidates":[{"url":"https://scontent.cdninstagram.com/poster.jpg","width":640,"height":640}]}},
+      {"media_type":1,"image_versions2":{"candidates":[{"url":"https://scontent.cdninstagram.com/second.webp?fm=webp","width":900,"height":1200}]}}
+    ]}}}
+    </script></body></html>'''
+
+
+def test_threads_share_link_resolves_canonical_post_shortcode():
+    html = _threads_fixture_html()
+    assert api._threads_page_shortcode("https://www.threads.com/share/SHARE123", html) == "THREAD123"
+
+
+def test_threads_photo_parser_returns_only_real_images_and_best_variant():
+    items = api._threads_photo_items("https://www.threads.com/share/SHARE123", _threads_fixture_html())
+    assert len(items) == 2
+    assert items[0]["url"] == "https://scontent.cdninstagram.com/large.jpg?format=jpg"
+    assert items[1]["url"] == "https://scontent.cdninstagram.com/second.webp?fm=webp"
+    assert [item["id"] for item in items] == [1, 2]
+
+
+def test_threads_gallery_requires_safe_cdn_hosts():
+    assert api._safe_threads_media_url("https://scontent.cdninstagram.com/photo.jpg")
+    assert api._safe_threads_media_url("https://video.fna.fbcdn.net/photo.jpg")
+    assert not api._safe_threads_media_url("https://example.com/photo.jpg")
+    assert not api._safe_threads_media_url("http://scontent.cdninstagram.com/photo.jpg")
+    assert not api._safe_threads_media_url("https://127.0.0.1/private.jpg")
+
+
+def test_threads_inspect_returns_photo_items_without_ytdlp(monkeypatch):
+    no_rate_limit(monkeypatch)
+    def unavailable(_url):
+        raise RuntimeError("Unsupported URL")
+    monkeypatch.setattr(api, "_extract_info", unavailable)
+    monkeypatch.setattr(api, "_fetch_threads_page", lambda _url: _threads_fixture_html())
+    response = client.post("/api/inspect", json={"url": "https://www.threads.com/share/SHARE123"})
+    assert response.status_code == 200
+    body = response.json()
+    assert body["service"] == "threads"
+    assert len(body["photoItems"]) == 2
+    assert body["galleryAvailable"] is True
+
+
+def test_threads_gallery_download_routes_to_public_page_resolver(monkeypatch, tmp_path):
+    no_rate_limit(monkeypatch)
+    def fake_download(_url, indices):
+        assert indices == [1]
+        folder = tmp_path / "threads-gallery-job"
+        folder.mkdir()
+        file = folder / "foto-001.jpg"
+        file.write_bytes(b"thread-photo")
+        return folder, [file]
+    monkeypatch.setattr(api, "_download_threads_gallery_files", fake_download)
+    response = client.post("/api/gallery/download", json={
+        "url": "https://www.threads.com/share/SHARE123", "indices": [1], "zip": False
+    })
+    assert response.status_code == 200
+    assert response.json()["service"] == "threads"
+    assert response.json()["count"] == 1
+
+
+def test_dailymotion_and_linkedin_are_recognised():
+    assert api._normalise_and_validate("https://www.dailymotion.com/video/x123abc")[1] == "dailymotion"
+    assert api._normalise_and_validate("https://dai.ly/x123abc")[1] == "dailymotion"
+    assert api._normalise_and_validate("https://www.linkedin.com/posts/example_123")[1] == "linkedin"
+
+
+
+def test_instagram_public_graphql_normalizes_photo_carousel_and_skips_video():
+    payload = {
+        "edge_sidecar_to_children": {"edges": [
+            {"node": {"is_video": False, "display_url": "https://scontent.cdninstagram.com/a.jpg"}},
+            {"node": {"is_video": True, "video_url": "https://video.cdninstagram.com/b.mp4", "display_url": "https://scontent.cdninstagram.com/poster.jpg"}},
+            {"node": {"is_video": False, "display_url": "https://scontent.cdninstagram.com/c.jpg"}},
+        ]}
+    }
+    items = api._instagram_photo_items(payload)
+    assert [item["url"] for item in items] == [
+        "https://scontent.cdninstagram.com/a.jpg",
+        "https://scontent.cdninstagram.com/c.jpg",
+    ]
+    assert [item["id"] for item in items] == [1, 2]
+
+
+def test_instagram_public_fallback_uses_anonymous_graphql_session(monkeypatch):
+    payload = {"data": {"xdt_shortcode_media": {
+        "edge_sidecar_to_children": {"edges": [
+            {"node": {"is_video": False, "display_url": "https://scontent.cdninstagram.com/a.jpg"}},
+            {"node": {"is_video": False, "display_url": "https://scontent.cdninstagram.com/b.jpg"}},
+        ]}
+    }}}
+    class FakeResponse:
+        status_code = 200
+        def __init__(self, data=None): self._data = data
+        def json(self): return self._data
+    class FakeSession:
+        def __init__(self): self.cookies = {"csrftoken": "anonymous"}; self.calls = []
+        def get(self, url, **kwargs):
+            self.calls.append((url, kwargs))
+            return FakeResponse(payload) if "graphql/query" in url else FakeResponse()
+    class FakeCurl:
+        last_session = None
+        @classmethod
+        def Session(cls):
+            cls.last_session = FakeSession()
+            return cls.last_session
+    monkeypatch.setattr(api, "curl_requests", FakeCurl)
+    monkeypatch.setattr(api, "HAS_CURL_CFFI", True)
+    items = api._instagram_public_gallery("https://www.instagram.com/p/ABC123/")
+    assert len(items) == 2
+    assert len(FakeCurl.last_session.calls) == 2
+    assert FakeCurl.last_session.impersonate == "chrome124"
+    assert "cookies.txt" not in str(FakeCurl.last_session.calls)
+
+
+def test_health_reports_gallery_and_public_fallback_capabilities():
+    body = client.get("/health").json()
+    assert body["version"] == "1.6.1"
+    assert "threads" in body["galleryPlatforms"]
+    assert body["threadsPhotoResolver"] == "public-page-json"
+    assert isinstance(body["instagramPublicFallbackAvailable"], bool)
+
+
+def test_threads_redirects_reject_external_hosts_before_following():
+    import httpx
+    calls = []
+    def handler(request):
+        calls.append(str(request.url))
+        return httpx.Response(302, headers={"Location": "https://example.com/redirect-target"})
+    with httpx.Client(transport=httpx.MockTransport(handler), follow_redirects=False) as client_http:
+        try:
+            with api._safe_threads_stream(client_http, "https://www.threads.com/share/ABC"):
+                pass
+        except RuntimeError as exc:
+            assert "Pengalihan" in str(exc)
+        else:
+            raise AssertionError("External redirect must be rejected")
+    assert len(calls) == 1
+
+
+def test_threads_gallery_download_fetches_and_validates_image_bytes(monkeypatch, tmp_path):
+    import httpx
+    image_bytes = b"\xff\xd8\xff" + b"petik-test-jpeg"
+    transport = httpx.MockTransport(lambda request: httpx.Response(
+        200, headers={"Content-Type": "image/jpeg"}, content=image_bytes, request=request
+    ))
+    original_client = httpx.Client
+    monkeypatch.setattr(api, "TEMP_ROOT", tmp_path)
+    monkeypatch.setattr(api, "_threads_list_images", lambda _url: [{
+        "id": 1, "url": "https://scontent.cdninstagram.com/test.jpg", "extension": "jpg"
+    }])
+    monkeypatch.setattr(api.httpx, "Client", lambda **kwargs: original_client(transport=transport, **kwargs))
+    folder, files = api._download_threads_gallery_files("https://www.threads.com/share/ABC", [1])
+    assert len(files) == 1
+    assert files[0].read_bytes() == image_bytes
+    assert files[0].suffix == ".jpg"
+    import shutil as _shutil
+    _shutil.rmtree(folder, ignore_errors=True)
+
+
+def test_threads_stream_rejects_unsafe_initial_host_before_network_request():
+    import httpx
+    calls = []
+    def handler(request):
+        calls.append(str(request.url))
+        return httpx.Response(200, content="unexpected", request=request)
+    with httpx.Client(transport=httpx.MockTransport(handler), follow_redirects=False) as client_http:
+        try:
+            with api._safe_threads_stream(client_http, "https://example.com/private"):
+                pass
+        except RuntimeError as exc:
+            assert "daftar host HTTPS" in str(exc)
+        else:
+            raise AssertionError("Unsafe initial host must be rejected")
+    assert calls == []
