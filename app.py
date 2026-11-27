@@ -18,13 +18,15 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 from yt_dlp import YoutubeDL
 
-APP_VERSION = "1.3.0"
+APP_VERSION = "1.4.0"
 MAX_FILE_BYTES = int(os.getenv("MAX_FILE_MB", "140")) * 1024 * 1024
 FILE_TTL_SECONDS = int(os.getenv("FILE_TTL_SECONDS", "1800"))
 MAX_DURATION_SECONDS = int(os.getenv("MAX_DURATION_SECONDS", "3600"))
 MAX_CONCURRENT = max(1, int(os.getenv("MAX_CONCURRENT_DOWNLOADS", "1")))
 RATE_LIMIT_COUNT = max(1, int(os.getenv("RATE_LIMIT_COUNT", "20")))
 RATE_LIMIT_WINDOW = max(60, int(os.getenv("RATE_LIMIT_WINDOW_SECONDS", "300")))
+PREVIEW_MAX_CONCURRENT = max(2, int(os.getenv("PREVIEW_MAX_CONCURRENT", "6")))
+PREVIEW_RATE_COUNT = max(30, int(os.getenv("PREVIEW_RATE_COUNT", "240")))
 TEMP_ROOT = Path(os.getenv("TEMP_DIR", "/tmp/petik-media"))
 TEMP_ROOT.mkdir(parents=True, exist_ok=True)
 
@@ -64,6 +66,11 @@ app.add_middleware(
 )
 
 download_slots = threading.BoundedSemaphore(MAX_CONCURRENT)
+# Preview punya jatah sendiri: Safari/iOS mengirim banyak request Range paralel
+# untuk satu video. Kalau berbagi slot (1) dan limit (20/5 menit) dengan unduhan,
+# preview langsung kena 429 dan video tidak bisa diputar.
+preview_slots = threading.BoundedSemaphore(PREVIEW_MAX_CONCURRENT)
+preview_rate_events: dict[str, deque[float]] = defaultdict(deque)
 active_files: dict[str, tuple[Path, str, float]] = {}
 rate_events: dict[str, deque[float]] = defaultdict(deque)
 state_lock = threading.Lock()
@@ -91,6 +98,18 @@ def _rate_limited(key: str) -> bool:
         while q and now - q[0] > RATE_LIMIT_WINDOW:
             q.popleft()
         if len(q) >= RATE_LIMIT_COUNT:
+            return True
+        q.append(now)
+        return False
+
+
+def _preview_rate_limited(key: str) -> bool:
+    now = time.time()
+    with state_lock:
+        q = preview_rate_events[key]
+        while q and now - q[0] > RATE_LIMIT_WINDOW:
+            q.popleft()
+        if len(q) >= PREVIEW_RATE_COUNT:
             return True
         q.append(now)
         return False
@@ -268,38 +287,42 @@ def _safe_preview_url(value) -> str | None:
         return None
 
 
+def _is_none_codec(value) -> bool:
+    """True only when yt-dlp explicitly says "none" (bukan sekadar tidak dilaporkan)."""
+    return isinstance(value, str) and value.strip().lower() == "none"
+
+
 def _preview_url(info: dict, platform: str) -> str | None:
     """Choose a browser-friendly progressive stream for inline video preview."""
     if platform == "soundcloud":
         return None
-    formats = _media_formats(info)
     candidates = []
-    for fmt in formats:
+    for fmt in _media_formats(info):
         url = _safe_preview_url(fmt.get("url"))
-        if not url or not _codec_present(fmt.get("vcodec")):
+        if not url:
             continue
-        if not _codec_present(fmt.get("acodec")):
+        vcodec, acodec = fmt.get("vcodec"), fmt.get("acodec")
+        # "none" berarti pasti tidak ada; None/kosong berarti tidak dilaporkan.
+        if _is_none_codec(vcodec) or _is_none_codec(acodec):
             continue
         ext = str(fmt.get("ext") or "").lower()
         protocol = str(fmt.get("protocol") or "").lower()
         if ext in {"m3u8", "mpd"} or "m3u8" in protocol or "dash" in protocol:
             continue
+        known = _codec_present(vcodec) and _codec_present(acodec)
+        if not known and ext not in {"mp4", "mov", "m4v", "webm"}:
+            continue
         height = fmt.get("height")
         height = int(height) if isinstance(height, (int, float)) and height > 0 else 0
-        # Prefer MP4 and a practical preview size; never construct or rewrite URLs.
-        candidates.append((0 if ext == "mp4" else 1, 0 if 0 < height <= 720 else 1, -min(height or 720, 720), url))
+        candidates.append((0 if known else 1, 0 if ext == "mp4" else 1, 0 if 0 < height <= 720 else 1, -min(height or 720, 720), url))
     if candidates:
         candidates.sort()
-        return candidates[0][3]
+        return candidates[0][-1]
 
-    # A few extractors publish only one combined direct media URL on the root info.
     root_url = _safe_preview_url(info.get("url"))
-    if root_url and _codec_present(info.get("vcodec")) and _codec_present(info.get("acodec")):
-        return root_url
     ext = str(info.get("ext") or "").lower()
-    if root_url and ext in {"mp4", "webm", "mov", "m4v"} and not _codec_present(info.get("acodec")):
-        return root_url
-    if root_url and not _codec_present(info.get("vcodec")) and not _codec_present(info.get("acodec")) and ext not in {"mp3", "m4a", "aac", "wav", "flac", "ogg", "opus", "m3u8", "mpd"}:
+    if root_url and not _is_none_codec(info.get("vcodec")) and not _is_none_codec(info.get("acodec")) \
+            and ext not in {"mp3", "m4a", "aac", "wav", "flac", "ogg", "opus", "m3u8", "mpd"}:
         return root_url
     return None
 
@@ -529,14 +552,15 @@ def _preview_source(url: str) -> tuple[str, dict]:
 @app.get("/api/preview")
 def preview_media(request: Request, url: str):
     """Range-aware media proxy so Safari can play, pause and seek inline previews."""
-    limited = _acquire(request)
-    if limited:
-        return limited
+    if _preview_rate_limited(_client_key(request)):
+        return _error("error.api.rate.limit", "Terlalu banyak permintaan pratinjau.", 429)
+    if not preview_slots.acquire(blocking=False):
+        return _error("error.api.rate.limit", "Pratinjau sedang sibuk. Coba lagi sebentar.", 429)
     upstream = None
     try:
         normalised, error = _normalise_request({"url": url})
         if error:
-            download_slots.release()
+            preview_slots.release()
             return error
         source_url, _platform = normalised
         media_url, upstream_headers = _preview_source(source_url)
@@ -570,13 +594,13 @@ def preview_media(request: Request, url: str):
                     yield chunk
             finally:
                 upstream.close()
-                download_slots.release()
+                preview_slots.release()
         return StreamingResponse(stream(), status_code=status, headers=response_headers, media_type=None)
     except Exception as exc:
         if upstream is not None:
             try: upstream.close()
             except Exception: pass
-        download_slots.release()
+        preview_slots.release()
         return JSONResponse({"success": False, "error": str(exc)[:300]}, status_code=502)
 
 @app.post("/api/inspect")

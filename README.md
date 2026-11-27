@@ -12,7 +12,7 @@ Backend Petik berbasis FastAPI, yt-dlp, Deno/EJS, dan FFmpeg. API mendukung dua 
 3. Pastikan `Dockerfile`, `app.py`, `requirements.txt`, dan `render.yaml` berada langsung di root.
 4. Di Render, buka Blueprint `petik-universal-api`, lalu jalankan Manual Sync / Apply jika diminta.
 5. Tunggu deploy berstatus **Live**.
-6. Tes `https://NAMA-LAYANAN.onrender.com/health`; versi yang baru harus menampilkan `1.3.0`.
+6. Tes `https://NAMA-LAYANAN.onrender.com/health`; versi yang baru harus menampilkan `1.4.0`.
 7. Tes URL root `/`; daftar `cobalt.services` harus memuat layanan yang ditawarkan.
 
 ## Platform dan batas dukungan
