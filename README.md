@@ -12,7 +12,7 @@ Backend Petik berbasis FastAPI, yt-dlp, Deno/EJS, dan FFmpeg. API mendukung dua 
 3. Pastikan `Dockerfile`, `app.py`, `requirements.txt`, dan `render.yaml` berada langsung di root.
 4. Di Render, buka Blueprint `petik-universal-api`, lalu jalankan Manual Sync / Apply jika diminta.
 5. Tunggu deploy berstatus **Live**.
-6. Tes `https://NAMA-LAYANAN.onrender.com/health`; versi yang baru harus menampilkan `1.4.0`.
+6. Tes `https://NAMA-LAYANAN.onrender.com/health`; versi yang baru harus menampilkan `1.5.0`.
 7. Tes URL root `/`; daftar `cobalt.services` harus memuat layanan yang ditawarkan.
 
 ## Platform dan batas dukungan
@@ -42,3 +42,10 @@ Batasan khusus:
 ## Tes
 
 Folder `tests/` berisi tes offline untuk validasi platform, endpoint inspect dan URL preview progresif, deteksi direct-media URL, endpoint download, kompatibilitas Cobalt, tunnel file, format MP3, filter durasi, dan kualitas video. Tes tiruan tidak membuktikan keberhasilan unduhan langsung dari situs sumber.
+
+
+## Perubahan v1.5
+
+- yt-dlp tidak lagi dikunci ke satu versi, dan diperbarui otomatis tiap container hidup (matikan dengan `YTDLP_AUTO_UPDATE=0`). `/health` menampilkan `ytdlpVersion`.
+- Unduhan bersamaan default 2 (sebelumnya 1) dan batas 40 permintaan per 5 menit. Kalau Render Free kehabisan memori (out of memory di log), kembalikan `MAX_CONCURRENT_DOWNLOADS` ke 1.
+- Pratinjau punya slot dan batas sendiri (v1.4).

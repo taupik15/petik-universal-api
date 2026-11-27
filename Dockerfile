@@ -21,4 +21,7 @@ RUN pip install --no-cache-dir -r requirements.txt
 COPY app.py ./app.py
 
 EXPOSE 10000
-CMD ["sh", "-c", "uvicorn app:app --host 0.0.0.0 --port ${PORT:-10000}"]
+# Saat container bangun (Render Free tidur lalu hidup lagi), yt-dlp diperbarui dulu
+# karena Instagram/TikTok/YouTube sering berubah. Gagal/lambat -> lanjut pakai versi terpasang.
+# Matikan dengan env YTDLP_AUTO_UPDATE=0.
+CMD ["sh", "-c", "if [ \"${YTDLP_AUTO_UPDATE:-1}\" = \"1\" ]; then timeout 60 pip install --no-cache-dir -q -U 'yt-dlp[default]' || echo 'pembaruan yt-dlp dilewati'; fi; exec uvicorn app:app --host 0.0.0.0 --port ${PORT:-10000}"]

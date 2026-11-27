@@ -18,12 +18,12 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 from yt_dlp import YoutubeDL
 
-APP_VERSION = "1.4.0"
+APP_VERSION = "1.5.0"
 MAX_FILE_BYTES = int(os.getenv("MAX_FILE_MB", "140")) * 1024 * 1024
 FILE_TTL_SECONDS = int(os.getenv("FILE_TTL_SECONDS", "1800"))
 MAX_DURATION_SECONDS = int(os.getenv("MAX_DURATION_SECONDS", "3600"))
-MAX_CONCURRENT = max(1, int(os.getenv("MAX_CONCURRENT_DOWNLOADS", "1")))
-RATE_LIMIT_COUNT = max(1, int(os.getenv("RATE_LIMIT_COUNT", "20")))
+MAX_CONCURRENT = max(1, int(os.getenv("MAX_CONCURRENT_DOWNLOADS", "2")))
+RATE_LIMIT_COUNT = max(1, int(os.getenv("RATE_LIMIT_COUNT", "40")))
 RATE_LIMIT_WINDOW = max(60, int(os.getenv("RATE_LIMIT_WINDOW_SECONDS", "300")))
 PREVIEW_MAX_CONCURRENT = max(2, int(os.getenv("PREVIEW_MAX_CONCURRENT", "6")))
 PREVIEW_RATE_COUNT = max(30, int(os.getenv("PREVIEW_RATE_COUNT", "240")))
@@ -516,6 +516,14 @@ def server_info(request: Request):
     }
 
 
+def _ytdlp_version() -> str:
+    try:
+        from yt_dlp.version import __version__
+        return str(__version__)
+    except Exception:
+        return "unknown"
+
+
 @app.get("/health")
 def health():
     return {
@@ -523,6 +531,7 @@ def health():
         "status": "healthy",
         "version": APP_VERSION,
         "engine": "yt-dlp+ffmpeg",
+        "ytdlpVersion": _ytdlp_version(),
         "javascriptRuntime": "deno" if shutil.which("deno") else "missing",
     }
 

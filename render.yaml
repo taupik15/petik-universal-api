@@ -13,8 +13,10 @@ services:
       - key: FILE_TTL_SECONDS
         value: "1800"
       - key: MAX_CONCURRENT_DOWNLOADS
-        value: "1"
+        value: "2"
       - key: RATE_LIMIT_COUNT
-        value: "20"
+        value: "40"
       - key: RATE_LIMIT_WINDOW_SECONDS
         value: "300"
+      - key: YTDLP_AUTO_UPDATE
+        value: "1"
