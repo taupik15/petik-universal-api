@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import os
 import re
+import json
+import html as html_lib
 import shutil
 import secrets
 import subprocess
@@ -11,21 +13,35 @@ import time
 import zipfile
 import urllib.error
 import urllib.request
+from contextlib import contextmanager
 from collections import defaultdict, deque
 from pathlib import Path
-from urllib.parse import urlparse, unquote
+from urllib.parse import urlparse, unquote, parse_qs, urljoin
+
+import httpx
+
+try:
+    from curl_cffi import requests as curl_requests
+    HAS_CURL_CFFI = True
+except ImportError:
+    curl_requests = None
+    HAS_CURL_CFFI = False
 
 from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 from yt_dlp import YoutubeDL
 
-APP_VERSION = "1.6.0"
+APP_VERSION = "1.6.1"
 MAX_GALLERY_ITEMS = max(1, min(30, int(os.getenv("MAX_GALLERY_ITEMS", "20"))))
 MAX_GALLERY_SOURCE_ITEMS = MAX_GALLERY_ITEMS * 2  # Mixed carousels can contain video entries between photos.
 MAX_GALLERY_FILE_BYTES = int(os.getenv("MAX_GALLERY_FILE_MB", "20")) * 1024 * 1024
 MAX_GALLERY_TOTAL_BYTES = int(os.getenv("MAX_GALLERY_TOTAL_MB", "60")) * 1024 * 1024
 GALLERY_PLATFORMS = {"instagram", "facebook", "twitter", "pinterest", "reddit"}
+THREADS_PAGE_HOSTS = {"threads.net", "threads.com"}
+THREADS_MEDIA_SUFFIXES = (".cdninstagram.com", ".fbcdn.net", ".threads.net", ".threads.com", ".fbsbx.com")
+THREADS_MAX_PAGE_BYTES = 3 * 1024 * 1024
+THREADS_CRAWLER_UA = "Mozilla/5.0 (compatible; Googlebot/2.1; +http://www.google.com/bot.html)"
 IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".webp", ".gif", ".avif", ".heic"}
 MAX_FILE_BYTES = int(os.getenv("MAX_FILE_MB", "140")) * 1024 * 1024
 FILE_TTL_SECONDS = int(os.getenv("FILE_TTL_SECONDS", "1800"))
@@ -41,6 +57,7 @@ TEMP_ROOT.mkdir(parents=True, exist_ok=True)
 SERVICES = [
     "youtube", "instagram", "facebook", "tiktok", "twitter",
     "reddit", "vimeo", "pinterest", "soundcloud", "telegram", "threads", "snapchat",
+    "dailymotion", "linkedin",
 ]
 
 HOSTS = {
@@ -56,6 +73,8 @@ HOSTS = {
     "t.me", "telegram.me",
     "threads.net", "threads.com",
     "snapchat.com",
+    "dailymotion.com", "dai.ly",
+    "linkedin.com",
 }
 
 app = FastAPI(title="Petik Universal Extractor API", version=APP_VERSION)
@@ -186,6 +205,10 @@ def _normalise_and_validate(raw_url: str) -> tuple[str, str]:
         platform = "twitter"
     elif host == "snapchat.com" or host.endswith(".snapchat.com"):
         platform = "snapchat"
+    elif host == "dailymotion.com" or host.endswith(".dailymotion.com") or host == "dai.ly":
+        platform = "dailymotion"
+    elif host == "linkedin.com" or host.endswith(".linkedin.com"):
+        platform = "linkedin"
     return value, platform
 
 
@@ -353,17 +376,43 @@ def _gallery_command() -> str | None:
     return shutil.which("gallery-dl")
 
 
-def _parse_gallery_urls(output: str) -> list[dict]:
-    """Convert gallery-dl's -g output into a small, safe image manifest.
+def _image_extension_from_url(value: str) -> str | None:
+    """Resolve common image extensions from a CDN path or signed query string."""
+    parsed = urlparse(value)
+    suffix = Path(unquote(parsed.path)).suffix.lower()
+    if suffix in IMAGE_EXTENSIONS:
+        return suffix
 
-    IDs retain the original extractor position so mixed photo/video carousels
-    can be downloaded with gallery-dl's --range option without index drift.
+    query = parse_qs(parsed.query, keep_blank_values=False)
+    for key in ("format", "fm", "ext", "extension", "image_format", "mime", "mime_type", "content_type", "filename", "file", "name"):
+        for raw in query.get(key, []):
+            candidate = unquote(str(raw)).lower().strip()
+            if "image/" in candidate:
+                candidate = candidate.split("image/", 1)[1].split(";", 1)[0]
+            candidate = candidate.split("?", 1)[0].split("#", 1)[0]
+            ext = Path(candidate).suffix.lower()
+            if ext in IMAGE_EXTENSIONS:
+                return ext
+            candidate = candidate.lstrip(".")
+            if f".{candidate}" in IMAGE_EXTENSIONS:
+                return f".{candidate}"
+            if candidate in {item.lstrip(".") for item in IMAGE_EXTENSIONS}:
+                return f".{candidate}"
+    return None
+
+
+def _parse_gallery_urls(output: str) -> list[dict]:
+    """Convert gallery-dl's -g output into a safe image manifest.
+
+    IDs retain the original URL order (including skipped non-image entries), so
+    mixed photo/video galleries can still be selected with gallery-dl --filter.
+    Signed CDN URLs commonly put image format in the query instead of the path.
     """
     found: list[dict] = []
     seen: set[str] = set()
     source_index = 0
     for raw in (output or "").splitlines():
-        value = raw.strip().strip('"')
+        value = raw.strip().strip('"').strip("'")
         if not value.startswith(("https://", "http://")):
             continue
         source_index += 1
@@ -371,13 +420,18 @@ def _parse_gallery_urls(output: str) -> list[dict]:
             break
         try:
             parsed = urlparse(value)
-            if parsed.scheme != "https" or not parsed.hostname:
+            if parsed.scheme != "https" or not parsed.hostname or parsed.username or parsed.password:
                 continue
-            suffix = Path(unquote(parsed.path)).suffix.lower()
-            if suffix not in IMAGE_EXTENSIONS or value in seen:
+            suffix = _image_extension_from_url(value)
+            if not suffix:
                 continue
-            seen.add(value)
-            filename = Path(unquote(parsed.path)).name or f"foto-{len(found) + 1}{suffix}"
+            dedupe_key = f"{parsed.hostname.lower()}{unquote(parsed.path).lower()}"
+            if dedupe_key in seen:
+                continue
+            seen.add(dedupe_key)
+            filename = Path(unquote(parsed.path)).name
+            if not Path(filename).suffix:
+                filename = f"foto-{len(found) + 1}{suffix}"
             found.append({
                 "id": source_index,
                 "url": value,
@@ -406,10 +460,374 @@ def _gallery_list_images(url: str, platform: str) -> list[dict]:
         result = subprocess.run(command, capture_output=True, text=True, encoding="utf-8",
                                 errors="replace", timeout=40, check=False)
         if result.returncode not in (0, 1):
+            detail = (result.stderr or result.stdout or "").strip().splitlines()
+            if detail:
+                print(f"[gallery-dl:{platform}] {detail[-1][:300]}")
             return []
         return _parse_gallery_urls(result.stdout)
-    except (OSError, subprocess.TimeoutExpired):
+    except subprocess.TimeoutExpired:
+        print(f"[gallery-dl:{platform}] timeout after 40 seconds")
         return []
+    except OSError as exc:
+        print(f"[gallery-dl:{platform}] unavailable: {exc}")
+        return []
+
+
+def _instagram_photo_items(media: dict) -> list[dict]:
+    """Normalize public Instagram GraphQL media into photo items only."""
+    sidecar = media.get("edge_sidecar_to_children")
+    edges = sidecar.get("edges") if isinstance(sidecar, dict) else None
+    nodes = [edge.get("node") for edge in edges if isinstance(edge, dict) and isinstance(edge.get("node"), dict)] if isinstance(edges, list) else [media]
+    photos: list[dict] = []
+    seen: set[str] = set()
+    for node in nodes:
+        if not isinstance(node, dict) or node.get("is_video") is True or node.get("video_url"):
+            continue
+        image_url = node.get("display_url") or node.get("display_src")
+        if not isinstance(image_url, str) or not _safe_threads_media_url(image_url):
+            versions = node.get("image_versions2")
+            candidates = versions.get("candidates") if isinstance(versions, dict) else []
+            candidates = [item for item in candidates if isinstance(item, dict) and isinstance(item.get("url"), str) and _safe_threads_media_url(item["url"])]
+            image_url = max(candidates, key=lambda item: int(item.get("width") or 0) * int(item.get("height") or 0)).get("url") if candidates else None
+        if not image_url:
+            continue
+        canonical = image_url.split("?", 1)[0]
+        if canonical in seen:
+            continue
+        seen.add(canonical)
+        suffix = _image_extension_from_url(image_url) or ".jpg"
+        photos.append({
+            "id": len(photos) + 1,
+            "url": image_url,
+            "thumbnail": image_url,
+            "extension": suffix.lstrip("."),
+            "filename": f"foto-{len(photos) + 1:03d}{suffix}",
+            "label": f"Foto {len(photos) + 1}",
+            "kind": "image",
+        })
+        if len(photos) >= MAX_GALLERY_ITEMS:
+            break
+    return photos
+
+
+def _instagram_public_gallery(url: str) -> list[dict]:
+    """Best-effort anonymous public-post fallback; no account cookies or login."""
+    if not HAS_CURL_CFFI or curl_requests is None:
+        return []
+    match = re.search(r"instagram\.com/(?:p|reel|tv)/([A-Za-z0-9_-]+)", url)
+    if not match:
+        return []
+    shortcode = match.group(1)
+    session = None
+    try:
+        session = curl_requests.Session()
+        # This creates only an anonymous request session; no user account/session is supplied.
+        session.impersonate = "chrome124"
+        headers = {
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+            "Accept": "text/html,application/xhtml+xml,application/json;q=0.9,*/*;q=0.8",
+        }
+        page = session.get(url, headers=headers, timeout=14)
+        if page.status_code != 200:
+            return []
+        csrf = dict(session.cookies).get("csrftoken", "")
+        variables = {
+            "shortcode": shortcode,
+            "child_comment_count": 3,
+            "fetch_comment_count": 40,
+            "parent_comment_count": 24,
+            "has_threaded_comments": True,
+        }
+        response = session.get(
+            "https://www.instagram.com/graphql/query/",
+            params={
+                "doc_id": "8845758582119845",
+                "variables": json.dumps(variables, separators=(",", ":")),
+            },
+            headers={
+                "X-CSRFToken": csrf,
+                "X-Requested-With": "XMLHttpRequest",
+                "Referer": url,
+                "Accept": "application/json",
+            },
+            timeout=14,
+        )
+        if response.status_code != 200:
+            return []
+        payload = response.json()
+        data = payload.get("data") if isinstance(payload, dict) else None
+        media = (data or {}).get("xdt_shortcode_media") or (data or {}).get("shortcode_media") if isinstance(data, dict) else None
+        return _instagram_photo_items(media) if isinstance(media, dict) else []
+    except Exception as exc:
+        print(f"[instagram-public-gallery] {str(exc)[:240]}")
+        return []
+    finally:
+        try:
+            if session is not None:
+                session.close()
+        except Exception:
+            pass
+
+
+def _safe_threads_media_url(value: str) -> bool:
+    try:
+        parsed = urlparse(value)
+        host = (parsed.hostname or "").lower().rstrip(".")
+        return bool(
+            parsed.scheme == "https" and host and not parsed.username and not parsed.password
+            and any(host.endswith(suffix) for suffix in THREADS_MEDIA_SUFFIXES)
+            and (parsed.port is None or parsed.port == 443)
+        )
+    except Exception:
+        return False
+
+
+def _threads_page_shortcode(url: str, page_html: str) -> str | None:
+    match = re.search(r"/@[^/]+/post/([A-Za-z0-9_-]+)", urlparse(url).path)
+    if match:
+        return match.group(1)
+    # /share/ links usually reveal the canonical /@user/post/CODE URL in og:url.
+    for match in re.finditer(r'<meta\b[^>]*(?:property|name)=["\']og:url["\'][^>]*>', page_html, re.I):
+        content = re.search(r'content=["\']([^"\']+)', match.group(0), re.I)
+        if content:
+            canonical = html_lib.unescape(content.group(1))
+            code_match = re.search(r"/@[^/]+/post/([A-Za-z0-9_-]+)", urlparse(canonical).path)
+            if code_match:
+                return code_match.group(1)
+    return None
+
+
+def _threads_collect_post_dicts(page_html: str) -> list[dict]:
+    """Read public post JSON blocks; fail closed when the page layout changes."""
+    scripts = re.finditer(
+        r'<script\b(?=[^>]*\btype=["\']application/json["\'])[^>]*>(.*?)</script>',
+        page_html, re.I | re.S,
+    )
+    posts: list[dict] = []
+    media_keys = {"video_versions", "video_dash_manifest", "image_versions2", "carousel_media"}
+    node_count = 0
+    for script in scripts:
+        try:
+            root = json.loads(html_lib.unescape(script.group(1)))
+        except Exception:
+            continue
+        stack = [root]
+        while stack and node_count < 200_000:
+            item = stack.pop()
+            node_count += 1
+            if isinstance(item, dict):
+                if isinstance(item.get("code"), str) and media_keys.intersection(item):
+                    posts.append(item)
+                stack.extend(item.values())
+            elif isinstance(item, list):
+                stack.extend(item)
+    return posts
+
+
+def _threads_best_image(media: dict) -> str | None:
+    versions = media.get("image_versions2")
+    candidates = versions.get("candidates") if isinstance(versions, dict) else None
+    if not isinstance(candidates, list):
+        return None
+    valid: list[tuple[int, str]] = []
+    for candidate in candidates:
+        if not isinstance(candidate, dict):
+            continue
+        candidate_url = candidate.get("url")
+        if not isinstance(candidate_url, str) or not _safe_threads_media_url(candidate_url):
+            continue
+        width = candidate.get("width") if isinstance(candidate.get("width"), (int, float)) else 0
+        height = candidate.get("height") if isinstance(candidate.get("height"), (int, float)) else 0
+        valid.append((int(width * height), candidate_url))
+    return max(valid, default=(0, None), key=lambda pair: pair[0])[1]
+
+
+def _threads_photo_items(url: str, page_html: str) -> list[dict]:
+    posts = _threads_collect_post_dicts(page_html)
+    target = _threads_page_shortcode(url, page_html)
+    selected = next((post for post in posts if post.get("code") == target), None) if target else None
+    if selected is None and not target and len(posts) == 1:
+        selected = posts[0]
+    if selected is None:
+        return []
+
+    media_entries = selected.get("carousel_media")
+    if not isinstance(media_entries, list) or not media_entries:
+        media_entries = [selected]
+
+    photos: list[dict] = []
+    seen: set[str] = set()
+    for media in media_entries:
+        if not isinstance(media, dict):
+            continue
+        # A carousel video can have a poster; do not expose it as a photo download.
+        if isinstance(media.get("video_versions"), list) and media.get("video_versions"):
+            continue
+        image_url = _threads_best_image(media)
+        if not image_url:
+            continue
+        canonical = image_url.split("?", 1)[0]
+        if canonical in seen:
+            continue
+        seen.add(canonical)
+        suffix = _image_extension_from_url(image_url) or ".jpg"
+        photos.append({
+            "id": len(photos) + 1,
+            "url": image_url,
+            "thumbnail": image_url,
+            "extension": suffix.lstrip("."),
+            "filename": f"foto-{len(photos) + 1:03d}{suffix}",
+            "label": f"Foto {len(photos) + 1}",
+            "kind": "image",
+        })
+        if len(photos) >= MAX_GALLERY_ITEMS:
+            break
+    return photos
+
+
+@contextmanager
+def _safe_threads_stream(client: httpx.Client, url: str, *, media: bool = False):
+    """Follow only same-platform or approved CDN redirects; avoid open-redirect SSRF."""
+    current = url
+    for _ in range(5):
+        parsed_current = urlparse(current)
+        current_host = (parsed_current.hostname or "").lower()
+        current_allowed = _safe_threads_media_url(current) if media else (
+            parsed_current.scheme == "https" and not parsed_current.username and not parsed_current.password
+            and (parsed_current.port is None or parsed_current.port == 443)
+            and (current_host in THREADS_PAGE_HOSTS or any(current_host.endswith("." + base) for base in THREADS_PAGE_HOSTS))
+        )
+        if not current_allowed:
+            raise RuntimeError("Alamat sumber berada di luar daftar host HTTPS yang diizinkan.")
+        with client.stream("GET", current) as response:
+            if response.status_code in (301, 302, 303, 307, 308):
+                location = response.headers.get("location")
+                if not location:
+                    raise RuntimeError("Platform mengirim pengalihan tanpa alamat tujuan.")
+                target = urljoin(current, location)
+                parsed = urlparse(target)
+                host = (parsed.hostname or "").lower()
+                allowed = _safe_threads_media_url(target) if media else (
+                    parsed.scheme == "https" and any(host == base or host.endswith("." + base) for base in THREADS_PAGE_HOSTS)
+                )
+                if not allowed:
+                    raise RuntimeError("Pengalihan ke host di luar daftar aman ditolak.")
+                current = target
+                continue
+            final_url = str(response.url)
+            allowed = _safe_threads_media_url(final_url) if media else (
+                (urlparse(final_url).hostname or "").lower() in THREADS_PAGE_HOSTS
+                or any((urlparse(final_url).hostname or "").lower().endswith("." + base) for base in THREADS_PAGE_HOSTS)
+            )
+            if not allowed:
+                raise RuntimeError("Host tujuan tidak termasuk sumber Threads yang diizinkan.")
+            yield response
+            return
+    raise RuntimeError("Terlalu banyak pengalihan dari sumber Threads.")
+
+
+def _fetch_threads_page(url: str) -> str:
+    headers = {
+        "User-Agent": THREADS_CRAWLER_UA,
+        "Accept": "text/html,application/xhtml+xml",
+        "Accept-Language": "en-US,en;q=0.9",
+    }
+    timeout = httpx.Timeout(12.0, connect=8.0)
+    with httpx.Client(timeout=timeout, follow_redirects=False, headers=headers) as client:
+        with _safe_threads_stream(client, url) as response:
+            if response.status_code in (401, 403):
+                raise RuntimeError("Postingan Threads membatasi akses publik atau meminta login.")
+            if response.status_code == 404:
+                raise RuntimeError("Postingan Threads tidak ditemukan atau sudah dihapus.")
+            if response.status_code == 429:
+                raise RuntimeError("Threads membatasi permintaan sementara. Coba lagi nanti.")
+            if not response.is_success:
+                raise RuntimeError(f"Halaman Threads gagal diakses (HTTP {response.status_code}).")
+            chunks: list[bytes] = []
+            total = 0
+            for chunk in response.iter_bytes():
+                total += len(chunk)
+                if total > THREADS_MAX_PAGE_BYTES:
+                    raise RuntimeError("Halaman Threads terlalu besar untuk diproses.")
+                chunks.append(chunk)
+    return b"".join(chunks).decode("utf-8", errors="replace")
+
+
+def _threads_list_images(url: str) -> list[dict]:
+    try:
+        page_html = _fetch_threads_page(url)
+        items = _threads_photo_items(url, page_html)
+        if not items:
+            print("[threads-gallery] no public image data matched the requested post")
+        return items
+    except Exception as exc:
+        print(f"[threads-gallery] {str(exc)[:300]}")
+        return []
+
+
+def _extension_from_mime(content_type: str) -> str | None:
+    return {
+        "image/jpeg": "jpg", "image/jpg": "jpg", "image/png": "png",
+        "image/webp": "webp", "image/gif": "gif", "image/avif": "avif",
+        "image/heic": "heic", "image/heif": "heic",
+    }.get(content_type.lower())
+
+
+def _looks_like_image(data: bytes, content_type: str) -> bool:
+    if data.startswith(b"\xff\xd8\xff") or data.startswith(b"\x89PNG\r\n\x1a\n"):
+        return True
+    if data.startswith((b"GIF87a", b"GIF89a")) or (len(data) >= 12 and data[:4] == b"RIFF" and data[8:12] == b"WEBP"):
+        return True
+    if len(data) >= 12 and data[4:8] == b"ftyp" and (b"avif" in data[8:16] or b"heic" in data[8:16] or b"heix" in data[8:16] or b"mif1" in data[8:16]):
+        return True
+    return False
+
+
+def _download_threads_gallery_files(url: str, indices: list[int]) -> tuple[Path, list[Path]]:
+    if not indices or len(indices) > MAX_GALLERY_ITEMS:
+        raise ValueError(f"Pilih 1 sampai {MAX_GALLERY_ITEMS} foto.")
+    items = _threads_list_images(url)
+    chosen_indices = set(indices)
+    chosen = [item for item in items if item["id"] in chosen_indices]
+    if len(chosen) != len(indices):
+        raise RuntimeError("Foto Threads tidak lagi tersedia atau indeks galeri berubah. Ambil ulang tautannya.")
+
+    job_dir = Path(tempfile.mkdtemp(prefix="threads-gallery-", dir=TEMP_ROOT))
+    downloaded: list[Path] = []
+    total_bytes = 0
+    headers = {"User-Agent": THREADS_CRAWLER_UA, "Referer": "https://www.threads.net/"}
+    try:
+        with httpx.Client(timeout=httpx.Timeout(30.0, connect=10.0), follow_redirects=False, headers=headers) as client:
+            for position, item in enumerate(chosen, 1):
+                if not _safe_threads_media_url(item["url"]):
+                    raise RuntimeError("Alamat CDN foto Threads tidak lolos pemeriksaan keamanan.")
+                with _safe_threads_stream(client, item["url"], media=True) as response:
+                    if not response.is_success:
+                        raise RuntimeError(f"CDN foto Threads gagal diakses (HTTP {response.status_code}).")
+                    content_type = (response.headers.get("content-type") or "").split(";", 1)[0].lower()
+                    if not content_type.startswith("image/"):
+                        raise RuntimeError("Sumber Threads tidak mengembalikan data foto yang valid.")
+                    parts: list[bytes] = []
+                    size = 0
+                    for chunk in response.iter_bytes():
+                        size += len(chunk)
+                        if size > MAX_GALLERY_FILE_BYTES:
+                            raise RuntimeError("Ada foto yang melebihi batas ukuran per berkas.")
+                        parts.append(chunk)
+                data = b"".join(parts)
+                if not _looks_like_image(data, content_type):
+                    raise RuntimeError("Isi berkas dari CDN bukan gambar yang valid.")
+                total_bytes += len(data)
+                if total_bytes > MAX_GALLERY_TOTAL_BYTES:
+                    raise RuntimeError("Total foto melebihi batas ukuran unduhan galeri.")
+                ext = _extension_from_mime(content_type) or item["extension"]
+                path = job_dir / f"foto-{position:03d}.{ext}"
+                path.write_bytes(data)
+                downloaded.append(path)
+        return job_dir, downloaded
+    except Exception:
+        shutil.rmtree(job_dir, ignore_errors=True)
+        raise
 
 
 def _inspect_payload(url: str, platform: str) -> dict:
@@ -420,7 +838,12 @@ def _inspect_payload(url: str, platform: str) -> dict:
     except Exception as exc:
         extraction_error = exc
 
-    photo_items = _gallery_list_images(url, platform)
+    if platform == "threads":
+        photo_items = _threads_list_images(url)
+    else:
+        photo_items = _gallery_list_images(url, platform)
+        if not photo_items and platform == "instagram":
+            photo_items = _instagram_public_gallery(url)
     if info is None and not photo_items:
         if extraction_error:
             raise extraction_error
@@ -453,7 +876,7 @@ def _download_gallery_files(url: str, indices: list[int]) -> tuple[Path, list[Pa
         raise RuntimeError("Mesin galeri belum terpasang pada server. Pastikan gallery-dl selesai dipasang saat deployment.")
     if not indices or len(indices) > MAX_GALLERY_ITEMS:
         raise ValueError(f"Pilih 1 sampai {MAX_GALLERY_ITEMS} foto.")
-    if any(type(index) is not int or index < 1 or index > MAX_GALLERY_ITEMS for index in indices):
+    if any(type(index) is not int or index < 1 or index > MAX_GALLERY_SOURCE_ITEMS for index in indices):
         raise ValueError("Nomor foto yang dipilih tidak valid.")
     job_dir = Path(tempfile.mkdtemp(prefix="gallery-", dir=TEMP_ROOT))
     command = [executable, "--config-ignore", "--no-input", "--no-colors", "--quiet",
@@ -584,15 +1007,23 @@ def _error(code: str, message: str, status_code: int = 502, service: str | None 
 
 
 def _extract_error(exc: Exception, platform: str):
-    message = str(exc)[:350] or "Media tidak tersedia."
-    lowered = message.lower()
+    original = str(exc)[:500] or "Media tidak tersedia."
+    lowered = original.lower()
     code = "error.api.content.video.unavailable"
     if "unsupported url" in lowered or "not supported" in lowered or "belum didukung" in lowered:
         code = "error.api.link.unsupported"
+        message = "Jenis tautan ini belum didukung oleh extractor yang tersedia."
     elif "too many requests" in lowered or "429" in lowered or "rate limit" in lowered:
         code = "error.api.rate.limit"
-    elif "private" in lowered or "login" in lowered or "not available" in lowered or "deleted" in lowered:
-        code = "error.api.content.video.unavailable"
+        message = "Platform membatasi permintaan sementara. Coba lagi beberapa saat."
+    elif any(term in lowered for term in ("private", "login", "sign in", "not available", "deleted", "403: forbidden", "401: unauthorized")):
+        message = "Konten tidak dapat diakses secara publik tanpa login, atau platform sedang membatasi server Petik."
+    elif "timed out" in lowered or "timeout" in lowered:
+        message = "Platform terlalu lama merespons. Coba lagi beberapa saat."
+    elif "gallery" in lowered and ("not installed" in lowered or "missing" in lowered):
+        message = "Mesin galeri belum tersedia pada server. Periksa status deployment API."
+    else:
+        message = original
     return _error(code, message, 502, platform)
 
 
@@ -636,7 +1067,7 @@ def server_info(request: Request):
             "url": _base_url(request),
             "services": SERVICES,
             "durationLimit": MAX_DURATION_SECONDS,
-            "features": ["inspect", "quality-picker", "audio-mp3", "photo-gallery", "multi-image-selection", "zip-download", "temporary-tunnel"],
+            "features": ["inspect", "quality-picker", "audio-mp3", "photo-gallery", "multi-image-selection", "zip-download", "threads-public-photo-gallery", "temporary-tunnel"],
         },
         "git": {"remote": "Petik Universal Extractor"},
     }
@@ -651,11 +1082,18 @@ def _ytdlp_version() -> str:
 
 
 def _gallery_version() -> str:
-    executable = _gallery_command()
-    if not executable:
+    if not _gallery_command():
         return "missing"
     try:
-        result = subprocess.run([executable, "--version"], capture_output=True, text=True, timeout=5, check=False)
+        from importlib.metadata import version as package_version, PackageNotFoundError
+        try:
+            return package_version("gallery-dl")[:40]
+        except PackageNotFoundError:
+            pass
+    except Exception:
+        pass
+    try:
+        result = subprocess.run([_gallery_command(), "--version"], capture_output=True, text=True, timeout=5, check=False)
         return (result.stdout or result.stderr or "unknown").strip()[:40]
     except Exception:
         return "unknown"
@@ -671,6 +1109,9 @@ def health():
         "ytdlpVersion": _ytdlp_version(),
         "galleryDlAvailable": bool(_gallery_command()),
         "galleryDlVersion": _gallery_version(),
+        "galleryPlatforms": sorted(GALLERY_PLATFORMS | {"threads"}),
+        "threadsPhotoResolver": "public-page-json",
+        "instagramPublicFallbackAvailable": HAS_CURL_CFFI,
         "maxGalleryItems": MAX_GALLERY_ITEMS,
         "javascriptRuntime": "deno" if shutil.which("deno") else "missing",
     }
@@ -781,14 +1222,17 @@ def download_gallery(payload: dict, request: Request):
         if error:
             return error
         url, platform = normalised
-        if platform not in GALLERY_PLATFORMS:
+        if platform not in GALLERY_PLATFORMS and platform != "threads":
             return _error("error.api.gallery.unsupported", "Platform ini belum memiliki extractor galeri foto Petik.", 400, platform)
         raw_indices = payload.get("indices")
         if not isinstance(raw_indices, list) or not raw_indices or len(raw_indices) > MAX_GALLERY_ITEMS:
             return _error("error.api.gallery.selection", f"Pilih 1 sampai {MAX_GALLERY_ITEMS} foto.", 400, platform)
         if any(type(value) is not int or value < 1 or value > MAX_GALLERY_SOURCE_ITEMS for value in raw_indices) or len(set(raw_indices)) != len(raw_indices):
             return _error("error.api.gallery.selection", "Daftar pilihan foto tidak valid.", 400, platform)
-        job_dir, files = _download_gallery_files(url, raw_indices)
+        if platform == "threads":
+            job_dir, files = _download_threads_gallery_files(url, raw_indices)
+        else:
+            job_dir, files = _download_gallery_files(url, raw_indices)
         zip_requested = bool(payload.get("zip"))
         if zip_requested:
             archive = job_dir / "petik-foto.zip"
@@ -814,7 +1258,7 @@ def download_gallery(payload: dict, request: Request):
     except ValueError as exc:
         return _error("error.api.gallery.selection", str(exc), 400)
     except Exception as exc:
-        return _extract_error(exc, "gallery")
+        return _extract_error(exc, platform if "platform" in locals() else "gallery")
     finally:
         if job_dir is not None:
             shutil.rmtree(job_dir, ignore_errors=True)
