@@ -29,7 +29,7 @@ def test_health_endpoint_and_version():
     response = client.get("/health")
     assert response.status_code == 200
     assert response.json()["status"] == "healthy"
-    assert response.json()["version"] == "1.3.0"
+    assert response.json()["version"] == "1.4.0"
     assert "javascriptRuntime" in response.json()
 
 
@@ -330,3 +330,29 @@ def test_preview_endpoint_forwards_range_and_streams_bytes(monkeypatch):
     assert response.content == b"test"
     assert response.headers["content-range"] == "bytes 0-3/10"
     assert captured["range"] == "bytes=0-3"
+
+
+def test_preview_url_accepts_instagram_style_formats_without_codec_info():
+    info = {"formats": [
+        {"url": "https://cdn.example/ig.mp4", "ext": "mp4", "height": 1280, "vcodec": None, "acodec": None, "protocol": "https"},
+        {"url": "https://cdn.example/dash-video.mp4", "ext": "mp4", "vcodec": "avc1", "acodec": "none", "protocol": "https"},
+    ]}
+    assert api._preview_url(info, "instagram") == "https://cdn.example/ig.mp4"
+
+
+def test_preview_not_blocked_by_busy_download_slot_or_download_rate_limit(monkeypatch):
+    from io import BytesIO
+
+    class FakeUpstream(BytesIO):
+        status = 200
+        headers = {"Content-Type": "video/mp4"}
+
+    monkeypatch.setattr(api, "_preview_source", lambda _url: ("https://cdn.example/v.mp4", {}))
+    monkeypatch.setattr(api.urllib.request, "urlopen", lambda *a, **k: FakeUpstream(b"ok"))
+    assert api.download_slots.acquire(blocking=False)  # unduhan sedang jalan
+    try:
+        for _ in range(25):  # lebih banyak dari RATE_LIMIT_COUNT unduhan
+            r = client.get("/api/preview", params={"url": "https://www.instagram.com/reel/ABC123/"})
+            assert r.status_code == 200
+    finally:
+        api.download_slots.release()
