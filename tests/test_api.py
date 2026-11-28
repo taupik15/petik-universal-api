@@ -48,7 +48,7 @@ def test_health_endpoint_and_version():
     response = client.get("/health")
     assert response.status_code == 200
     assert response.json()["status"] == "healthy"
-    assert response.json()["version"] == "1.15.0"
+    assert response.json()["version"] == "1.16.0"
     assert "javascriptRuntime" in response.json()
     assert response.json()["youtubePoTokenProvider"] == "bgutil-http"
     assert isinstance(response.json()["youtubePoTokenProviderReady"], bool)
@@ -818,7 +818,7 @@ def test_instagram_public_fallback_uses_anonymous_graphql_session(monkeypatch):
 
 def test_health_reports_gallery_and_public_fallback_capabilities():
     body = client.get("/health").json()
-    assert body["version"] == "1.15.0"
+    assert body["version"] == "1.16.0"
     assert body["youtubeClientFallbacks"] in (
         ["tv_samsung", "visionos", "web", "web_embedded"],
         ["tv_samsung", "visionos", "web", "mweb", "web_embedded"],
@@ -1533,7 +1533,7 @@ def test_bgutil_provider_status_rejects_version_mismatch(monkeypatch):
 
 def test_health_exposes_v111_youtube_diagnostics_without_sensitive_fields():
     payload = client.get("/health").json()
-    assert payload["version"] == "1.15.0"
+    assert payload["version"] == "1.16.0"
     assert "youtubePoTokenTelemetryAvailable" in payload
     assert payload["youtubeForceIPv4"] is True
     assert payload["youtubeWpc"]["runtimeEnabled"] is False
@@ -2283,3 +2283,19 @@ def test_youtube_network_probe_is_rate_limited_to_one_per_120_seconds(monkeypatc
     assert response.status_code == 429
     assert response.json()["status"] == "cooldown"
     assert response.json()["retryAfterSeconds"] > 0
+
+
+def test_youtube_proxy_applies_only_to_youtube(monkeypatch):
+    monkeypatch.setenv("YOUTUBE_PROXY", "socks5h://127.0.0.1:40000")
+    yt = api._yt_common_options("youtube", "mweb")
+    other = api._yt_common_options("instagram")
+    assert yt["proxy"] == "socks5h://127.0.0.1:40000"
+    assert "source_address" not in yt
+    assert "proxy" not in other
+
+
+def test_youtube_proxy_rejects_bad_scheme(monkeypatch):
+    monkeypatch.setenv("YOUTUBE_PROXY", "ftp://example.com:21")
+    assert api._youtube_proxy() is None
+    monkeypatch.setenv("YOUTUBE_PROXY", "")
+    assert api._youtube_proxy() is None
