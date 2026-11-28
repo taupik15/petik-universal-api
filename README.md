@@ -1,6 +1,6 @@
-# Petik Universal Extractor API v1.11.0
+# Petik Universal Extractor API v1.12.0
 
-Backend Petik berbasis FastAPI, yt-dlp, gallery-dl, curl-cffi untuk resolver publik Meta, Deno/EJS, BgUtils PO Token Provider, HTTPX, dan FFmpeg. Rilis ini memperkuat diagnosis YouTube dengan proxy telemetry BgUtils lokal, pengukuran respons PO Token, strategi HLS `web_safari` terpisah, dan opsi IPv4 untuk jalur yt-dlp, tanpa layanan/API berbayar. Fitur galeri campuran foto + video dari v1.8.0 tetap dipertahankan.
+Backend Petik berbasis FastAPI, yt-dlp, gallery-dl, curl-cffi untuk resolver publik Meta, Deno/EJS, BgUtils PO Token Provider, HTTPX, dan FFmpeg. Rilis v1.12.0 memperdalam diagnosis tahap YouTube, mengisolasi event telemetry per percobaan, mengevaluasi fallback alternatif dan menyediakan cookies YouTube opsional tanpa mengubah default anonim. WPC/Chromium tetap tidak dipasang pada image Render Free. Fitur galeri campuran foto + video dan resolver sosial dipertahankan; tidak ada API berbayar yang ditambahkan.
 
 ## Fitur dan kontrak API
 
@@ -30,14 +30,31 @@ Contoh itu hanya menjelaskan bentuk respons; bukan URL media yang benar-benar di
 ## Deploy lewat Render
 
 1. Buka repository GitHub `petik-universal-api`.
-2. Ekstrak ZIP backend v1.11.0, lalu unggah semua isinya langsung ke root repository (jangan unggah file ZIP sebagai satu file).
-3. Pastikan `Dockerfile`, `app.py`, `pot_telemetry.py`, `start.sh`, `requirements.txt`, `render.yaml`, `README.md`, dan folder `tests/` berada di root.
+2. Ekstrak ZIP backend v1.12.0, lalu unggah semua isinya langsung ke root repository (jangan unggah file ZIP sebagai satu file).
+3. Pastikan `Dockerfile`, `app.py`, `pot_telemetry.py`, `start.sh`, `requirements.txt`, `requirements-wpc.txt`, `render.yaml`, `README.md`, dan folder `tests/` berada di root.
 4. Commit perubahan dari GitHub.
 5. Di Render, buka Blueprint Petik lalu jalankan **Manual Sync / Apply**.
-6. Setelah layanan berstatus Live, buka endpoint `/health`. Versi yang diharapkan `1.11.0`, `mixedMediaAvailable: true`, dan `galleryDlAvailable: true` bila gallery-dl berhasil terpasang. Untuk YouTube, pastikan `youtubePoTokenProviderReady: true`, `youtubePoTokenPluginVersion: "2.0.2"`, dan `youtubePoTokenServerVersion: "2.0.2"`.
+6. Setelah layanan berstatus Live, buka endpoint `/health`. Versi yang diharapkan `1.12.0`, `mixedMediaAvailable: true`, dan `galleryDlAvailable: true` bila gallery-dl berhasil terpasang. Untuk YouTube, pastikan `youtubePoTokenProviderReady: true`, `youtubePoTokenPluginVersion: "2.0.2"`, dan `youtubePoTokenServerVersion: "2.0.2"`.
 7. Jika `youtubePoTokenProviderReady` bernilai `false`, lihat Render Logs. Backend tetap dapat melayani platform lain, tetapi Petik tidak akan memaksa klien YouTube `mweb` tanpa provider yang cocok.
 8. Buka `/` untuk memeriksa daftar platform dan layanan.
 
+
+## YouTube diagnosis dan recovery (v1.12.0)
+
+Rilis ini dibuat untuk menindaklanjuti hasil v1.11 ketika provider BgUtils terdeteksi tetapi tidak ada permintaan `/get_pot`. Fokusnya adalah membuktikan tahap kegagalan, bukan menganggap IP Render pasti diblokir.
+
+- **Diagnostik tahap ekstraksi:** logger yt-dlp mengubah baris debug menjadi label tahap aman seperti `youtube_watch_page`, `innertube_client_config`, `innertube_player_api`, `po_token_generation`, dan `youtube_bot_check`. Teks mentah, URL, query, signed URL, cookie, visitor data, dan token tidak disimpan.
+- **Telemetry per percobaan:** `pot_telemetry.py` menyimpan event metadata berbatas (ID urut, waktu, status HTTP, ada/tidaknya token, dan durasi). Event tidak menyimpan body request atau respons. Endpoint `/stats` internal menampilkan event terbaru; API menghitung event setelah baseline percobaan terakhir.
+- **Isolasi percobaan:** ekstraksi/unduhan YouTube diserialkan per proses API untuk mencegah permintaan bersamaan tercampur pada diagnostik provider. Platform lain tidak menggunakan lock ini. Trade-off-nya, permintaan YouTube kedua dapat menunggu sampai percobaan YouTube pertama selesai.
+- **Evaluasi fallback non-PO:** opsi `android_vr` diperiksa tetapi tidak dimasukkan ke daftar aktif. Source extractor yt-dlp saat ini memberi catatan bahwa semua format client tersebut mengalami HTTP 403 sejak 17 Agustus 2026. `web_embedded` tetap hanya berlaku untuk video yang mengizinkan embedding, sedangkan `tv` masih berisiko mengembalikan SABR/DRM. HLS `web_safari` juga tidak dijamin tersedia pada sesi anonim. Karena itu tidak ada client tambahan yang dipaksakan hanya untuk memperpanjang daftar fallback.
+- **IPv4:** pengaturan `YOUTUBE_FORCE_IPV4=1` tetap dipertahankan; ini memilih keluarga alamat sumber IPv4 dan tidak mengubah reputasi IP server.
+- **Cookies opsional:** jika pemilik server secara sadar mengatur `YOUTUBE_COOKIES_B64`, API memvalidasi file Netscape, menulisnya hanya di filesystem sementara `/tmp` dengan mode `0600`, lalu memberi path file ke yt-dlp. Variabel ini tidak pernah ditampilkan; `/health` hanya menunjukkan boolean `youtubeCookiesConfigured`. Jangan commit file cookies ke GitHub atau membagikannya di chat. Hapus environment variable bila tidak dibutuhkan. Default tetap tanpa login.
+- **WPC:** `requirements-wpc.txt` disediakan sebagai dependensi opsional versi 1.1.2. Plugin WPC memerlukan Chrome/Chromium. Paket ini tidak masuk ke `requirements.txt` dan tidak diinstal pada image standar. Render Free menyediakan 512 MB RAM dan 0,1 CPU; browser headless berisiko menghabiskan sumber daya. WPC hanya layak dievaluasi pada lingkungan yang menyediakan memori/CPU lebih besar serta binary Chrome/Chromium.
+- **Pesan error:** hasil bot-check tidak lagi menyatakan IP Render diblokir sebagai fakta. Pesan menjelaskan bahwa penyebab dapat terkait tahap ekstraksi, sesi, atau reputasi IP dan perlu dibuktikan melalui diagnostik.
+
+`/health` kini menambahkan `lastStage`, `lastErrorStage`, `stageEvents`, dan `providerAttemptEvents` pada `youtubeDiagnostics`, serta `youtubeCookiesConfigured` dan `youtubeDownloadFallbacks`. Nilai event bersifat metadata. Counter provider lifetime tetap disediakan untuk perbandingan.
+
+**Batas verifikasi:** 112 tes offline memeriksa kontrak, klasifikasi tahap, privasi telemetry, event baseline, validasi cookies, fallback, dan regresi. Tes ini tidak membuktikan YouTube live akan menerima permintaan dari IP Render. Docker build, deploy Render, dan unduhan YouTube nyata perlu diuji setelah pengguna melakukan deploy.
 
 ## YouTube PO Token, telemetry, dan strategi recovery (v1.11.0)
 
@@ -71,7 +88,7 @@ Resolver galeri campuran yang diterapkan:
 
 Batasan yang perlu diperhatikan:
 
-- Konten privat, dihapus, paywalled, age-gated, atau yang membutuhkan login tidak didukung. Petik tidak meminta password, session cookie, token akun, OAuth pengguna, atau login media sosial.
+- Secara default Petik mengakses YouTube tanpa login dan tidak meminta password. Admin dapat menambahkan cookies YouTube miliknya sendiri secara opsional melalui secret environment variable `YOUTUBE_COOKIES_B64`; fitur ini tidak wajib, tidak menerima cookies media sosial, dan tidak menjamin semua konten privat/age-gated dapat diakses.
 - Instagram Story dan Facebook Story bukan bagian fitur galeri post ini dan tidak dijanjikan tersedia.
 - Meta dapat mengganti struktur GraphQL, JSON halaman, CDN, atau membatasi IP Render. Jika data media tidak tersedia secara publik, resolver akan gagal dengan pesan yang jelas.
 - Beberapa URL CDN bersifat sementara/kedaluwarsa. Link Direct hanya ditampilkan saat extractor menyediakan URL berkas yang valid; link tersebut dapat berhenti berlaku mengikuti masa berlaku dari sumber.
@@ -97,11 +114,11 @@ Pengunduh CDN menulis potongan data langsung ke file sementara agar tidak menamp
 
 ## Variabel lingkungan
 
-`PUBLIC_BASE_URL`, `ALLOWED_ORIGINS`, `MAX_FILE_MB`, `MAX_DURATION_SECONDS`, `FILE_TTL_SECONDS`, `MAX_CONCURRENT_DOWNLOADS`, `RATE_LIMIT_COUNT`, `RATE_LIMIT_WINDOW_SECONDS`, `TEMP_DIR`, `BGUTIL_POT_PROVIDER_ENABLED`, `BGUTIL_POT_PROVIDER_URL`, `BGUTIL_PROVIDER_PORT`, `BGUTIL_PROVIDER_START_TIMEOUT`, `BGUTIL_TELEMETRY_PORT`, `BGUTIL_TELEMETRY_URL`, `YOUTUBE_FORCE_IPV4`, `YOUTUBE_WPC_ENABLED` (status/request flag; WPC belum diaktifkan), `MAX_GALLERY_ITEMS`, `MAX_GALLERY_FILE_MB`, `MAX_GALLERY_VIDEO_MB`, dan `MAX_GALLERY_TOTAL_MB`.
+`PUBLIC_BASE_URL`, `ALLOWED_ORIGINS`, `MAX_FILE_MB`, `MAX_DURATION_SECONDS`, `FILE_TTL_SECONDS`, `MAX_CONCURRENT_DOWNLOADS`, `RATE_LIMIT_COUNT`, `RATE_LIMIT_WINDOW_SECONDS`, `TEMP_DIR`, `BGUTIL_POT_PROVIDER_ENABLED`, `BGUTIL_POT_PROVIDER_URL`, `BGUTIL_PROVIDER_PORT`, `BGUTIL_PROVIDER_START_TIMEOUT`, `BGUTIL_TELEMETRY_PORT`, `BGUTIL_TELEMETRY_URL`, `YOUTUBE_FORCE_IPV4`, `YOUTUBE_WPC_ENABLED` (flag status; plugin dan Chrome/Chromium tetap harus tersedia untuk menjalankan WPC), `YOUTUBE_COOKIES_B64` (opsional; file cookies YouTube format Netscape yang di-Base64), `MAX_GALLERY_ITEMS`, `MAX_GALLERY_FILE_MB`, `MAX_GALLERY_VIDEO_MB`, dan `MAX_GALLERY_TOTAL_MB`.
 
 ## Tes dan batas verifikasi
 
-Folder `tests/` berisi 101 tes offline untuk parser Instagram/Threads campuran, deteksi URL gallery-dl, urutan `sourceIndex`, pemetaan ID unduhan, ZIP yang berisi foto dan video, unduhan CDN streaming, partial failure, validasi host/redirect, endpoint inspect/download, health, kompatibilitas Cobalt, preview, MP3, durasi, dan kualitas. Tes ini memvalidasi kontrak dan perilaku lokal; tes offline bukan bukti bahwa setiap tautan live dari tiap platform akan berhasil diekstrak.
+Folder `tests/` berisi 112 tes offline untuk parser Instagram/Threads campuran, deteksi URL gallery-dl, urutan `sourceIndex`, pemetaan ID unduhan, ZIP yang berisi foto dan video, unduhan CDN streaming, partial failure, validasi host/redirect, endpoint inspect/download, health, kompatibilitas Cobalt, preview, MP3, durasi, dan kualitas. Tes ini memvalidasi kontrak dan perilaku lokal; tes offline bukan bukti bahwa setiap tautan live dari tiap platform akan berhasil diekstrak.
 
 ## Urutan API di frontend Petik
 
@@ -110,6 +127,18 @@ Folder `tests/` berisi 101 tes offline untuk parser Instagram/Threads campuran, 
 3. API Cobalt eksternal sebagai cadangan video/audio yang sudah ada.
 
 ## Riwayat rilis
+
+### v1.12.0 — Stage Diagnostics, Attempt Telemetry, dan Recovery
+
+- Merekam tahap ekstraksi YouTube dalam label aman tanpa menyimpan baris debug mentah.
+- Menambahkan event telemetry per request BgUtils, dengan metadata terbatas dan tanpa body/token.
+- Menserialkan percobaan YouTube untuk menjaga korelasi event telemetry.
+- Mengevaluasi `android_vr` tetapi tidak memasukkannya ke fallback aktif karena catatan extractor yt-dlp terbaru menunjukkan semua format client ini mengalami HTTP 403.
+- Menambahkan dukungan cookies YouTube opsional melalui secret environment variable Base64, dengan file sementara mode `0600`; default tetap tanpa login.
+- Menambahkan `requirements-wpc.txt` opsional, tetapi tidak memasang Chrome/WPC pada Render Free.
+- Membuat pesan bot-check lebih akurat dan tidak menyimpulkan blokir IP tanpa bukti.
+- Mempertahankan BgUtils, Deno/EJS, mixed media, resolver sosial, preview, Direct Link, dan MP3.
+- Menambahkan tes offline untuk diagnostik tahap, isolasi event, privasi, cookies, dan fallback.
 
 ### v1.11.0 — YouTube Provider Telemetry, HLS Recovery, dan IPv4
 

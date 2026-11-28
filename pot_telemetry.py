@@ -1,8 +1,9 @@
 """Loopback-only telemetry proxy for BgUtils PO Token requests.
 
-It forwards requests without persisting request/response bodies. For /get_pot,
-only aggregate counts, HTTP status, and whether a non-empty poToken was returned
-are retained in process memory. The proxy must bind to loopback only.
+The proxy forwards requests but never persists request/response bodies, URL
+paths, query strings, visitor data, cookies or token values. For POST /get_pot
+it retains a bounded ring of metadata-only events so one serialized YouTube
+attempt can be distinguished from earlier attempts.
 """
 from __future__ import annotations
 
@@ -10,14 +11,15 @@ import argparse
 import json
 import threading
 import time
+from collections import deque
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.error import HTTPError, URLError
-from urllib.parse import urlsplit
+from urllib.parse import parse_qs, urlsplit
 from urllib.request import Request, urlopen
 
 
 class Metrics:
-    def __init__(self):
+    def __init__(self, max_events: int = 100):
         self.lock = threading.Lock()
         self.request_count = 0
         self.http_success_count = 0
@@ -27,10 +29,14 @@ class Metrics:
         self.last_request_at = None
         self.last_request_outcome = None
         self.last_token_response_at = None
+        self.next_event_id = 1
+        self.events = deque(maxlen=max(10, int(max_events)))
 
-    def record(self, status_code: int, token_present: bool) -> None:
+    def record(self, status_code: int, token_present: bool, elapsed_ms: int = 0) -> dict:
         now = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
         with self.lock:
+            event_id = self.next_event_id
+            self.next_event_id += 1
             self.request_count += 1
             if 200 <= status_code < 300:
                 self.http_success_count += 1
@@ -44,9 +50,22 @@ class Metrics:
             if token_present:
                 self.token_response_count += 1
                 self.last_token_response_at = now
+            event = {
+                "eventId": event_id,
+                "at": now,
+                "statusCode": int(status_code),
+                "outcome": outcome,
+                "tokenPresent": bool(token_present),
+                "elapsedMs": max(0, int(elapsed_ms)),
+            }
+            self.events.append(event)
+            return dict(event)
 
-    def snapshot(self) -> dict:
+    def snapshot(self, since: int | None = None) -> dict:
         with self.lock:
+            events = list(self.events)
+            if since is not None:
+                events = [event for event in events if event["eventId"] > since]
             return {
                 "requestCount": self.request_count,
                 "httpSuccessCount": self.http_success_count,
@@ -56,6 +75,8 @@ class Metrics:
                 "lastRequestAt": self.last_request_at,
                 "lastRequestOutcome": self.last_request_outcome,
                 "lastTokenResponseAt": self.last_token_response_at,
+                "lastEventId": self.next_event_id - 1,
+                "events": events[-25:],
             }
 
 
@@ -66,7 +87,7 @@ def make_handler(upstream: str, metrics: Metrics):
         protocol_version = "HTTP/1.1"
 
         def log_message(self, _format, *_args):
-            # Do not log request paths, query strings, payloads, or response data.
+            # Never write paths, query strings, payloads, or provider responses.
             return
 
         def _send(self, status: int, payload: bytes, content_type: str = "application/json"):
@@ -79,8 +100,17 @@ def make_handler(upstream: str, metrics: Metrics):
                 self.wfile.write(payload)
 
         def do_GET(self):
-            if urlsplit(self.path).path == "/stats":
-                payload = json.dumps(metrics.snapshot(), separators=(",", ":")).encode()
+            parsed = urlsplit(self.path)
+            if parsed.path == "/stats":
+                params = parse_qs(parsed.query)
+                try:
+                    since = int(params.get("since", [""])[0]) if params.get("since") else None
+                    if since is not None and since < 0:
+                        raise ValueError
+                except (TypeError, ValueError):
+                    self._send(400, b'{"error":"invalid_since"}')
+                    return
+                payload = json.dumps(metrics.snapshot(since), separators=(",", ":")).encode()
                 self._send(200, payload)
                 return
             self._forward()
@@ -112,11 +142,13 @@ def make_handler(upstream: str, metrics: Metrics):
                 value = self.headers.get(key)
                 if value:
                     headers[key] = value
+            # The upstream path is forwarded but never included in logs/metrics.
             url = upstream + self.path
             request = Request(url, data=body, headers=headers, method=self.command)
             status = 502
             response_body = b'{"error":"provider_unreachable"}'
             content_type = "application/json"
+            started = time.monotonic()
             try:
                 with urlopen(request, timeout=35) as response:
                     status = int(response.status)
@@ -131,16 +163,21 @@ def make_handler(upstream: str, metrics: Metrics):
             except Exception:
                 status = 502
 
-            is_get_pot = self.command == "POST" and urlsplit(self.path).path.rstrip("/") == "/get_pot"
+            parsed_path = urlsplit(self.path).path.rstrip("/")
+            is_get_pot = self.command == "POST" and parsed_path == "/get_pot"
             if is_get_pot:
                 token_present = False
                 if 200 <= status < 300:
                     try:
                         result = json.loads(response_body.decode("utf-8", errors="replace"))
-                        token_present = isinstance(result, dict) and isinstance(result.get("poToken"), str) and bool(result["poToken"].strip())
+                        token_present = (
+                            isinstance(result, dict)
+                            and isinstance(result.get("poToken"), str)
+                            and bool(result["poToken"].strip())
+                        )
                     except Exception:
                         token_present = False
-                metrics.record(status, token_present)
+                metrics.record(status, token_present, int((time.monotonic() - started) * 1000))
             self._send(status, response_body, content_type)
 
     return Handler

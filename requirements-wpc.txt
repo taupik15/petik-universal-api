@@ -1,0 +1,3 @@
+# Optional provider for environments that can run Chrome/Chromium.
+# This is intentionally NOT installed by the standard Render Free image.
+yt-dlp-getpot-wpc==1.1.2
