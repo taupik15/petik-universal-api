@@ -20,6 +20,14 @@ services:
         value: "300"
       - key: YTDLP_AUTO_UPDATE
         value: "1"
+      - key: BGUTIL_POT_PROVIDER_ENABLED
+        value: "1"
+      - key: BGUTIL_POT_PROVIDER_URL
+        value: "http://127.0.0.1:4416"
+      - key: BGUTIL_PROVIDER_PORT
+        value: "4416"
+      - key: BGUTIL_PROVIDER_START_TIMEOUT
+        value: "25"
       - key: MAX_GALLERY_ITEMS
         value: "20"
       - key: MAX_GALLERY_FILE_MB

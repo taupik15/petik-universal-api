@@ -33,7 +33,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 from yt_dlp import YoutubeDL
 
-APP_VERSION = "1.8.0"
+APP_VERSION = "1.9.0"
 MAX_GALLERY_ITEMS = max(1, min(30, int(os.getenv("MAX_GALLERY_ITEMS", "20"))))
 MAX_GALLERY_SOURCE_ITEMS = MAX_GALLERY_ITEMS * 2  # Mixed carousels can contain video entries between photos.
 MAX_GALLERY_FILE_BYTES = int(os.getenv("MAX_GALLERY_FILE_MB", "20")) * 1024 * 1024
@@ -224,7 +224,54 @@ def _safe_filename(info: dict, suffix: str) -> str:
     return f"{title}.{safe_suffix}"
 
 
-def _yt_common_options() -> dict:
+BGUTIL_PROVIDER_DEFAULT_URL = "http://127.0.0.1:4416"
+BGUTIL_PROVIDER_VERSION = "2.0.2"
+
+
+def _bgutil_provider_status() -> dict:
+    """Check the local, non-public BgUtils server and its matching yt-dlp plugin."""
+    enabled = os.getenv("BGUTIL_POT_PROVIDER_ENABLED", "1").strip() == "1"
+    base_url = (os.getenv("BGUTIL_POT_PROVIDER_URL") or BGUTIL_PROVIDER_DEFAULT_URL).strip().rstrip("/")
+    plugin_version = None
+    try:
+        from importlib.metadata import version as package_version
+        plugin_version = package_version("bgutil-ytdlp-pot-provider")
+    except Exception:
+        plugin_version = None
+
+    server_version = None
+    server_uptime = None
+    server_available = False
+    if enabled:
+        try:
+            request = urllib.request.Request(
+                f"{base_url}/ping",
+                headers={"User-Agent": "Petik-Health/1.9.0"},
+            )
+            with urllib.request.urlopen(request, timeout=1.2) as response:
+                payload = json.loads(response.read(4096).decode("utf-8", errors="replace"))
+            if isinstance(payload, dict) and payload.get("version"):
+                server_version = str(payload.get("version"))[:40]
+                server_uptime = payload.get("server_uptime")
+                server_available = True
+        except Exception:
+            pass
+
+    plugin_matches = plugin_version == BGUTIL_PROVIDER_VERSION
+    server_matches = server_version == BGUTIL_PROVIDER_VERSION
+    return {
+        "enabled": enabled,
+        "ready": bool(enabled and server_available and plugin_matches and server_matches),
+        "serverAvailable": server_available,
+        "pluginVersion": plugin_version,
+        "serverVersion": server_version,
+        "serverUptimeSeconds": server_uptime,
+        "expectedVersion": BGUTIL_PROVIDER_VERSION,
+        "baseUrl": base_url,
+    }
+
+
+def _yt_common_options(platform: str | None = None) -> dict:
     options = {
         "noplaylist": True,
         "quiet": True,
@@ -239,11 +286,22 @@ def _yt_common_options() -> dict:
     deno_path = shutil.which("deno")
     if deno_path:
         options["js_runtimes"] = {"deno": {"path": deno_path}}
+
+    # The current yt-dlp PO Token guide recommends mweb with a GVS token.
+    # Do not force that client unless the local provider and plugin versions match.
+    if platform == "youtube":
+        provider = _bgutil_provider_status()
+        if provider["ready"]:
+            options["extractor_args"] = {
+                "youtube": {"player_client": ["mweb"]},
+                "youtubepot-bgutilhttp": {"base_url": [provider["baseUrl"]]},
+            }
     return options
 
 
 def _extract_info(url: str) -> dict:
-    options = _yt_common_options()
+    platform = _normalise_and_validate(url)[1]
+    options = _yt_common_options(platform)
     options.update({"skip_download": True, "extract_flat": False})
     with YoutubeDL(options) as ydl:
         info = ydl.extract_info(url, download=False)
@@ -1792,7 +1850,8 @@ def _download_media(url: str, mode: str, quality: str) -> tuple[Path, str, dict]
             return f"Durasi melebihi batas {MAX_DURATION_SECONDS // 60} menit."
         return None
 
-    options = _yt_common_options()
+    platform = _normalise_and_validate(url)[1]
+    options = _yt_common_options(platform)
     options.update({
         "format": fmt,
         "outtmpl": outtmpl,
@@ -1870,6 +1929,12 @@ def _extract_error(exc: Exception, platform: str):
     elif platform == "facebook" and any(term in lowered for term in ("unsupported url", "no formats", "no media", "not supported")):
         code = "error.api.gallery.unavailable"
         message = "Facebook tidak mengembalikan data media publik yang bisa dibaca Petik. Periksa apakah tautan dapat dibuka tanpa login; beberapa postingan atau album membatasi akses anonim dari server."
+    elif platform == "youtube" and any(term in lowered for term in (
+        "sign in to confirm you're not a bot", "confirm you're not a bot", "po token",
+        "bgutil", "botguard", "http error 403", "403: forbidden",
+    )):
+        code = "error.api.youtube.restricted"
+        message = "YouTube masih membatasi akses dari IP server Petik atau proses PO Token gagal. Provider sudah disiapkan, tetapi token tidak menjamin semua pembatasan IP dapat dilewati. Coba lagi nanti atau gunakan tautan video publik lain."
     elif "unsupported url" in lowered or "not supported" in lowered or "belum didukung" in lowered:
         code = "error.api.link.unsupported"
         message = "Jenis tautan ini belum didukung oleh extractor yang tersedia."
@@ -1927,7 +1992,7 @@ def server_info(request: Request):
             "url": _base_url(request),
             "services": SERVICES,
             "durationLimit": MAX_DURATION_SECONDS,
-            "features": ["inspect", "quality-picker", "audio-mp3", "mixed-media-gallery", "multi-media-selection", "mixed-media-zip-download", "threads-public-photo-video-gallery", "temporary-tunnel"],
+            "features": ["inspect", "quality-picker", "audio-mp3", "youtube-po-token-provider", "mixed-media-gallery", "multi-media-selection", "mixed-media-zip-download", "threads-public-photo-video-gallery", "temporary-tunnel"],
         },
         "git": {"remote": "Petik Universal Extractor"},
     }
@@ -1961,11 +2026,21 @@ def _gallery_version() -> str:
 
 @app.get("/health")
 def health():
+    pot_provider = _bgutil_provider_status()
     return {
         "success": True,
         "status": "healthy",
         "version": APP_VERSION,
-        "engine": "yt-dlp+gallery-dl+ffmpeg",
+        "engine": "yt-dlp+gallery-dl+ffmpeg+bgutil-pot",
+        "youtubePoTokenProvider": "bgutil-http",
+        "youtubePoTokenProviderEnabled": pot_provider["enabled"],
+        "youtubePoTokenProviderReady": pot_provider["ready"],
+        "youtubePoTokenServerAvailable": pot_provider["serverAvailable"],
+        "youtubePoTokenPluginVersion": pot_provider["pluginVersion"],
+        "youtubePoTokenServerVersion": pot_provider["serverVersion"],
+        "youtubePoTokenServerUptimeSeconds": pot_provider["serverUptimeSeconds"],
+        "youtubePoTokenExpectedVersion": pot_provider["expectedVersion"],
+        "youtubePoTokenClient": "mweb" if pot_provider["ready"] else None,
         "ytdlpVersion": _ytdlp_version(),
         "galleryDlAvailable": bool(_gallery_command()),
         "galleryDlVersion": _gallery_version(),

@@ -1,6 +1,6 @@
-# Petik Universal Extractor API v1.8.0
+# Petik Universal Extractor API v1.9.0
 
-Backend Petik berbasis FastAPI, yt-dlp, gallery-dl, curl-cffi untuk resolver publik Meta, Deno/EJS, HTTPX, dan FFmpeg. Rilis ini menyatukan daftar media foto + video dalam satu kontrak galeri sehingga carousel/album campuran tidak lagi ditampilkan sebagai foto saja.
+Backend Petik berbasis FastAPI, yt-dlp, gallery-dl, curl-cffi untuk resolver publik Meta, Deno/EJS, BgUtils PO Token Provider, HTTPX, dan FFmpeg. Rilis ini menambahkan provider PO Token YouTube lokal untuk mencoba alur `mweb` yang direkomendasikan dokumentasi yt-dlp, tanpa layanan/API berbayar. Fitur galeri campuran foto + video dari v1.8.0 tetap dipertahankan.
 
 ## Fitur dan kontrak API
 
@@ -8,7 +8,7 @@ Backend Petik berbasis FastAPI, yt-dlp, gallery-dl, curl-cffi untuk resolver pub
 - `photoItems[]` tetap disediakan sebagai alias kompatibilitas foto-only untuk frontend lama. ID di `mediaItems` adalah ID yang harus dipakai pada endpoint unduhan campuran.
 - `POST /api/gallery/download`: menerima `url`, array `indices` berisi ID dari `mediaItems`, dan `zip`. `zip: true` mengembalikan ZIP campuran `petik-media.zip`; `zip: false` mengembalikan daftar file untuk dikirim satu per satu. Respons berisi `count`, `failedCount`, dan `failures`; pada unduhan langsung Meta, satu item gagal tidak membatalkan item lain yang berhasil.
 - `POST /api/download`: alur unduh video/audio tunggal tetap memakai pemilih kualitas lama.
-- `GET /health`: menampilkan versi API, ketersediaan gallery-dl, resolver media campuran, dan batas jumlah/ukuran media.
+- `GET /health`: menampilkan versi API, ketersediaan gallery-dl, resolver media campuran, status provider PO Token YouTube, kecocokan versi plugin/server, dan batas jumlah/ukuran media.
 - `GET /` dan `POST /` tetap menyediakan kompatibilitas Cobalt yang sudah ada.
 
 Contoh ringkas respons galeri:
@@ -30,12 +30,26 @@ Contoh itu hanya menjelaskan bentuk respons; bukan URL media yang benar-benar di
 ## Deploy lewat Render
 
 1. Buka repository GitHub `petik-universal-api`.
-2. Ekstrak ZIP backend v1.8.0, lalu unggah semua isinya langsung ke root repository (jangan unggah file ZIP sebagai satu file).
-3. Pastikan `Dockerfile`, `app.py`, `requirements.txt`, `render.yaml`, `README.md`, dan folder `tests/` berada di root.
+2. Ekstrak ZIP backend v1.9.0, lalu unggah semua isinya langsung ke root repository (jangan unggah file ZIP sebagai satu file).
+3. Pastikan `Dockerfile`, `app.py`, `start.sh`, `requirements.txt`, `render.yaml`, `README.md`, dan folder `tests/` berada di root.
 4. Commit perubahan dari GitHub.
 5. Di Render, buka Blueprint Petik lalu jalankan **Manual Sync / Apply**.
-6. Setelah layanan berstatus Live, buka endpoint `/health`. Versi yang diharapkan `1.8.0`, `mixedMediaAvailable: true`, dan `galleryDlAvailable: true` bila gallery-dl berhasil terpasang.
-7. Buka `/` untuk memeriksa daftar platform dan layanan.
+6. Setelah layanan berstatus Live, buka endpoint `/health`. Versi yang diharapkan `1.9.0`, `mixedMediaAvailable: true`, dan `galleryDlAvailable: true` bila gallery-dl berhasil terpasang. Untuk YouTube, pastikan `youtubePoTokenProviderReady: true`, `youtubePoTokenPluginVersion: "2.0.2"`, dan `youtubePoTokenServerVersion: "2.0.2"`.
+7. Jika `youtubePoTokenProviderReady` bernilai `false`, lihat Render Logs. Backend tetap dapat melayani platform lain, tetapi Petik tidak akan memaksa klien YouTube `mweb` tanpa provider yang cocok.
+8. Buka `/` untuk memeriksa daftar platform dan layanan.
+
+
+## YouTube PO Token Provider (v1.9.0)
+
+Rilis ini memakai **BgUtils PO Token Provider 2.0.2** dengan dua komponen yang versinya dipasangkan: plugin Python `bgutil-ytdlp-pot-provider==2.0.2` dan server HTTP BgUtils 2.0.2. Docker membangun server dari tag upstream `2.0.2`, memasang dependensi Deno, lalu `start.sh` menjalankan server pada `127.0.0.1:4416`. Server token tidak dibuka sebagai port publik dan tidak menambah layanan Render terpisah.
+
+Untuk permintaan YouTube, Petik hanya menetapkan `player_client=mweb` dan URL provider jika pemeriksaan `/ping` berhasil serta versi plugin/server sama-sama `2.0.2`. Jika provider belum siap, backend tidak memaksa `mweb`; platform lain tetap berjalan. `/health` melaporkan `youtubePoTokenProviderReady`, versi plugin, versi server, uptime provider, dan klien yang sedang diaktifkan. Status siap hanya memverifikasi ping dan kecocokan versi; ini bukan bukti bahwa setiap permintaan token atau unduhan YouTube akan berhasil.
+
+Deno juga dipakai untuk EJS challenge solver yt-dlp. Paket `yt-dlp[default]` menyediakan dependensi EJS, sedangkan runtime Deno harus memenuhi versi minimum pada panduan EJS yt-dlp yang digunakan saat rilis ini.
+
+**Batas penting:** PO Token bukan jaminan bypass. YouTube tetap dapat membatasi IP pusat data/Render, meminta verifikasi, mengubah challenge, atau mengembalikan format yang tidak dapat diunduh. BgUtils sendiri memperingatkan bahwa penyediaan token tidak menjamin lolos dari 403 atau bot checks. Konten privat, berbayar, atau yang memerlukan akun tidak otomatis menjadi dapat diakses. Petik tidak meminta password, cookies, atau token akun YouTube.
+
+BgUtils dan yt-dlp adalah proyek open-source; tidak ada API berbayar atau biaya provider tambahan pada implementasi ini. Namun penggunaan Render Free tetap tunduk pada kuota, bandwidth, waktu build, penghentian saat idle, dan batas resource Render. Render menyebut instance Free memiliki RAM 512 MB pada halaman pricing dan dapat spin down setelah 15 menit tidak menerima trafik.
 
 ## Platform dan batas dukungan
 
@@ -77,11 +91,11 @@ Pengunduh CDN menulis potongan data langsung ke file sementara agar tidak menamp
 
 ## Variabel lingkungan
 
-`PUBLIC_BASE_URL`, `ALLOWED_ORIGINS`, `MAX_FILE_MB`, `MAX_DURATION_SECONDS`, `FILE_TTL_SECONDS`, `MAX_CONCURRENT_DOWNLOADS`, `RATE_LIMIT_COUNT`, `RATE_LIMIT_WINDOW_SECONDS`, `TEMP_DIR`, `MAX_GALLERY_ITEMS`, `MAX_GALLERY_FILE_MB`, `MAX_GALLERY_VIDEO_MB`, dan `MAX_GALLERY_TOTAL_MB`.
+`PUBLIC_BASE_URL`, `ALLOWED_ORIGINS`, `MAX_FILE_MB`, `MAX_DURATION_SECONDS`, `FILE_TTL_SECONDS`, `MAX_CONCURRENT_DOWNLOADS`, `RATE_LIMIT_COUNT`, `RATE_LIMIT_WINDOW_SECONDS`, `TEMP_DIR`, `BGUTIL_POT_PROVIDER_ENABLED`, `BGUTIL_POT_PROVIDER_URL`, `BGUTIL_PROVIDER_PORT`, `BGUTIL_PROVIDER_START_TIMEOUT`, `MAX_GALLERY_ITEMS`, `MAX_GALLERY_FILE_MB`, `MAX_GALLERY_VIDEO_MB`, dan `MAX_GALLERY_TOTAL_MB`.
 
 ## Tes dan batas verifikasi
 
-Folder `tests/` berisi 75 tes offline untuk parser Instagram/Threads campuran, deteksi URL gallery-dl, urutan `sourceIndex`, pemetaan ID unduhan, ZIP yang berisi foto dan video, unduhan CDN streaming, partial failure, validasi host/redirect, endpoint inspect/download, health, kompatibilitas Cobalt, preview, MP3, durasi, dan kualitas. Tes ini memvalidasi kontrak dan perilaku lokal; tes offline bukan bukti bahwa setiap tautan live dari tiap platform akan berhasil diekstrak.
+Folder `tests/` berisi 81 tes offline untuk parser Instagram/Threads campuran, deteksi URL gallery-dl, urutan `sourceIndex`, pemetaan ID unduhan, ZIP yang berisi foto dan video, unduhan CDN streaming, partial failure, validasi host/redirect, endpoint inspect/download, health, kompatibilitas Cobalt, preview, MP3, durasi, dan kualitas. Tes ini memvalidasi kontrak dan perilaku lokal; tes offline bukan bukti bahwa setiap tautan live dari tiap platform akan berhasil diekstrak.
 
 ## Urutan API di frontend Petik
 
@@ -90,6 +104,16 @@ Folder `tests/` berisi 75 tes offline untuk parser Instagram/Threads campuran, d
 3. API Cobalt eksternal sebagai cadangan video/audio yang sudah ada.
 
 ## Riwayat rilis
+
+### v1.9.0 — YouTube PO Token Provider
+
+- Menambahkan BgUtils PO Token Provider HTTP 2.0.2 dan plugin yt-dlp 2.0.2 dengan versi yang dipasangkan.
+- Menjalankan provider di container yang sama, terikat ke `127.0.0.1:4416`, bukan endpoint publik.
+- Menambahkan `start.sh` untuk startup provider, pengecekan `/ping`, dan fallback agar API sosial tetap hidup bila provider tidak siap.
+- Mengaktifkan klien YouTube `mweb` hanya ketika server dan plugin sehat serta versinya cocok.
+- Menambahkan status provider dan versi plugin/server ke `/health`.
+- Menambahkan pesan error khusus untuk kegagalan PO Token dan pembatasan IP YouTube.
+- Mempertahankan resolver galeri campuran, Facebook post-scoped resolver, Instagram/Threads publik, Direct Link, preview, dan MP3 dari v1.8.0.
 
 ### v1.8.0 — Mixed Media Gallery
 
