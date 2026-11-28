@@ -38,7 +38,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 from yt_dlp import YoutubeDL
 
-APP_VERSION = "1.14.0"
+APP_VERSION = "1.15.0"
 MAX_GALLERY_ITEMS = max(1, min(30, int(os.getenv("MAX_GALLERY_ITEMS", "20"))))
 MAX_GALLERY_SOURCE_ITEMS = MAX_GALLERY_ITEMS * 2  # Mixed carousels can contain video entries between photos.
 MAX_GALLERY_FILE_BYTES = int(os.getenv("MAX_GALLERY_FILE_MB", "20")) * 1024 * 1024
@@ -98,7 +98,7 @@ app.add_middleware(
     allow_credentials=False,
     allow_methods=["GET", "POST", "OPTIONS"],
     allow_headers=["*"],
-    expose_headers=["Content-Disposition", "Content-Length", "Accept-Ranges"],
+    expose_headers=["Content-Disposition", "Content-Length", "Accept-Ranges", "Retry-After"],
 )
 
 download_slots = threading.BoundedSemaphore(MAX_CONCURRENT)
@@ -146,6 +146,15 @@ YOUTUBE_RATE_LIMIT_COOLDOWN_SECONDS = _bounded_env_int("YOUTUBE_RATE_LIMIT_COOLD
 YOUTUBE_SLEEP_INTERVAL_REQUESTS = _bounded_env_float("YOUTUBE_SLEEP_INTERVAL_REQUESTS", 1.0, 0.0, 10.0)
 YOUTUBE_INFO_CACHE_TTL_SECONDS = _bounded_env_int("YOUTUBE_INFO_CACHE_TTL_SECONDS", 45, 0, 180)
 YOUTUBE_INFO_CACHE_MAX = 64
+# Do not let yt-dlp silently retry YouTube requests after upstream 429 responses.
+# These are scoped to YouTube only; social extractors retain their normal retry behavior.
+YOUTUBE_RETRY_OPTIONS = {
+    "retries": 0,
+    "extractor_retries": 0,
+    "fragment_retries": 0,
+    "file_access_retries": 0,
+    "concurrent_fragment_downloads": 1,
+}
 YOUTUBE_RATE_LOCK = threading.Lock()
 YOUTUBE_NETWORK_PROBE_LOCK = threading.Lock()
 YOUTUBE_INFO_CACHE: dict[str, tuple[dict, float]] = {}
@@ -390,7 +399,7 @@ def _bgutil_provider_status() -> dict:
         try:
             request = urllib.request.Request(
                 f"{base_url}/ping",
-                headers={"User-Agent": "Petik-Health/1.14.0"},
+                headers={"User-Agent": "Petik-Health/1.15.0"},
             )
             with urllib.request.urlopen(request, timeout=1.2) as response:
                 payload = json.loads(response.read(4096).decode("utf-8", errors="replace"))
@@ -403,7 +412,7 @@ def _bgutil_provider_status() -> dict:
         try:
             request = urllib.request.Request(
                 f"{telemetry_url}/stats",
-                headers={"User-Agent": "Petik-Health/1.14.0"},
+                headers={"User-Agent": "Petik-Health/1.15.0"},
             )
             with urllib.request.urlopen(request, timeout=0.8) as response:
                 candidate = json.loads(response.read(4096).decode("utf-8", errors="replace"))
@@ -1121,6 +1130,7 @@ def _yt_common_options(platform: str | None = None, youtube_client: str | None =
         options["js_runtimes"] = {"deno": {"path": deno_path}}
 
     if platform == "youtube":
+        options.update(YOUTUBE_RETRY_OPTIONS)
         provider = _youtube_provider_status()
         wpc = _wpc_status()
         provider_mode = os.getenv("YOUTUBE_POT_PROVIDER_MODE", "bgutil").strip().lower()
@@ -1257,6 +1267,8 @@ def _extract_info_impl(url: str) -> dict:
             _finish_youtube_diagnostics(
                 "failed", failures[-1].split(":", 1)[-1] if failures else "unknown"
             )
+            if any(item.endswith(":http_429") for item in failures):
+                raise RuntimeError(f"YouTube HTTP Error 429: {detail}")
             raise RuntimeError(f"YouTube gagal pada client yang diuji ({', '.join(failures)}). {detail}")
         info = dict(info)
         info["_petik_youtube_client"] = selected_client
@@ -2837,6 +2849,8 @@ def _download_media_impl(url: str, mode: str, quality: str) -> tuple[Path, str, 
             "concurrent_fragment_downloads": 3,
             "fragment_retries": 2,
         })
+        if platform == "youtube":
+            options.update(YOUTUBE_RETRY_OPTIONS)
         try:
             if platform == "youtube":
                 _record_youtube_attempt(str(client), "attempting-download")
@@ -2882,6 +2896,7 @@ def _download_media_impl(url: str, mode: str, quality: str) -> tuple[Path, str, 
             is_rate_limited = observed_429 or code == "http_429"
             if is_rate_limited:
                 _activate_youtube_cooldown(str(client), stage or "http_429")
+                last_error = RuntimeError(f"YouTube HTTP Error 429: permintaan dari server Petik dibatasi sementara. Detail extractor: {str(exc)[:180]}")
             previous_client, previous_error_code = str(client), code
             _record_youtube_attempt(str(client), "download-failed", code, stage=stage)
             if is_rate_limited or index >= len(clients) - 1 or not _youtube_should_fallback(exc):
@@ -2916,17 +2931,29 @@ def _store_file(path: Path, filename: str) -> str:
     return token
 
 
-def _error(code: str, message: str, status_code: int = 502, service: str | None = None):
+def _error(
+    code: str,
+    message: str,
+    status_code: int = 502,
+    service: str | None = None,
+    headers: dict[str, str] | None = None,
+):
     context = {"message": message[:350]}
     if service:
         context["service"] = service
-    return JSONResponse({"status": "error", "error": {"code": code, "context": context}}, status_code=status_code)
+    return JSONResponse(
+        {"status": "error", "error": {"code": code, "context": context}},
+        status_code=status_code,
+        headers=headers,
+    )
 
 
 def _extract_error(exc: Exception, platform: str):
     original = str(exc)[:500] or "Media tidak tersedia."
     lowered = original.lower()
     code = "error.api.content.video.unavailable"
+    status_code = 502
+    response_headers = None
     if "there is no video in this post" in lowered or "no video in this post" in lowered:
         code = "error.api.gallery.unavailable"
         message = "Postingan Instagram ini tidak menyediakan stream video. Petik sudah mencoba extractor foto, tetapi server belum menerima data foto publik. Pastikan postingan bisa dibuka tanpa login; Instagram juga dapat membatasi akses dari server."
@@ -2936,17 +2963,21 @@ def _extract_error(exc: Exception, platform: str):
     elif platform == "youtube" and any(term in lowered for term in (
         "sign in to confirm you're not a bot", "confirm you're not a bot", "confirm you’re not a bot",
         "po token", "bgutil", "botguard", "http error 403", "403: forbidden",
-        "youtube gagal pada client yang diuji", "no downloadable formats", "http error 429",
+        "youtube gagal pada client yang diuji", "no downloadable formats", "http error 429", "http_429",
         "age_restricted", "age restricted", "members only", "video unavailable", "this video is not available",
         "too many requests", "http error 500", "http error 502", "http error 503", "http error 504",
         "login_required",
     )):
         code = "error.api.youtube.restricted"
-        if "sign in to confirm" in lowered or "confirm you're not a bot" in lowered or "confirm you’re not a bot" in lowered:
-            message = "YouTube menolak permintaan publik Petik dengan pemeriksaan anti-bot. Petik sudah mencoba beberapa jalur client. Hal ini dapat berkaitan dengan tahap ekstraksi, sesi, atau reputasi IP server; penyebab pastinya belum dapat dipastikan dari pesan ini saja."
-        elif "429" in lowered or "too many requests" in lowered:
+        # 429 wins over any later bot-check text from the same extraction attempt.
+        if any(term in lowered for term in ("http error 429", "http_429", "too many requests")):
             code = "error.api.rate.limit"
-            message = "YouTube membatasi permintaan sementara. Tunggu beberapa menit sebelum mencoba lagi."
+            message = "YouTube mengembalikan HTTP 429 dan membatasi permintaan dari server Petik. Percobaan ulang otomatis dihentikan. Tunggu sampai cooldown selesai sebelum mencoba lagi."
+            status_code = 429
+            retry_after = max(1, _youtube_rate_control_snapshot().get("cooldownRemainingSeconds") or YOUTUBE_RATE_LIMIT_COOLDOWN_SECONDS)
+            response_headers = {"Retry-After": str(retry_after)}
+        elif "sign in to confirm" in lowered or "confirm you're not a bot" in lowered or "confirm you’re not a bot" in lowered:
+            message = "YouTube menolak permintaan publik Petik dengan pemeriksaan anti-bot. Hal ini dapat berkaitan dengan sesi atau reputasi IP server; penyebab pastinya belum dapat dipastikan dari pesan ini saja."
         elif any(term in lowered for term in ("http error 500", "http error 502", "http error 503", "http error 504")):
             message = "Server YouTube sedang mengalami gangguan atau gagal merespons. Coba lagi beberapa saat."
         elif "po token" in lowered or "bgutil" in lowered or "botguard" in lowered:
@@ -2969,7 +3000,7 @@ def _extract_error(exc: Exception, platform: str):
         message = "Mesin galeri belum tersedia pada server. Periksa status deployment API."
     else:
         message = original
-    return _error(code, message, 502, platform)
+    return _error(code, message, status_code, platform, response_headers)
 
 
 def _acquire(request: Request):
@@ -3093,6 +3124,14 @@ def health():
         },
         "youtubeCookiesConfigured": _youtube_cookie_configured(),
         "youtubeRateControl": _youtube_rate_control_snapshot(),
+        "youtubeRequestPolicy": {
+            "retries": YOUTUBE_RETRY_OPTIONS["retries"],
+            "extractorRetries": YOUTUBE_RETRY_OPTIONS["extractor_retries"],
+            "fragmentRetries": YOUTUBE_RETRY_OPTIONS["fragment_retries"],
+            "fileAccessRetries": YOUTUBE_RETRY_OPTIONS["file_access_retries"],
+            "concurrentFragments": YOUTUBE_RETRY_OPTIONS["concurrent_fragment_downloads"],
+            "scope": "youtube-only; other extractors unchanged",
+        },
         "youtubeHttpImpersonation": {
             "available": HAS_CURL_CFFI,
             "enabled": bool(_youtube_impersonate_target()),
@@ -3233,7 +3272,7 @@ def youtube_network_diagnostics(request: Request):
         try:
             req = urllib.request.Request(
                 target,
-                headers={"User-Agent": "Mozilla/5.0 Petik-Network-Diagnostic/1.14.0", "Accept": "*/*"},
+                headers={"User-Agent": "Mozilla/5.0 Petik-Network-Diagnostic/1.15.0", "Accept": "*/*"},
                 method="GET",
             )
             with urllib.request.urlopen(req, timeout=8) as response:

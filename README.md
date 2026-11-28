@@ -1,41 +1,41 @@
-# Petik Universal Extractor API v1.14.0
+# Petik Universal API v1.15.0 — YouTube 429 request safety
 
-Backend Petik berbasis FastAPI, yt-dlp, gallery-dl, curl-cffi untuk resolver publik Meta, Deno/EJS, BgUtils PO Token Provider, HTTPX, dan FFmpeg. Rilis v1.14.0 mempertahankan BgUtils sebagai konfigurasi standar, menambahkan profil WPC/Chromium eksperimental yang terpisah, memperbaiki korelasi diagnosa YouTube dan menjaga penyebab error utama agar tidak tertimpa error pembungkus. Cookies YouTube tetap opsional dan tidak ada API berbayar yang ditambahkan. Galeri campuran foto + video dan resolver sosial dipertahankan.
+Petik adalah backend publik berbasis FastAPI, yt-dlp, gallery-dl, Deno/EJS, BgUtils PO Token Provider, HTTPX, curl-cffi, dan FFmpeg. Rilis ini berfokus pada penghentian retry YouTube yang tersembunyi setelah HTTP 429. Resolver sosial, galeri campuran foto + video, kompatibilitas API, dan konfigurasi BgUtils v1.14 dipertahankan.
 
-**Penting:** profil standar memakai `Dockerfile` dan tetap cocok untuk konfigurasi Render Free yang sudah ada. `Dockerfile.wpc` hanya untuk percobaan di lingkungan dengan resource memadai; WPC belum dibuktikan dapat mengatasi bot-check Player API atau stabil di Render Free.
+## Perubahan v1.15.0
 
-## YouTube recovery dan request safety (v1.14.0)
+- **Retry YouTube dimatikan pada semua lapisan yt-dlp:** `retries=0`, `extractor_retries=0`, `fragment_retries=0`, dan `file_access_retries=0`.
+- **Request fragmen diserialkan:** `concurrent_fragment_downloads=1` hanya untuk YouTube. Extractor sosial tetap menggunakan retry dan konkurensi sebelumnya.
+- **429 diprioritaskan:** bila logger yt-dlp sudah mencatat HTTP 429, pesan bot-check yang muncul sesudahnya tidak boleh menutupi kejadian 429.
+- **Status HTTP dipertahankan:** error upstream YouTube 429 dari `/api/inspect` dan `/api/download` dikembalikan sebagai HTTP 429 dengan header `Retry-After` berisi sisa cooldown atau nilai default cooldown. Header ini juga diekspos lewat CORS agar website GitHub Pages dapat membacanya.
+- **Health dapat diaudit:** `/health` menambahkan `youtubeRequestPolicy` untuk menunjukkan jumlah retry dan konkurensi YouTube.
+- **Website patch v1.15:** menampilkan pesan rate limit yang lebih jelas dan menghitung waktu tunggu dari header `Retry-After` jika tersedia. Tombol Simpan tidak diaktifkan ketika tidak ada format media.
+- **Tidak ada pengelakan pembatasan:** tidak mengaktifkan proxy pihak ketiga, rotasi IP, atau impersonasi otomatis. `curl_cffi`, WPC, cookies, dan opsi Innertube eksperimental tetap mengikuti konfigurasi opt-in yang sudah ada.
 
-Rilis ini memprioritaskan pengurangan permintaan berulang dan pengujian terkontrol. HTTP 429 diperlakukan sebagai sinyal untuk berhenti, bukan alasan menambah client fallback.
+## Temuan dan batas diagnosis
 
-- **Client eksplisit dan berurutan:** `tv_samsung`, `visionos`, `web`, `mweb` (hanya bila BgUtils/WPC siap), lalu `web_embedded`. Setiap client dijalankan dalam konfigurasi yt-dlp tersendiri agar Petik dapat mencatat kegagalan dan berhenti ketika menemukan 429. `web_safari` tidak lagi menjadi jalur default karena sejak Juli 2026 HLS-nya hanya tersedia pada sesi tertentu yang tepercaya. `android_vr` sengaja tidak dipakai karena source yt-dlp saat ini mencatat semua format client tersebut mengalami HTTP 403 sejak 17 Agustus 2026. Referensi client dan argumen extractor: https://github.com/yt-dlp/yt-dlp#extractor-arguments dan https://github.com/yt-dlp/yt-dlp/blob/master/yt_dlp/extractor/youtube/_base.py.
-- **Penghentian fallback saat 429:** jika logger yt-dlp atau exception mengidentifikasi HTTP 429, Petik menyimpan tahap/client yang kena batas, mengaktifkan cooldown, lalu menghentikan client berikutnya pada permintaan tersebut.
-- **Cooldown dan antrean:** satu proses hanya menjalankan satu pekerjaan YouTube pada satu waktu. Secara default, jarak antarpemeriksaan baru 5 detik, jarak percobaan client fallback 2 detik, dan cooldown setelah 429 adalah 300 detik. Permintaan baru selama cooldown ditolak lokal tanpa menambah request ke YouTube. Nilai hanya disimpan dalam memori proses; restart layanan akan mengatur ulang cooldown. Bila ada beberapa worker/instance, state rate-control tidak dibagi lintas instance.
-- **Jeda dan cache:** `sleep_interval_requests=1` membantu mengatur jeda di dalam yt-dlp. Hasil inspect sukses disimpan dalam cache memori maksimum 64 entri selama 45 detik. Cache tidak disimpan ke disk atau dikirim melalui health. Satu hasil inspect yang baru dapat dipakai untuk mengizinkan satu aksi Simpan segera agar pengguna tidak terkena jeda lima detik di antara Ambil dan Simpan.
-- **Diagnostik jaringan:** `GET /api/diagnostics/youtube-network` melakukan dua GET ke host tetap (`www.youtube.com/generate_204` dan `youtubei.googleapis.com/`) dan mengembalikan status HTTP + durasi saja. Endpoint dibatasi sekali per 120 detik dan berhenti pada target pertama yang memberi 429. Respons 2xx/3xx/4xx selain 429 hanya membuktikan host merespons; tidak membuktikan Player API atau download video berhasil. Endpoint ini tidak mengungkap alamat IP egress.
-- **Endpoint/visitor data eksperimen:** `YOUTUBE_INNERTUBE_HOST` menerima hanya host yang di-allowlist (`youtubei.googleapis.com`, `www.youtube.com`, `music.youtube.com`, `studio.youtube.com`). `YOUTUBE_INNERTUBE_KEY` dibatasi format/ukuran. `YOUTUBE_PLAYER_SKIP` menerima hanya `configs`, `webpage`, `js`, `initial_data`. `YOUTUBE_VISITOR_DATA` hanya dipakai saat `player_skip` memuat `webpage,configs` dan tidak ada cookies. Pengaturan ini kosong secara default; `player_skip` dan `visitor_data` dapat mengurangi request tetapi juga dapat menghilangkan metadata/format. Gunakan hanya nilai yang diperoleh secara sah dari sesi/konfigurasi sendiri. Nilainya tidak ditampilkan pada `/health` dan tidak ditulis ke log.
-- **Client tambahan:** `YOUTUBE_EXTRA_CLIENTS` hanya menerima nama dalam allowlist. `android_vr` tidak di-allowlist.
-- **curl_cffi impersonation:** `YOUTUBE_HTTP_IMPERSONATE` kosong secara default. Bila diaktifkan, nilai seperti `chrome` atau `safari` diteruskan ke yt-dlp jika dukungan tersedia. Ini eksperimen terakhir saja: catatan maintainer yt-dlp mengingatkan impersonation bukan pilihan yang disarankan untuk YouTube dan dapat memperburuk hasil. Referensi: https://github.com/yt-dlp/yt-dlp/issues/17219 dan https://github.com/yt-dlp/yt-dlp#impersonation.
-- **Region Render:** endpoint diagnostik membantu membandingkan akses dari suatu deployment, tetapi tidak dapat memindahkan atau mengubah IP egress. Uji region perlu dibuat sebagai deployment uji terpisah dari Render Dashboard, memakai salinan konfigurasi, lalu dibandingkan dengan video/link yang sama. Jangan pindahkan layanan utama sebelum ada hasil. Dedicated outbound IP tidak menjadi bagian paket ini.
-- **Website:** patch JavaScript v1.14 menghentikan percobaan extractor website selanjutnya bila API Petik mengembalikan HTTP 429 spesifik YouTube, menjaga tombol Simpan tetap nonaktif bila tidak ada format, dan mengganti pesan generic menjadi 429/bot-check yang lebih informatif. Jika API hanya bot-check (bukan 429), fallback eksternal tetap boleh dicoba.
+Deployment v1.14 yang diuji pengguna mengembalikan HTTP 429 dari YouTube. Ini membuktikan permintaan dari lingkungan server dibatasi pada saat pengujian, tetapi belum membuktikan satu alamat IP tertentu atau seluruh rentang IP Render yang menjadi penyebab. Dokumentasi Render menyatakan layanan pada region yang sama dapat memakai alamat dari rentang outbound bersama. Pengujian region perlu dilakukan melalui deployment uji yang terpisah; v1.15 tidak memindahkan service atau mengubah lokasi deployment.
 
-### Environment variables v1.14.0
+Dokumentasi PO Token yt-dlp saat ini membedakan tahap Player API dan GVS. Untuk `mweb`, kebutuhan PO Token yang tercantum saat ini adalah GVS; oleh karena itu provider BgUtils tidak dianggap sebagai penyebab utama ketika ekstraksi berhenti lebih awal di Player API atau pada HTTP 429. BgUtils tetap dipertahankan untuk tahap stream yang memang membutuhkannya.
 
-| Variable | Default | Fungsi |
-|---|---:|---|
-| `YOUTUBE_MIN_ATTEMPT_INTERVAL_SECONDS` | `5` | Jarak minimum antar job YouTube baru |
-| `YOUTUBE_CLIENT_FALLBACK_INTERVAL_SECONDS` | `2` | Jeda antar client setelah error yang boleh dicoba ulang |
-| `YOUTUBE_RATE_LIMIT_COOLDOWN_SECONDS` | `300` | Cooldown lokal setelah HTTP 429 (batas 30–3600 detik) |
-| `YOUTUBE_SLEEP_INTERVAL_REQUESTS` | `1` | Jeda internal request yt-dlp (0–10 detik) |
-| `YOUTUBE_INFO_CACHE_TTL_SECONDS` | `45` | Cache inspect sukses dalam memori (0–180 detik) |
-| `YOUTUBE_EXTRA_CLIENTS` | kosong | Client tambahan dalam allowlist |
-| `YOUTUBE_INNERTUBE_HOST` | kosong | Override host Innertube yang di-allowlist |
-| `YOUTUBE_INNERTUBE_KEY` | kosong | API key Innertube opsional, tidak pernah ditampilkan |
-| `YOUTUBE_PLAYER_SKIP` | kosong | Eksperimen pengurangan request extractor |
-| `YOUTUBE_VISITOR_DATA` | kosong | Visitor data opsional; syarat `player_skip` + tanpa cookies |
-| `YOUTUBE_HTTP_IMPERSONATE` | kosong | Impersonation eksperimental; tidak direkomendasikan sebagai langkah awal |
+Sumber teknis yang dirujuk:
+- Render outbound IP ranges: https://render.com/docs/outbound-ip-addresses
+- yt-dlp YouTube PO Token Guide: https://github.com/yt-dlp/yt-dlp/wiki/PO-Token-Guide
+- yt-dlp YouTube extractor documentation: https://github.com/yt-dlp/yt-dlp/wiki/Extractors
 
-**Verifikasi v1.14.0:** 142 tes offline lulus. Termasuk uji penghentian fallback ketika 429, cooldown, cache, allowlist, health, endpoint probe dengan respons simulasi, dan kontrak platform lama. Tes tersebut tidak bisa membuktikan akses YouTube live dari egress Render. Docker build, deploy Render, tes region, dan download MP4/MP3 nyata tetap membutuhkan pengujian setelah pengguna melakukan deploy.
+## Hal yang sengaja tidak diaktifkan
+
+- `YOUTUBE_HTTP_IMPERSONATE`: tetap kosong secara default. Mengubah fingerprint HTTP tidak menghilangkan rate limit pada egress IP dan dapat mengurangi stabilitas.
+- `YOUTUBE_INNERTUBE_HOST`, `YOUTUBE_INNERTUBE_KEY`, `YOUTUBE_PLAYER_SKIP`, `YOUTUBE_VISITOR_DATA`: tetap opt-in; jangan mengisi nilai tebakan atau data sesi orang lain.
+- WPC/Chromium: tetap eksperimental dan tidak aktif pada profil Render Free standar.
+- Cookies: mekanisme opsional dari v1.14 tetap tersedia, tetapi kredensial/cookies tidak dimasukkan ke ZIP, GitHub, atau log. Gunakan hanya sesi milik sendiri dan pahami risiko keamanan akun.
+- Perpindahan region, dedicated IP, proxy, dan tes lintas jaringan tidak dilakukan otomatis oleh paket ini. Tidak ada layanan berbayar yang ditambahkan.
+
+## Verifikasi v1.15.0
+
+Tes offline memeriksa konfigurasi retry khusus YouTube, memastikan retry platform sosial tetap utuh, memastikan HTTP 429 mengalahkan bot-check yang muncul sesudahnya, memeriksa status endpoint dan header `Retry-After`, serta menjalankan seluruh kontrak regresi yang tersedia. Tes offline tidak membuktikan YouTube akan memberikan format video dari IP Render. Docker build, tes live YouTube, unduhan MP4/MP3 nyata, dan perbandingan region tetap memerlukan deployment dan pengujian jaringan nyata.
+
+---
 
 ## Fitur dan kontrak API
 
@@ -65,11 +65,11 @@ Contoh itu hanya menjelaskan bentuk respons; bukan URL media yang benar-benar di
 ## Deploy lewat Render
 
 1. Buka repository GitHub `petik-universal-api`.
-2. Ekstrak ZIP backend v1.14.0, lalu unggah semua isinya langsung ke root repository (jangan unggah file ZIP sebagai satu file).
+2. Ekstrak ZIP backend v1.15.0, lalu unggah semua isinya langsung ke root repository (jangan unggah file ZIP sebagai satu file).
 3. Pastikan `Dockerfile`, `Dockerfile.wpc`, `app.py`, `pot_telemetry.py`, `start.sh`, `requirements.txt`, `requirements-wpc.txt`, `render.yaml`, `README.md`, dan folder `tests/` berada di root.
 4. Commit perubahan dari GitHub.
 5. Di Render, buka Blueprint Petik lalu jalankan **Manual Sync / Apply**.
-6. Setelah layanan berstatus Live, buka endpoint `/health`. Versi yang diharapkan `1.14.0`, `mixedMediaAvailable: true`, dan `galleryDlAvailable: true` bila gallery-dl berhasil terpasang. Untuk YouTube, pastikan `youtubePoTokenProviderReady: true`, `youtubePoTokenPluginVersion: "2.0.2"`, dan `youtubePoTokenServerVersion: "2.0.2"`.
+6. Setelah layanan berstatus Live, buka endpoint `/health`. Versi yang diharapkan `1.15.0`, `mixedMediaAvailable: true`, dan `galleryDlAvailable: true` bila gallery-dl berhasil terpasang. Untuk YouTube, pastikan `youtubePoTokenProviderReady: true`, `youtubePoTokenPluginVersion: "2.0.2"`, dan `youtubePoTokenServerVersion: "2.0.2"`.
 7. Jika `youtubePoTokenProviderReady` bernilai `false`, lihat Render Logs. Backend tetap dapat melayani platform lain, tetapi Petik tidak akan memaksa klien YouTube `mweb` tanpa provider yang cocok.
 8. Buka `/` untuk memeriksa daftar platform dan layanan.
 
@@ -153,7 +153,7 @@ Pengunduh CDN menulis potongan data langsung ke file sementara agar tidak menamp
 
 ## Tes dan batas verifikasi
 
-Folder `tests/` berisi 142 tes offline pada v1.14.0 untuk parser Instagram/Threads campuran, deteksi URL gallery-dl, urutan `sourceIndex`, pemetaan ID unduhan, ZIP yang berisi foto dan video, unduhan CDN streaming, partial failure, validasi host/redirect, endpoint inspect/download, health, kompatibilitas Cobalt, preview, MP3, durasi, dan kualitas. Tes ini memvalidasi kontrak dan perilaku lokal; tes offline bukan bukti bahwa setiap tautan live dari tiap platform akan berhasil diekstrak.
+Folder `tests/` berisi 146 tes offline pada v1.15.0 untuk parser Instagram/Threads campuran, deteksi URL gallery-dl, urutan `sourceIndex`, pemetaan ID unduhan, ZIP yang berisi foto dan video, unduhan CDN streaming, partial failure, validasi host/redirect, endpoint inspect/download, health, kompatibilitas Cobalt, preview, MP3, durasi, dan kualitas. Tes ini memvalidasi kontrak dan perilaku lokal; tes offline bukan bukti bahwa setiap tautan live dari tiap platform akan berhasil diekstrak.
 
 ## Urutan API di frontend Petik
 
