@@ -29,7 +29,7 @@ def test_health_endpoint_and_version():
     response = client.get("/health")
     assert response.status_code == 200
     assert response.json()["status"] == "healthy"
-    assert response.json()["version"] == "1.6.2"
+    assert response.json()["version"] == "1.6.3"
     assert "javascriptRuntime" in response.json()
 
 
@@ -671,11 +671,11 @@ def test_instagram_public_fallback_uses_anonymous_graphql_session(monkeypatch):
 
 def test_health_reports_gallery_and_public_fallback_capabilities():
     body = client.get("/health").json()
-    assert body["version"] == "1.6.2"
+    assert body["version"] == "1.6.3"
     assert "threads" in body["galleryPlatforms"]
     assert body["threadsPhotoResolver"] == "public-page-json"
     assert body["instagramPhotoResolver"] == "gallery-dl+logged-out-graphql+page-json"
-    assert body["facebookPhotoResolver"] == "gallery-dl+logged-out-page-html"
+    assert body["facebookPhotoResolver"] == "gallery-dl+og-image+post-scoped-json"
     assert isinstance(body["socialPublicFallbackAvailable"], bool)
     assert isinstance(body["instagramPublicFallbackAvailable"], bool)
 
@@ -763,15 +763,106 @@ def test_instagram_current_graphql_payload_unwraps_logged_out_media():
     assert api._instagram_find_product_info(root) == product
 
 
-def test_facebook_public_html_parser_extracts_deduplicated_cdn_photos():
+def test_facebook_public_html_parser_ignores_unrelated_page_cdn_urls():
     html = ('''<html><head>
       <meta property="og:image" content="https://scontent.xx.fbcdn.net/v/t39.30808-6/a.jpg?stp=abc&amp;oe=123">
       <meta property="og:image" content="https://scontent.xx.fbcdn.net/v/t39.30808-6/a.jpg?stp=abc&amp;oe=123">
-    </head><body><script>"image_uri":"https:\\/\\/scontent.xx.fbcdn.net\\/v\\/t39.30808-6\\/b.webp?format=webp&amp;oe=999"</script></body></html>''')
-    items = api._facebook_photo_items_from_html(html)
-    assert len(items) == 2
+    </head><body><script>"image_uri":"https://scontent.xx.fbcdn.net/v/t39.30808-6/unrelated.webp?format=webp&amp;oe=999"</script></body></html>''')
+    items = api._facebook_photo_items_from_html(html, "https://www.facebook.com/photo/?fbid=123")
+    assert len(items) == 1
     assert items[0]["extension"] == "jpg"
-    assert items[1]["extension"] == "webp"
+
+
+def test_facebook_parser_extracts_only_target_post_attachment_photos():
+    import json
+    target_story = {
+        "id": "123",
+        "comet_sections": {"content": {"story": {"attachments": [{
+            "style_type_renderer": {"attachment": {"all_subattachments": {"nodes": [
+                {"media": {"__typename": "Photo", "id": "photo-1", "image": {"uri": "https://scontent.xx.fbcdn.net/phone.jpg"}}},
+                {"media": {"__typename": "Photo", "id": "photo-2", "image": {"uri": "https://scontent.xx.fbcdn.net/detail.webp?format=webp"}}},
+            ]}}}
+        }]}}}
+    }
+    unrelated_story = {
+        "id": "999",
+        "attachments": [{"media": {"__typename": "Photo", "id": "other", "image": {"uri": "https://scontent.xx.fbcdn.net/recommendation.jpg"}}}],
+    }
+    html = '<script type="application/json">' + json.dumps({"data": {"nodes": [target_story, unrelated_story]}}) + '</script>'
+    items = api._facebook_photo_items_from_html(html, "https://www.facebook.com/example/posts/123")
+    assert [item["url"] for item in items] == [
+        "https://scontent.xx.fbcdn.net/phone.jpg",
+        "https://scontent.xx.fbcdn.net/detail.webp?format=webp",
+    ]
+
+
+def test_facebook_parser_does_not_guess_album_from_unbound_json():
+    import json
+    page = '<script type="application/json">' + json.dumps({"Photo": {
+        "__typename": "Photo", "id": "unrelated", "image": {"uri": "https://scontent.xx.fbcdn.net/random.jpg"}
+    }}) + '</script>'
+    assert api._facebook_photo_items_from_html(page, "https://www.facebook.com/posts/123") == []
+
+
+def test_facebook_public_resolver_passes_source_url_to_scoped_parser(monkeypatch):
+    import json
+    target_story = {
+        "id": "123",
+        "attachments": [{"media": {"__typename": "Photo", "id": "p1", "image": {
+            "uri": "https://scontent.xx.fbcdn.net/phone-only.jpg"
+        }}}],
+    }
+    page = '<meta property="og:image" content="https://scontent.xx.fbcdn.net/phone-only.jpg">' + (
+        '<script type="application/json">' + json.dumps({"data": {"story": target_story}}) + '</script>'
+    )
+
+    class FakeResponse:
+        status_code = 200
+        url = "https://www.facebook.com/example/posts/123"
+        text = page
+        headers = {}
+
+    class FakeSession:
+        def __init__(self, **kwargs):
+            self.kwargs = kwargs
+        def get(self, *_args, **_kwargs):
+            return FakeResponse()
+        def close(self):
+            pass
+
+    class FakeCurl:
+        @staticmethod
+        def Session(**kwargs):
+            return FakeSession(**kwargs)
+
+    monkeypatch.setattr(api, "curl_requests", FakeCurl)
+    monkeypatch.setattr(api, "HAS_CURL_CFFI", True)
+    items = api._facebook_public_gallery("https://www.facebook.com/example/posts/123")
+    assert len(items) == 1
+    assert items[0]["url"].endswith("phone-only.jpg")
+
+
+def test_facebook_video_thumbnail_is_not_misreported_as_photo_gallery():
+    html = '''<meta property="og:type" content="video.other">
+      <meta property="og:video" content="https://video.xx.fbcdn.net/clip.mp4">
+      <meta property="og:image" content="https://scontent.xx.fbcdn.net/video-poster.jpg">'''
+    assert api._facebook_photo_items_from_html(html, "https://www.facebook.com/watch/?v=123") == []
+
+
+def test_facebook_parser_uses_canonical_post_id_when_share_url_has_no_id():
+    import json
+    story = {
+        "id": "123",
+        "attachments": [{"media": {"__typename": "Photo", "id": "p1", "image": {
+            "uri": "https://scontent.xx.fbcdn.net/share-post-photo.jpg"
+        }}}],
+    }
+    html = '<meta property="og:url" content="https://www.facebook.com/demo/posts/123">' + (
+        '<script type="application/json">' + json.dumps({"data": {"story": story}}) + '</script>'
+    )
+    items = api._facebook_photo_items_from_html(html, "https://www.facebook.com/share/p/SHARETOKEN/")
+    assert len(items) == 1
+    assert items[0]["url"].endswith("share-post-photo.jpg")
 
 
 def test_social_media_hosts_allow_only_meta_image_cdns():
