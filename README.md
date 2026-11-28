@@ -1,6 +1,8 @@
-# Petik Universal Extractor API v1.12.0
+# Petik Universal Extractor API v1.13.0
 
-Backend Petik berbasis FastAPI, yt-dlp, gallery-dl, curl-cffi untuk resolver publik Meta, Deno/EJS, BgUtils PO Token Provider, HTTPX, dan FFmpeg. Rilis v1.12.0 memperdalam diagnosis tahap YouTube, mengisolasi event telemetry per percobaan, mengevaluasi fallback alternatif dan menyediakan cookies YouTube opsional tanpa mengubah default anonim. WPC/Chromium tetap tidak dipasang pada image Render Free. Fitur galeri campuran foto + video dan resolver sosial dipertahankan; tidak ada API berbayar yang ditambahkan.
+Backend Petik berbasis FastAPI, yt-dlp, gallery-dl, curl-cffi untuk resolver publik Meta, Deno/EJS, BgUtils PO Token Provider, HTTPX, dan FFmpeg. Rilis v1.13.0 mempertahankan BgUtils sebagai konfigurasi standar, menambahkan profil WPC/Chromium eksperimental yang terpisah, memperbaiki korelasi diagnosa YouTube dan menjaga penyebab error utama agar tidak tertimpa error pembungkus. Cookies YouTube tetap opsional dan tidak ada API berbayar yang ditambahkan. Galeri campuran foto + video dan resolver sosial dipertahankan.
+
+**Penting:** profil standar memakai `Dockerfile` dan tetap cocok untuk konfigurasi Render Free yang sudah ada. `Dockerfile.wpc` hanya untuk percobaan di lingkungan dengan resource memadai; WPC belum dibuktikan dapat mengatasi bot-check Player API atau stabil di Render Free.
 
 ## Fitur dan kontrak API
 
@@ -30,11 +32,11 @@ Contoh itu hanya menjelaskan bentuk respons; bukan URL media yang benar-benar di
 ## Deploy lewat Render
 
 1. Buka repository GitHub `petik-universal-api`.
-2. Ekstrak ZIP backend v1.12.0, lalu unggah semua isinya langsung ke root repository (jangan unggah file ZIP sebagai satu file).
-3. Pastikan `Dockerfile`, `app.py`, `pot_telemetry.py`, `start.sh`, `requirements.txt`, `requirements-wpc.txt`, `render.yaml`, `README.md`, dan folder `tests/` berada di root.
+2. Ekstrak ZIP backend v1.13.0, lalu unggah semua isinya langsung ke root repository (jangan unggah file ZIP sebagai satu file).
+3. Pastikan `Dockerfile`, `Dockerfile.wpc`, `app.py`, `pot_telemetry.py`, `start.sh`, `requirements.txt`, `requirements-wpc.txt`, `render.yaml`, `README.md`, dan folder `tests/` berada di root.
 4. Commit perubahan dari GitHub.
 5. Di Render, buka Blueprint Petik lalu jalankan **Manual Sync / Apply**.
-6. Setelah layanan berstatus Live, buka endpoint `/health`. Versi yang diharapkan `1.12.0`, `mixedMediaAvailable: true`, dan `galleryDlAvailable: true` bila gallery-dl berhasil terpasang. Untuk YouTube, pastikan `youtubePoTokenProviderReady: true`, `youtubePoTokenPluginVersion: "2.0.2"`, dan `youtubePoTokenServerVersion: "2.0.2"`.
+6. Setelah layanan berstatus Live, buka endpoint `/health`. Versi yang diharapkan `1.13.0`, `mixedMediaAvailable: true`, dan `galleryDlAvailable: true` bila gallery-dl berhasil terpasang. Untuk YouTube, pastikan `youtubePoTokenProviderReady: true`, `youtubePoTokenPluginVersion: "2.0.2"`, dan `youtubePoTokenServerVersion: "2.0.2"`.
 7. Jika `youtubePoTokenProviderReady` bernilai `false`, lihat Render Logs. Backend tetap dapat melayani platform lain, tetapi Petik tidak akan memaksa klien YouTube `mweb` tanpa provider yang cocok.
 8. Buka `/` untuk memeriksa daftar platform dan layanan.
 
@@ -54,7 +56,7 @@ Rilis ini dibuat untuk menindaklanjuti hasil v1.11 ketika provider BgUtils terde
 
 `/health` kini menambahkan `lastStage`, `lastErrorStage`, `stageEvents`, dan `providerAttemptEvents` pada `youtubeDiagnostics`, serta `youtubeCookiesConfigured` dan `youtubeDownloadFallbacks`. Nilai event bersifat metadata. Counter provider lifetime tetap disediakan untuk perbandingan.
 
-**Batas verifikasi:** 112 tes offline memeriksa kontrak, klasifikasi tahap, privasi telemetry, event baseline, validasi cookies, fallback, dan regresi. Tes ini tidak membuktikan YouTube live akan menerima permintaan dari IP Render. Docker build, deploy Render, dan unduhan YouTube nyata perlu diuji setelah pengguna melakukan deploy.
+**Batas verifikasi:** 129 tes offline memeriksa kontrak, klasifikasi tahap, privasi telemetry, event baseline, validasi cookies, fallback, dan regresi. Tes ini tidak membuktikan YouTube live akan menerima permintaan dari IP Render. Docker build, deploy Render, dan unduhan YouTube nyata perlu diuji setelah pengguna melakukan deploy.
 
 ## YouTube PO Token, telemetry, dan strategi recovery (v1.11.0)
 
@@ -114,11 +116,11 @@ Pengunduh CDN menulis potongan data langsung ke file sementara agar tidak menamp
 
 ## Variabel lingkungan
 
-`PUBLIC_BASE_URL`, `ALLOWED_ORIGINS`, `MAX_FILE_MB`, `MAX_DURATION_SECONDS`, `FILE_TTL_SECONDS`, `MAX_CONCURRENT_DOWNLOADS`, `RATE_LIMIT_COUNT`, `RATE_LIMIT_WINDOW_SECONDS`, `TEMP_DIR`, `BGUTIL_POT_PROVIDER_ENABLED`, `BGUTIL_POT_PROVIDER_URL`, `BGUTIL_PROVIDER_PORT`, `BGUTIL_PROVIDER_START_TIMEOUT`, `BGUTIL_TELEMETRY_PORT`, `BGUTIL_TELEMETRY_URL`, `YOUTUBE_FORCE_IPV4`, `YOUTUBE_WPC_ENABLED` (flag status; plugin dan Chrome/Chromium tetap harus tersedia untuk menjalankan WPC), `YOUTUBE_COOKIES_B64` (opsional; file cookies YouTube format Netscape yang di-Base64), `MAX_GALLERY_ITEMS`, `MAX_GALLERY_FILE_MB`, `MAX_GALLERY_VIDEO_MB`, dan `MAX_GALLERY_TOTAL_MB`.
+`PUBLIC_BASE_URL`, `ALLOWED_ORIGINS`, `MAX_FILE_MB`, `MAX_DURATION_SECONDS`, `FILE_TTL_SECONDS`, `MAX_CONCURRENT_DOWNLOADS`, `RATE_LIMIT_COUNT`, `RATE_LIMIT_WINDOW_SECONDS`, `TEMP_DIR`, `BGUTIL_POT_PROVIDER_ENABLED`, `BGUTIL_POT_PROVIDER_URL`, `BGUTIL_PROVIDER_PORT`, `BGUTIL_PROVIDER_START_TIMEOUT`, `BGUTIL_TELEMETRY_PORT`, `BGUTIL_TELEMETRY_URL`, `YOUTUBE_FORCE_IPV4`, `YOUTUBE_WPC_ENABLED` (harus bernilai `1` bersama plugin versi 1.1.2, Chromium, dan `YOUTUBE_POT_PROVIDER_MODE=wpc` untuk mengaktifkan WPC), `YOUTUBE_COOKIES_B64` (opsional; file cookies YouTube format Netscape yang di-Base64), `MAX_GALLERY_ITEMS`, `MAX_GALLERY_FILE_MB`, `MAX_GALLERY_VIDEO_MB`, dan `MAX_GALLERY_TOTAL_MB`.
 
 ## Tes dan batas verifikasi
 
-Folder `tests/` berisi 112 tes offline untuk parser Instagram/Threads campuran, deteksi URL gallery-dl, urutan `sourceIndex`, pemetaan ID unduhan, ZIP yang berisi foto dan video, unduhan CDN streaming, partial failure, validasi host/redirect, endpoint inspect/download, health, kompatibilitas Cobalt, preview, MP3, durasi, dan kualitas. Tes ini memvalidasi kontrak dan perilaku lokal; tes offline bukan bukti bahwa setiap tautan live dari tiap platform akan berhasil diekstrak.
+Folder `tests/` berisi 129 tes offline untuk parser Instagram/Threads campuran, deteksi URL gallery-dl, urutan `sourceIndex`, pemetaan ID unduhan, ZIP yang berisi foto dan video, unduhan CDN streaming, partial failure, validasi host/redirect, endpoint inspect/download, health, kompatibilitas Cobalt, preview, MP3, durasi, dan kualitas. Tes ini memvalidasi kontrak dan perilaku lokal; tes offline bukan bukti bahwa setiap tautan live dari tiap platform akan berhasil diekstrak.
 
 ## Urutan API di frontend Petik
 
@@ -191,3 +193,23 @@ Folder `tests/` berisi 112 tes offline untuk parser Instagram/Threads campuran, 
 - v1.6.3: perbaikan Facebook post-scoped agar gambar rekomendasi/halaman lain tidak ikut masuk.
 - v1.6.2: resolver Instagram logged-out GraphQL/page JSON dan pengetatan unduhan CDN.
 - v1.6.1: parser ekstensi dari query URL, galeri Threads publik, dan pemetaan nomor carousel.
+
+---
+
+## v1.13.0 — YouTube Player API diagnostics and optional WPC profile
+
+- Preserves the default Render deployment using BgUtils (`YOUTUBE_POT_PROVIDER_MODE=bgutil`).
+- Adds an isolated `Dockerfile.wpc` profile: installs Chromium and `yt-dlp-getpot-wpc==1.1.2`, disables the BgUtils provider in that image, and selects WPC explicitly. This is an experimental profile, not the default Render Free image.
+- WPC automatically registers as a yt-dlp PO Token provider when its package is installed. Chromium must be available; `YOUTUBE_WPC_BROWSER_PATH` pins the binary path.
+- Adds attempt IDs and safe error events, keeps the highest-priority root error instead of replacing Player API `bot_check` with later format-selection wrapper errors, and captures HTTP 403/429/5xx categories without storing raw response text.
+- Avoids retrying the Safari HLS strategy when the same underlying Safari Player API request was already blocked by bot-check/login/HTTP errors.
+- Keeps optional Netscape cookies in an owner-only temporary file and removes that file after each YouTube inspect/download operation.
+- WPC is not recommended for Render Free: Chromium increases resource use; the profile must be load-tested before production use.
+
+### YouTube provider profiles
+
+**Standard (default):** `Dockerfile`, `YOUTUBE_POT_PROVIDER_MODE=bgutil`, BgUtils server enabled, no Chromium, no WPC package.
+
+**WPC experiment:** `Dockerfile.wpc`, `YOUTUBE_POT_PROVIDER_MODE=wpc`, `YOUTUBE_WPC_ENABLED=1`, `YOUTUBE_WPC_BROWSER_PATH=/usr/bin/chromium`, BgUtils provider disabled in that image. Switch the Render Dockerfile Path back to `./Dockerfile` to restore the standard profile.
+
+The YouTube PO Token guide lists `mweb` as requiring a GVS PO Token currently, while `tv` and `web_embedded` have their own format restrictions. Therefore, WPC is tested here as an alternative provider for the token stage; it is not claimed to cure an Innertube Player API bot-check that happens before format delivery.
