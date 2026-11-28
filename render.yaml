@@ -45,7 +45,7 @@ services:
       - key: YOUTUBE_WARP_ENABLED
         value: "1"
       - key: WARP_POOL_SIZE
-        value: "3"
+        value: "2"
       - key: YOUTUBE_PROXY_BURN_SECONDS
         value: "120"
       - key: YOUTUBE_WPC_ENABLED

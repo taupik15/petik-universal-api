@@ -21,7 +21,7 @@ BGUTIL_READY=0
 # retries on another tunnel when YouTube blocks one, instead of freezing all
 # YouTube traffic for minutes. Any failure falls back to the direct Render IP.
 WARP_BASE_PORT="${WARP_SOCKS_PORT:-40000}"
-WARP_POOL_SIZE="${WARP_POOL_SIZE:-3}"
+WARP_POOL_SIZE="${WARP_POOL_SIZE:-2}"
 WARP_ROOT=/tmp/warp
 WARP_POOL_FILE="$WARP_ROOT/pool.txt"
 
@@ -46,7 +46,8 @@ warp_start_tunnel() {
     cat wgcf-profile.conf
     printf '\n[Socks5]\nBindAddress = 127.0.0.1:%s\n' "$port"
   } > wireproxy.conf
-  wireproxy -c wireproxy.conf >"/tmp/petik-wireproxy-$slot.log" 2>&1 &
+  # Cap Go heap: Render Free has only 512 MB shared with Python, deno and ffmpeg.
+  GOMEMLIMIT="${WARP_GOMEMLIMIT:-24MiB}" GOGC=50 wireproxy -c wireproxy.conf >"/tmp/petik-wireproxy-$slot.log" 2>&1 &
   i=0
   while [ "$i" -lt 15 ]; do
     trace="$(curl -fsS --max-time 6 --socks5-hostname "127.0.0.1:${port}" https://www.cloudflare.com/cdn-cgi/trace 2>/dev/null || true)"
@@ -89,7 +90,7 @@ if [ "$BGUTIL_ENABLED" = "1" ] && command -v deno >/dev/null 2>&1 && [ -f "$BGUT
   echo "[Petik] Starting private BgUtils PO Token provider on ${BGUTIL_HOST}:${BGUTIL_PORT}"
   (
     cd "$BGUTIL_DIR/node_modules" || exit 1
-    exec deno run --allow-env --allow-net --allow-ffi=. --allow-read=. \
+    exec deno run --v8-flags="--max-old-space-size=${BGUTIL_MAX_HEAP_MB:-256}" --allow-env --allow-net --allow-ffi=. --allow-read=. \
       ../src/main.ts --host "$BGUTIL_HOST" --port "$BGUTIL_PORT"
   ) >/tmp/petik-bgutil-provider.log 2>&1 &
   BGUTIL_PID=$!
@@ -144,4 +145,5 @@ if [ "$BGUTIL_READY" = "1" ] && [ -f "$APP_DIR/pot_telemetry.py" ]; then
   done
 fi
 
+export MALLOC_ARENA_MAX="${MALLOC_ARENA_MAX:-2}"
 exec uvicorn app:app --host 0.0.0.0 --port "${PORT:-10000}"

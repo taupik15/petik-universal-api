@@ -38,7 +38,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 from yt_dlp import YoutubeDL
 
-APP_VERSION = "1.17.1"
+APP_VERSION = "1.17.2"
 MAX_GALLERY_ITEMS = max(1, min(30, int(os.getenv("MAX_GALLERY_ITEMS", "20"))))
 MAX_GALLERY_SOURCE_ITEMS = MAX_GALLERY_ITEMS * 2  # Mixed carousels can contain video entries between photos.
 MAX_GALLERY_FILE_BYTES = int(os.getenv("MAX_GALLERY_FILE_MB", "20")) * 1024 * 1024
@@ -157,6 +157,39 @@ YOUTUBE_RETRY_OPTIONS = {
 }
 
 YOUTUBE_PROXY_SCHEMES = {"http", "https", "socks4", "socks5", "socks5h"}
+
+
+
+def _read_int_file(path: str) -> int | None:
+    try:
+        raw = Path(path).read_text(encoding="utf-8").strip()
+        return int(raw) if raw.isdigit() else None
+    except (OSError, ValueError):
+        return None
+
+
+def _memory_snapshot() -> dict:
+    """Container memory (cgroup v2/v1) so out-of-memory restarts are visible in /health."""
+    mb = lambda value: round(value / (1024 * 1024), 1) if isinstance(value, int) else None
+    current = _read_int_file("/sys/fs/cgroup/memory.current") or _read_int_file("/sys/fs/cgroup/memory/memory.usage_in_bytes")
+    limit = _read_int_file("/sys/fs/cgroup/memory.max") or _read_int_file("/sys/fs/cgroup/memory/memory.limit_in_bytes")
+    peak = _read_int_file("/sys/fs/cgroup/memory.peak") or _read_int_file("/sys/fs/cgroup/memory/memory.max_usage_in_bytes")
+    if limit and limit > 1 << 50:
+        limit = None
+    oom_kill = None
+    try:
+        for line in Path("/sys/fs/cgroup/memory.events").read_text(encoding="utf-8").splitlines():
+            if line.startswith("oom_kill "):
+                oom_kill = int(line.split()[1])
+    except (OSError, ValueError):
+        pass
+    return {"currentMB": mb(current), "limitMB": mb(limit), "peakMB": mb(peak), "oomKillCount": oom_kill}
+
+
+def _log_memory(label: str) -> None:
+    snap = _memory_snapshot()
+    if snap.get("currentMB") is not None:
+        print(f"[Petik memory] {label}: {snap['currentMB']} MB / {snap['limitMB']} MB (peak {snap['peakMB']} MB)", flush=True)
 
 
 YOUTUBE_PROXY_LOCK = threading.Lock()
@@ -610,7 +643,7 @@ def _bgutil_provider_status() -> dict:
         try:
             request = urllib.request.Request(
                 f"{base_url}/ping",
-                headers={"User-Agent": "Petik-Health/1.17.1"},
+                headers={"User-Agent": "Petik-Health/1.17.2"},
             )
             with urllib.request.urlopen(request, timeout=1.2) as response:
                 payload = json.loads(response.read(4096).decode("utf-8", errors="replace"))
@@ -623,7 +656,7 @@ def _bgutil_provider_status() -> dict:
         try:
             request = urllib.request.Request(
                 f"{telemetry_url}/stats",
-                headers={"User-Agent": "Petik-Health/1.17.1"},
+                headers={"User-Agent": "Petik-Health/1.17.2"},
             )
             with urllib.request.urlopen(request, timeout=0.8) as response:
                 candidate = json.loads(response.read(4096).decode("utf-8", errors="replace"))
@@ -1415,6 +1448,7 @@ def _extract_info(url: str) -> dict:
                 _update_youtube_diagnostics(infoCacheHit=True, lastOutcome="cache-hit", lastStage="inspect_cache")
                 return cached
             _youtube_request_gate()
+            _log_memory("inspect-start")
             used = {}
 
             def _run():
@@ -1422,6 +1456,7 @@ def _extract_info(url: str) -> dict:
                 return _extract_info_impl(url)
 
             info = _with_youtube_rotation(_run)
+            _log_memory("inspect-done")
             if isinstance(info, dict):
                 if used.get("proxy"):
                     info = dict(info)
@@ -3169,6 +3204,7 @@ def _download_media(url: str, mode: str, quality: str) -> tuple[Path, str, dict]
         with YOUTUBE_ATTEMPT_LOCK:
             followup = _consume_youtube_inspect_cache(url)
             _youtube_request_gate(allow_recent_inspect_followup=followup)
+            _log_memory("download-start")
             reuse = _take_youtube_download_info(url)
             holder = {"info": reuse}
 
@@ -3384,6 +3420,7 @@ def health():
         },
         "youtubeCookiesConfigured": _youtube_cookie_configured(),
         "youtubeProxy": {"configured": bool(_youtube_proxy_pool()), "kind": _youtube_proxy_kind(), **_youtube_proxy_health()},
+        "memory": _memory_snapshot(),
         "youtubeRateControl": _youtube_rate_control_snapshot(),
         "youtubeRequestPolicy": {
             "retries": YOUTUBE_RETRY_OPTIONS["retries"],
@@ -3542,7 +3579,7 @@ def youtube_network_diagnostics(request: Request):
         try:
             req = urllib.request.Request(
                 target,
-                headers={"User-Agent": "Mozilla/5.0 Petik-Network-Diagnostic/1.17.1", "Accept": "*/*"},
+                headers={"User-Agent": "Mozilla/5.0 Petik-Network-Diagnostic/1.17.2", "Accept": "*/*"},
                 method="GET",
             )
             with urllib.request.urlopen(req, timeout=8) as response:
