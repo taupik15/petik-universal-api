@@ -26,6 +26,14 @@ services:
         value: "http://127.0.0.1:4416"
       - key: BGUTIL_PROVIDER_PORT
         value: "4416"
+      - key: BGUTIL_TELEMETRY_PORT
+        value: "4417"
+      - key: BGUTIL_TELEMETRY_URL
+        value: "http://127.0.0.1:4417"
+      - key: YOUTUBE_FORCE_IPV4
+        value: "1"
+      - key: YOUTUBE_WPC_ENABLED
+        value: "0"
       - key: BGUTIL_PROVIDER_START_TIMEOUT
         value: "25"
       - key: MAX_GALLERY_ITEMS

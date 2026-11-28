@@ -32,6 +32,7 @@ WORKDIR /app
 COPY requirements.txt ./requirements.txt
 RUN pip install --no-cache-dir -r requirements.txt
 COPY app.py ./app.py
+COPY pot_telemetry.py ./pot_telemetry.py
 COPY start.sh ./start.sh
 RUN chmod 755 ./start.sh
 

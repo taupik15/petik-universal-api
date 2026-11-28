@@ -34,7 +34,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 from yt_dlp import YoutubeDL
 
-APP_VERSION = "1.10.0"
+APP_VERSION = "1.11.0"
 MAX_GALLERY_ITEMS = max(1, min(30, int(os.getenv("MAX_GALLERY_ITEMS", "20"))))
 MAX_GALLERY_SOURCE_ITEMS = MAX_GALLERY_ITEMS * 2  # Mixed carousels can contain video entries between photos.
 MAX_GALLERY_FILE_BYTES = int(os.getenv("MAX_GALLERY_FILE_MB", "20")) * 1024 * 1024
@@ -111,14 +111,32 @@ preview_cache: dict[str, tuple[str, dict, float]] = {}
 # Only safe, non-sensitive YouTube diagnostics are retained in memory. Never
 # store source URLs, cookies, visitor data, PO Tokens, or signed media URLs.
 YOUTUBE_CLIENTS_WITH_PROVIDER = ("mweb", "web_safari")
-YOUTUBE_CLIENT_FALLBACKS = ("mweb", "web_safari", "web_embedded", "tv")
+# web_safari_hls is a separate diagnostic strategy: same player client, but
+# download must select an HLS manifest rather than silently falling back to DASH.
+YOUTUBE_CLIENT_FALLBACKS = ("mweb", "web_safari", "web_safari_hls", "web_embedded", "tv")
 YOUTUBE_DIAGNOSTICS_LOCK = threading.Lock()
 YOUTUBE_DIAGNOSTICS = {
     "lastOutcome": "not-run",
     "attemptedClients": [],
     "clientOutcomes": [],
     "providerAdvertised": None,
+    "providerNames": [],
     "tokenGenerationObserved": False,
+    "providerTelemetryAvailable": False,
+    "providerRequestCount": 0,
+    "providerHttpSuccessCount": 0,
+    "providerHttpFailureCount": 0,
+    "providerTokenResponseCount": 0,
+    "providerLastStatusCode": None,
+    "providerLastRequestAt": None,
+    "providerLastTokenResponseAt": None,
+    "providerRequestBaseline": 0,
+    "providerTokenResponseBaseline": 0,
+    "providerRequestsThisAttempt": 0,
+    "providerTokenResponsesThisAttempt": 0,
+    "lastStrategy": None,
+    "hlsFormatsObserved": False,
+    "rootCauseHint": None,
     "lastErrorCode": None,
     "updatedAt": None,
 }
@@ -246,9 +264,10 @@ BGUTIL_PROVIDER_VERSION = "2.0.2"
 
 
 def _bgutil_provider_status() -> dict:
-    """Check the local, non-public BgUtils server and its matching yt-dlp plugin."""
+    """Check BgUtils directly and the loopback telemetry proxy, if available."""
     enabled = os.getenv("BGUTIL_POT_PROVIDER_ENABLED", "1").strip() == "1"
     base_url = (os.getenv("BGUTIL_POT_PROVIDER_URL") or BGUTIL_PROVIDER_DEFAULT_URL).strip().rstrip("/")
+    telemetry_url = (os.getenv("BGUTIL_TELEMETRY_URL") or "http://127.0.0.1:4417").strip().rstrip("/")
     plugin_version = None
     try:
         from importlib.metadata import version as package_version
@@ -259,11 +278,13 @@ def _bgutil_provider_status() -> dict:
     server_version = None
     server_uptime = None
     server_available = False
+    telemetry = None
+    telemetry_available = False
     if enabled:
         try:
             request = urllib.request.Request(
                 f"{base_url}/ping",
-                headers={"User-Agent": "Petik-Health/1.10.0"},
+                headers={"User-Agent": "Petik-Health/1.11.0"},
             )
             with urllib.request.urlopen(request, timeout=1.2) as response:
                 payload = json.loads(response.read(4096).decode("utf-8", errors="replace"))
@@ -271,6 +292,19 @@ def _bgutil_provider_status() -> dict:
                 server_version = str(payload.get("version"))[:40]
                 server_uptime = payload.get("server_uptime")
                 server_available = True
+        except Exception:
+            pass
+        try:
+            request = urllib.request.Request(
+                f"{telemetry_url}/stats",
+                headers={"User-Agent": "Petik-Health/1.11.0"},
+            )
+            with urllib.request.urlopen(request, timeout=0.8) as response:
+                candidate = json.loads(response.read(4096).decode("utf-8", errors="replace"))
+            required = {"requestCount", "httpSuccessCount", "httpFailureCount", "tokenResponseCount"}
+            if isinstance(candidate, dict) and required.issubset(candidate):
+                telemetry = candidate
+                telemetry_available = True
         except Exception:
             pass
 
@@ -285,6 +319,9 @@ def _bgutil_provider_status() -> dict:
         "serverUptimeSeconds": server_uptime,
         "expectedVersion": BGUTIL_PROVIDER_VERSION,
         "baseUrl": base_url,
+        "clientBaseUrl": telemetry_url if telemetry_available else base_url,
+        "telemetryAvailable": telemetry_available,
+        "telemetry": telemetry or {},
     }
 
 
@@ -302,7 +339,9 @@ def _youtube_error_code(message: str) -> str:
         return "po_token"
     if "http error 403" in lowered or "403: forbidden" in lowered:
         return "http_403"
-    if any(term in lowered for term in ("no formats", "no video formats", "requested format is not available", "no downloadable formats", "sabr")):
+    if "no hls formats" in lowered or "no hls format" in lowered:
+        return "no_hls_formats"
+    if any(term in lowered for term in ("no formats", "no video formats", "requested format is not available", "no downloadable formats", "format yang dapat diunduh", "format non-hls", "sabr", "m3u8")):
         return "no_downloadable_formats"
     if "login_required" in lowered or "sign in" in lowered or "login" in lowered:
         return "login_required"
@@ -317,6 +356,7 @@ def _youtube_diagnostics_snapshot() -> dict:
             **YOUTUBE_DIAGNOSTICS,
             "attemptedClients": list(YOUTUBE_DIAGNOSTICS.get("attemptedClients") or []),
             "clientOutcomes": [dict(item) for item in (YOUTUBE_DIAGNOSTICS.get("clientOutcomes") or [])],
+            "providerNames": list(YOUTUBE_DIAGNOSTICS.get("providerNames") or []),
         }
 
 
@@ -329,7 +369,7 @@ def _record_youtube_attempt(client: str, outcome: str, error_code: str | None = 
         outcomes.append({"client": client, "outcome": outcome, "errorCode": error_code})
         YOUTUBE_DIAGNOSTICS.update({
             "attemptedClients": attempted,
-            "clientOutcomes": outcomes[-8:],
+            "clientOutcomes": outcomes[-12:],
             "lastOutcome": outcome,
             "lastErrorCode": error_code,
             "updatedAt": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
@@ -350,10 +390,10 @@ class _YtDlpDiagnosticLogger:
             for name in ("bgutil:http", "bgutil:script-node", "bgutil:script-deno", "wpc"):
                 if name in lowered:
                     provider_names.append(name)
-            _update_youtube_diagnostics(providerAdvertised=bool(provider_names))
+            _update_youtube_diagnostics(providerAdvertised=bool(provider_names), providerNames=provider_names)
             self.logger.info("[Petik YouTube] provider_registry=%s client=%s", ",".join(provider_names) or "none", self.client)
         if "generating a" in lowered and "po token" in lowered:
-            _update_youtube_diagnostics(tokenGenerationObserved=True)
+            _update_youtube_diagnostics(tokenGenerationObserved=True, lastStrategy=self.client)
             context = "gvs" if "gvs" in lowered else "player" if "player" in lowered else "other"
             self.logger.info("[Petik YouTube] token_generation_requested=true context=%s client=%s", context, self.client)
         elif "po token" in lowered and any(term in lowered for term in ("generated", "generation failed", "failed to generate")):
@@ -372,6 +412,92 @@ class _YtDlpDiagnosticLogger:
 
 def _youtube_provider_status() -> dict:
     return _bgutil_provider_status()
+
+
+def _begin_youtube_diagnostics_attempt(provider: dict, outcome: str) -> None:
+    telemetry = provider.get("telemetry") or {}
+    request_baseline = int(telemetry.get("requestCount") or 0)
+    token_baseline = int(telemetry.get("tokenResponseCount") or 0)
+    _update_youtube_diagnostics(
+        lastOutcome=outcome,
+        attemptedClients=[],
+        clientOutcomes=[],
+        providerAdvertised=None,
+        providerNames=[],
+        tokenGenerationObserved=False,
+        providerTelemetryAvailable=bool(provider.get("telemetryAvailable")),
+        providerRequestCount=request_baseline,
+        providerHttpSuccessCount=int(telemetry.get("httpSuccessCount") or 0),
+        providerHttpFailureCount=int(telemetry.get("httpFailureCount") or 0),
+        providerTokenResponseCount=token_baseline,
+        providerLastStatusCode=telemetry.get("lastStatusCode"),
+        providerLastRequestAt=telemetry.get("lastRequestAt"),
+        providerLastTokenResponseAt=telemetry.get("lastTokenResponseAt"),
+        providerRequestBaseline=request_baseline,
+        providerTokenResponseBaseline=token_baseline,
+        providerRequestsThisAttempt=0,
+        providerTokenResponsesThisAttempt=0,
+        lastErrorCode=None,
+        lastStrategy=None,
+        hlsFormatsObserved=False,
+        rootCauseHint=None,
+    )
+
+
+def _youtube_root_cause_hint(diagnostics: dict) -> str | None:
+    code = diagnostics.get("lastErrorCode")
+    if code == "bot_check":
+        if diagnostics.get("providerTelemetryAvailable") is False:
+            return "provider_telemetry_unavailable_token_request_result_unknown"
+        token_responses = int(diagnostics.get("providerTokenResponsesThisAttempt") or 0)
+        requests = int(diagnostics.get("providerRequestsThisAttempt") or 0)
+        if token_responses:
+            return "bot_check_after_provider_returned_po_token_possible_ip_or_session_restriction"
+        if requests:
+            return "provider_called_but_no_po_token_response_confirmed"
+        if diagnostics.get("providerAdvertised"):
+            return "provider_loaded_but_no_token_request_observed_client_may_have_failed_before_token_step"
+        return "bot_check_without_provider_evidence_possible_client_or_server_ip_restriction"
+    if code in {"no_downloadable_formats", "no_hls_formats"}:
+        return "client_did_not_expose_a_supported_non_drm_download_format"
+    if code == "po_token":
+        return "po_token_provider_or_token_flow_error_check_provider_telemetry"
+    return diagnostics.get("rootCauseHint")
+
+
+def _refresh_youtube_provider_diagnostics(provider: dict) -> None:
+    telemetry = provider.get("telemetry") or {}
+    if not provider.get("telemetryAvailable"):
+        # Direct BgUtils fallback still works, but the request/token count is
+        # unknown. Never interpret missing telemetry as a zero request count.
+        _update_youtube_diagnostics(
+            providerTelemetryAvailable=False,
+            providerRequestCount=None,
+            providerHttpSuccessCount=None,
+            providerHttpFailureCount=None,
+            providerTokenResponseCount=None,
+            providerLastStatusCode=None,
+            providerLastRequestAt=None,
+            providerLastTokenResponseAt=None,
+            providerRequestsThisAttempt=None,
+            providerTokenResponsesThisAttempt=None,
+        )
+        return
+    request_count = int(telemetry.get("requestCount") or 0)
+    token_count = int(telemetry.get("tokenResponseCount") or 0)
+    _update_youtube_diagnostics(
+        providerTelemetryAvailable=True,
+        providerRequestCount=request_count,
+        providerHttpSuccessCount=int(telemetry.get("httpSuccessCount") or 0),
+        providerHttpFailureCount=int(telemetry.get("httpFailureCount") or 0),
+        providerTokenResponseCount=token_count,
+        providerLastStatusCode=telemetry.get("lastStatusCode"),
+        providerLastRequestAt=telemetry.get("lastRequestAt"),
+        providerLastTokenResponseAt=telemetry.get("lastTokenResponseAt"),
+        providerRequestsThisAttempt=max(0, request_count - int(YOUTUBE_DIAGNOSTICS.get("providerRequestBaseline") or 0)),
+        providerTokenResponsesThisAttempt=max(0, token_count - int(YOUTUBE_DIAGNOSTICS.get("providerTokenResponseBaseline") or 0)),
+        tokenGenerationObserved=(request_count > int(YOUTUBE_DIAGNOSTICS.get("providerRequestBaseline") or 0)) or bool(YOUTUBE_DIAGNOSTICS.get("tokenGenerationObserved")),
+    )
 
 
 def _youtube_client_candidates(provider_ready: bool, preferred: str | None = None) -> list[str]:
@@ -413,18 +539,35 @@ def _youtube_should_fallback(exc: Exception | str) -> bool:
         "sign in to confirm", "confirm you're not a bot", "confirm you’re not a bot",
         "login_required", "po token", "bgutil", "botguard", "http error 403",
         "403: forbidden", "no formats", "no video formats",
-        "requested format is not available", "no downloadable formats", "no playable formats", "sabr",
-        "tidak mengembalikan format", "format yang dapat diunduh", "berkas media tidak terbentuk",
+        "requested format is not available", "no downloadable formats", "no playable formats", "sabr", "hls", "m3u8",
+        "tidak mengembalikan format", "format yang dapat diunduh", "format non-hls", "berkas media tidak terbentuk",
         "not embeddable", "embedding disabled", "video unavailable", "this video is not available",
     ))
 
 
-def _youtube_info_has_downloadable_formats(info: dict) -> bool:
+def _youtube_hls_format_selector(quality: str) -> str:
+    """Prefer a muxed HLS format and never fall back to a silent video-only stream."""
+    height_filter = f"[height<={quality}]" if quality not in {"max", "best"} else ""
+    return (
+        f"best[protocol^=m3u8]{height_filter}[vcodec!=none][acodec!=none]"
+        f"/best[protocol^=hls]{height_filter}[vcodec!=none][acodec!=none]"
+    )
+
+
+def _youtube_info_has_downloadable_formats(
+    info: dict, *, hls_only: bool = False, exclude_hls: bool = False
+) -> bool:
     formats = _media_formats(info)
     for item in formats:
         if not isinstance(item, dict) or item.get("has_drm"):
             continue
         protocol = str(item.get("protocol") or "").lower()
+        ext = str(item.get("ext") or "").lower()
+        is_hls = "m3u8" in protocol or "hls" in protocol or ext == "m3u8"
+        if hls_only and not is_hls:
+            continue
+        if exclude_hls and is_hls:
+            continue
         if any(term in protocol for term in ("mhtml", "sabr")):
             continue
         if item.get("url") or item.get("manifest_url"):
@@ -450,10 +593,13 @@ def _yt_common_options(platform: str | None = None, youtube_client: str | None =
 
     if platform == "youtube":
         provider = _youtube_provider_status()
-        client = youtube_client or ("mweb" if provider.get("ready") else "web_safari")
+        strategy = youtube_client or ("mweb" if provider.get("ready") else "web_safari")
+        client = "web_safari" if strategy == "web_safari_hls" else strategy
         extractor_args = {"youtube": {"player_client": [client]}}
         if provider.get("ready") and client in YOUTUBE_CLIENTS_WITH_PROVIDER:
-            extractor_args["youtubepot-bgutilhttp"] = {"base_url": [provider["baseUrl"]]}
+            extractor_args["youtubepot-bgutilhttp"] = {"base_url": [provider.get("clientBaseUrl") or provider["baseUrl"]]}
+        if os.getenv("YOUTUBE_FORCE_IPV4", "1").strip() == "1":
+            options["source_address"] = "0.0.0.0"
         options.update({
             "extractor_args": extractor_args,
             "logger": _YtDlpDiagnosticLogger(client),
@@ -476,18 +622,17 @@ def _extract_info(url: str) -> dict:
             raise RuntimeError("Platform tidak mengembalikan informasi media.")
     else:
         provider = _youtube_provider_status()
+        _refresh_youtube_provider_diagnostics(provider)
         preferred = _get_cached_youtube_client(url)
         clients = _youtube_client_candidates(bool(provider.get("ready")), preferred)
-        _update_youtube_diagnostics(
-            lastOutcome="attempting", attemptedClients=[], clientOutcomes=[],
-            providerAdvertised=None, tokenGenerationObserved=False, lastErrorCode=None,
-        )
+        _begin_youtube_diagnostics_attempt(provider, "attempting")
         failures = []
         info = None
         selected_client = None
         last_exception = None
         for index, client in enumerate(clients):
             _record_youtube_attempt(client, "attempting")
+            _update_youtube_diagnostics(lastStrategy=client)
             options = _yt_common_options("youtube", client)
             options.update({"skip_download": True, "extract_flat": False})
             try:
@@ -495,8 +640,16 @@ def _extract_info(url: str) -> dict:
                     candidate = ydl.extract_info(url, download=False)
                 if not candidate:
                     raise RuntimeError("YouTube tidak mengembalikan informasi media.")
-                if not _youtube_info_has_downloadable_formats(candidate):
-                    raise RuntimeError(f"YouTube client {client} tidak mengembalikan format yang dapat diunduh.")
+                hls_only = client == "web_safari_hls"
+                if hls_only:
+                    has_hls = _youtube_info_has_downloadable_formats(candidate, hls_only=True)
+                    _update_youtube_diagnostics(hlsFormatsObserved=bool(has_hls), lastStrategy=client)
+                    if not has_hls:
+                        raise RuntimeError("web_safari tidak mengembalikan format HLS m3u8.")
+                elif not _youtube_info_has_downloadable_formats(
+                    candidate, exclude_hls=(client == "web_safari")
+                ):
+                    raise RuntimeError(f"YouTube client {client} tidak mengembalikan format non-HLS yang dapat diunduh.")
                 info = candidate
                 selected_client = client
                 _record_youtube_attempt(client, "success")
@@ -2052,20 +2205,25 @@ def _download_media(url: str, mode: str, quality: str) -> tuple[Path, str, dict]
     clients = [None]
     if platform == "youtube":
         provider = _youtube_provider_status()
+        _refresh_youtube_provider_diagnostics(provider)
         preferred = _get_cached_youtube_client(url)
         clients = _youtube_client_candidates(bool(provider.get("ready")), preferred)
-        _update_youtube_diagnostics(
-            lastOutcome="attempting-download", attemptedClients=[], clientOutcomes=[],
-            providerAdvertised=None, tokenGenerationObserved=False, lastErrorCode=None,
-        )
+        if mode == "audio":
+            clients = [item for item in clients if item != "web_safari_hls"]
+        _begin_youtube_diagnostics_attempt(provider, "attempting-download")
 
     last_error = None
     for index, client in enumerate(clients):
         job_dir = Path(tempfile.mkdtemp(prefix="job-", dir=TEMP_ROOT))
         outtmpl = str(job_dir / "%(id)s.%(ext)s")
         options = _yt_common_options(platform, client) if platform == "youtube" else _yt_common_options(platform)
+        if platform == "youtube" and client == "web_safari_hls" and mode == "video":
+            # Keep the user's requested height and avoid silent video-only streams.
+            fmt_for_attempt = _youtube_hls_format_selector(quality)
+        else:
+            fmt_for_attempt = fmt
         options.update({
-            "format": fmt,
+            "format": fmt_for_attempt,
             "outtmpl": outtmpl,
             "match_filter": duration_filter,
             "max_filesize": MAX_FILE_BYTES,
@@ -2081,6 +2239,7 @@ def _download_media(url: str, mode: str, quality: str) -> tuple[Path, str, dict]
         try:
             if platform == "youtube":
                 _record_youtube_attempt(str(client), "attempting-download")
+                _update_youtube_diagnostics(lastStrategy=str(client))
             with YoutubeDL(options) as ydl:
                 info = ydl.extract_info(url, download=True)
                 if not info:
@@ -2230,6 +2389,14 @@ def server_info(request: Request):
     }
 
 
+def _package_available(package_name: str) -> bool:
+    try:
+        from importlib.metadata import version as package_version
+        return bool(package_version(package_name))
+    except Exception:
+        return False
+
+
 def _ytdlp_version() -> str:
     try:
         from yt_dlp.version import __version__
@@ -2259,6 +2426,9 @@ def _gallery_version() -> str:
 @app.get("/health")
 def health():
     pot_provider = _bgutil_provider_status()
+    _refresh_youtube_provider_diagnostics(pot_provider)
+    youtube_diagnostics = _youtube_diagnostics_snapshot()
+    youtube_diagnostics["rootCauseHint"] = _youtube_root_cause_hint(youtube_diagnostics)
     return {
         "success": True,
         "status": "healthy",
@@ -2273,8 +2443,17 @@ def health():
         "youtubePoTokenServerUptimeSeconds": pot_provider["serverUptimeSeconds"],
         "youtubePoTokenExpectedVersion": pot_provider["expectedVersion"],
         "youtubePoTokenClient": "mweb" if pot_provider["ready"] else None,
+        "youtubePoTokenTelemetryAvailable": pot_provider["telemetryAvailable"],
+        "youtubeForceIPv4": os.getenv("YOUTUBE_FORCE_IPV4", "1").strip() == "1",
+        "youtubeWpc": {
+            "requested": os.getenv("YOUTUBE_WPC_ENABLED", "0").strip() == "1",
+            "pluginInstalled": _package_available("yt-dlp-getpot-wpc"),
+            "browserAvailable": bool(shutil.which("chromium") or shutil.which("chromium-browser") or shutil.which("google-chrome")),
+            "runtimeEnabled": False,
+            "note": "WPC memerlukan Chrome/Chromium dan tidak diaktifkan pada image Render Free standar.",
+        },
         "youtubeClientFallbacks": _youtube_client_candidates(bool(pot_provider["ready"])),
-        "youtubeDiagnostics": _youtube_diagnostics_snapshot(),
+        "youtubeDiagnostics": youtube_diagnostics,
         "ytdlpVersion": _ytdlp_version(),
         "galleryDlAvailable": bool(_gallery_command()),
         "galleryDlVersion": _gallery_version(),

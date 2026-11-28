@@ -1,6 +1,6 @@
-# Petik Universal Extractor API v1.10.0
+# Petik Universal Extractor API v1.11.0
 
-Backend Petik berbasis FastAPI, yt-dlp, gallery-dl, curl-cffi untuk resolver publik Meta, Deno/EJS, BgUtils PO Token Provider, HTTPX, dan FFmpeg. Rilis ini memperbaiki alur YouTube dengan percobaan client bertahap, diagnosa aman untuk alur PO Token, serta fallback saat client utama ditolak, tanpa layanan/API berbayar. Fitur galeri campuran foto + video dari v1.8.0 tetap dipertahankan.
+Backend Petik berbasis FastAPI, yt-dlp, gallery-dl, curl-cffi untuk resolver publik Meta, Deno/EJS, BgUtils PO Token Provider, HTTPX, dan FFmpeg. Rilis ini memperkuat diagnosis YouTube dengan proxy telemetry BgUtils lokal, pengukuran respons PO Token, strategi HLS `web_safari` terpisah, dan opsi IPv4 untuk jalur yt-dlp, tanpa layanan/API berbayar. Fitur galeri campuran foto + video dari v1.8.0 tetap dipertahankan.
 
 ## Fitur dan kontrak API
 
@@ -30,28 +30,32 @@ Contoh itu hanya menjelaskan bentuk respons; bukan URL media yang benar-benar di
 ## Deploy lewat Render
 
 1. Buka repository GitHub `petik-universal-api`.
-2. Ekstrak ZIP backend v1.10.0, lalu unggah semua isinya langsung ke root repository (jangan unggah file ZIP sebagai satu file).
-3. Pastikan `Dockerfile`, `app.py`, `start.sh`, `requirements.txt`, `render.yaml`, `README.md`, dan folder `tests/` berada di root.
+2. Ekstrak ZIP backend v1.11.0, lalu unggah semua isinya langsung ke root repository (jangan unggah file ZIP sebagai satu file).
+3. Pastikan `Dockerfile`, `app.py`, `pot_telemetry.py`, `start.sh`, `requirements.txt`, `render.yaml`, `README.md`, dan folder `tests/` berada di root.
 4. Commit perubahan dari GitHub.
 5. Di Render, buka Blueprint Petik lalu jalankan **Manual Sync / Apply**.
-6. Setelah layanan berstatus Live, buka endpoint `/health`. Versi yang diharapkan `1.10.0`, `mixedMediaAvailable: true`, dan `galleryDlAvailable: true` bila gallery-dl berhasil terpasang. Untuk YouTube, pastikan `youtubePoTokenProviderReady: true`, `youtubePoTokenPluginVersion: "2.0.2"`, dan `youtubePoTokenServerVersion: "2.0.2"`.
+6. Setelah layanan berstatus Live, buka endpoint `/health`. Versi yang diharapkan `1.11.0`, `mixedMediaAvailable: true`, dan `galleryDlAvailable: true` bila gallery-dl berhasil terpasang. Untuk YouTube, pastikan `youtubePoTokenProviderReady: true`, `youtubePoTokenPluginVersion: "2.0.2"`, dan `youtubePoTokenServerVersion: "2.0.2"`.
 7. Jika `youtubePoTokenProviderReady` bernilai `false`, lihat Render Logs. Backend tetap dapat melayani platform lain, tetapi Petik tidak akan memaksa klien YouTube `mweb` tanpa provider yang cocok.
 8. Buka `/` untuk memeriksa daftar platform dan layanan.
 
 
-## YouTube PO Token dan strategi fallback (v1.10.0)
+## YouTube PO Token, telemetry, dan strategi recovery (v1.11.0)
 
-Rilis ini memakai **BgUtils PO Token Provider 2.0.2** dengan dua komponen yang versinya dipasangkan: plugin Python `bgutil-ytdlp-pot-provider==2.0.2` dan server HTTP BgUtils 2.0.2. Docker membangun server dari tag upstream `2.0.2`, memasang dependensi Deno, lalu `start.sh` menjalankan server pada `127.0.0.1:4416`. Server token tidak dibuka sebagai port publik dan tidak menambah layanan Render terpisah.
+Rilis ini tetap memakai **BgUtils PO Token Provider 2.0.2** dengan dua komponen yang versinya dipasangkan: plugin Python `bgutil-ytdlp-pot-provider==2.0.2` dan server HTTP BgUtils 2.0.2. Docker membangun server dari tag upstream `2.0.2`, memasang dependensi Deno, lalu `start.sh` menjalankan server pada `127.0.0.1:4416`. Server token tidak dibuka sebagai port publik dan tidak menambah layanan Render terpisah.
 
-Untuk permintaan YouTube, Petik menjalankan client secara berurutan, bukan mengaktifkan banyak client sekaligus: `mweb` (jika BgUtils sehat dan versi plugin/server cocok), `web_safari`, `web_embedded`, lalu `tv`. Setiap client dicoba dalam sesi yt-dlp terpisah; percobaan berikutnya hanya dijalankan ketika error menunjukkan bot-check, PO Token, HTTP 403, atau format tidak tersedia. Hasil format DRM dan SABR-only tidak dipilih sebagai media unduhan. `web_embedded` hanya dapat bekerja pada video yang mengizinkan embedding; `tv` merupakan fallback terakhir karena formatnya dapat terbatas. Provider BgUtils dipasang pada `mweb` dan `web_safari` jika token diminta.
+**Telemetry v1.11:** `pot_telemetry.py` menambahkan proxy penerus lokal pada `127.0.0.1:4417`. Plugin yt-dlp diarahkan ke proxy ini bila tersedia; proxy meneruskan permintaan ke BgUtils pada `127.0.0.1:4416`. Untuk endpoint `POST /get_pot`, proxy hanya menghitung total permintaan, status HTTP, serta apakah respons JSON memiliki nilai `poToken` non-kosong. Body request, token, visitor data, cookie, URL video, dan signed media URL tidak disimpan maupun ditulis ke log. Jika proxy tidak bisa mulai, API tetap memakai alamat BgUtils langsung.
 
-Untuk membuktikan apakah provider benar-benar dipanggil, logger yt-dlp v1.10 mengamati baris registry `PO Token Providers` dan `Generating a ... PO Token`. `/health` menyediakan `youtubeDiagnostics` berisi client yang dicoba, hasil aman tiap percobaan, `providerAdvertised`, dan `tokenGenerationObserved`. Diagnostik tidak menyimpan URL sumber, cookies, visitor data, signed media URL, atau nilai PO Token. `youtubePoTokenProviderReady` tetap hanya memverifikasi ping dan kecocokan versi; indikator token generation merupakan bukti runtime yang lebih kuat, tetapi bukan jaminan ekstraksi atau unduhan akan berhasil.
+Strategi YouTube dijalankan berurutan dalam sesi yt-dlp terpisah: `mweb` (jika BgUtils sehat dan versi plugin/server cocok), `web_safari`, `web_safari_hls` sebagai strategi HLS-only yang terpisah, `web_embedded`, lalu `tv`. `web_safari_hls` memakai player client `web_safari`, tetapi unduhan dibatasi pada format protokol HLS `m3u8` yang memiliki video dan audio sekaligus; kualitas maksimum atau batas tinggi yang dipilih tetap dihormati. Strategi ini tidak diam-diam memilih format DASH/MP4 lain dan tidak mengunduh video-only tanpa audio. `web_embedded` hanya dapat bekerja pada video yang mengizinkan embedding; `tv` merupakan fallback terakhir. Format DRM dan SABR-only tetap ditolak. Untuk audio, strategi HLS-only tidak diulang.
 
-Deno juga dipakai untuk EJS challenge solver yt-dlp. Paket `yt-dlp[default]` menyediakan dependensi EJS, sedangkan runtime Deno harus memenuhi versi minimum pada panduan EJS yt-dlp yang digunakan saat rilis ini.
+Dokumentasi yt-dlp yang diperiksa pada November 2026 mencatat bahwa `web_safari` dapat menawarkan HLS tanpa PO Token untuk GVS, tetapi sejak perubahan Juli 2026 format HLS hanya tersedia pada sesi tertentu yang dianggap tepercaya. Karena itu, percobaan HLS di Petik adalah jalur diagnosis/pemulihan, bukan jaminan akan tersedia untuk server anonim Render. Petik juga mengaktifkan `source_address=0.0.0.0` secara default untuk memaksa jalur IPv4 pada permintaan yt-dlp; ini membantu menghindari variasi rute IPv6, tetapi tidak mengubah reputasi IP Render.
 
-**Batas penting:** PO Token bukan jaminan bypass. YouTube tetap dapat membatasi IP pusat data/Render, meminta verifikasi, mengubah challenge, atau mengembalikan format yang tidak dapat diunduh. BgUtils sendiri memperingatkan bahwa penyediaan token tidak menjamin lolos dari 403 atau bot checks. Konten privat, berbayar, atau yang memerlukan akun tidak otomatis menjadi dapat diakses. Petik tidak meminta password, cookies, atau token akun YouTube.
+`/health` menyediakan `youtubeDiagnostics` dengan daftar provider yang terdeteksi, strategi yang dicoba, hasil per strategi, status telemetry, jumlah permintaan provider, jumlah respons HTTP sukses/gagal, jumlah respons berisi `poToken`, timestamp terakhir, dan petunjuk akar masalah. Counter lifetime provider dan delta pada percobaan terakhir ditampilkan terpisah. `tokenGenerationObserved` hanya berarti permintaan provider teramati; `providerTokenResponsesThisAttempt` membuktikan respons `/get_pot` berisi field `poToken` non-kosong. Keduanya tidak membuktikan YouTube menerima token atau memberikan format unduhan.
 
-Provider alternatif `yt-dlp-getpot-wpc` juga dievaluasi. Dokumentasi upstream menyebutnya sebagai alternatif/fallback yang masih eksperimental dan memerlukan Chrome/Chromium untuk mencetak token melalui browser. Provider ini tidak dimasukkan ke image v1.10 agar tidak menambah browser headless dan beban runtime; BgUtils tetap menjadi provider utama. BgUtils dan yt-dlp adalah proyek open-source; tidak ada API berbayar atau biaya provider tambahan pada implementasi ini. Namun penggunaan Render Free tetap tunduk pada kuota, bandwidth, waktu build, penghentian saat idle, dan batas resource Render. Render menyebut instance Free memiliki RAM 512 MB pada halaman pricing dan dapat spin down setelah 15 menit tidak menerima trafik.
+Deno juga dipakai untuk EJS challenge solver yt-dlp. Paket `yt-dlp[default]` menyediakan dependensi EJS, sedangkan runtime Deno memenuhi kebutuhan JavaScript challenge solver yang dipakai image ini.
+
+**WPC dievaluasi tetapi tidak dipasang pada image standar.** Plugin `yt-dlp-getpot-wpc` membutuhkan Chrome/Chromium untuk membuat token melalui browser headless. Menambahkan Chromium akan menambah ukuran image serta penggunaan memori pada Render Free; WPC ditampilkan sebagai status diagnosa, tetapi `runtimeEnabled` tetap `false`. Tidak ada API berbayar atau layanan eksternal berbayar yang ditambahkan.
+
+**Batas penting:** PO Token bukan jaminan bypass. BgUtils menyatakan token tidak menjamin lolos dari HTTP 403 atau bot-check. Jika bot-check terjadi setelah proxy mengamati respons token, diagnosa akan memberi petunjuk kemungkinan pembatasan IP/session; itu bukan bukti definitif bahwa IP Render diblokir. Petik tidak menggunakan password, cookie, atau login akun YouTube. Konten privat, berbayar, atau yang memerlukan akun tetap tidak didukung.
 
 ## Platform dan batas dukungan
 
@@ -93,11 +97,11 @@ Pengunduh CDN menulis potongan data langsung ke file sementara agar tidak menamp
 
 ## Variabel lingkungan
 
-`PUBLIC_BASE_URL`, `ALLOWED_ORIGINS`, `MAX_FILE_MB`, `MAX_DURATION_SECONDS`, `FILE_TTL_SECONDS`, `MAX_CONCURRENT_DOWNLOADS`, `RATE_LIMIT_COUNT`, `RATE_LIMIT_WINDOW_SECONDS`, `TEMP_DIR`, `BGUTIL_POT_PROVIDER_ENABLED`, `BGUTIL_POT_PROVIDER_URL`, `BGUTIL_PROVIDER_PORT`, `BGUTIL_PROVIDER_START_TIMEOUT`, `MAX_GALLERY_ITEMS`, `MAX_GALLERY_FILE_MB`, `MAX_GALLERY_VIDEO_MB`, dan `MAX_GALLERY_TOTAL_MB`.
+`PUBLIC_BASE_URL`, `ALLOWED_ORIGINS`, `MAX_FILE_MB`, `MAX_DURATION_SECONDS`, `FILE_TTL_SECONDS`, `MAX_CONCURRENT_DOWNLOADS`, `RATE_LIMIT_COUNT`, `RATE_LIMIT_WINDOW_SECONDS`, `TEMP_DIR`, `BGUTIL_POT_PROVIDER_ENABLED`, `BGUTIL_POT_PROVIDER_URL`, `BGUTIL_PROVIDER_PORT`, `BGUTIL_PROVIDER_START_TIMEOUT`, `BGUTIL_TELEMETRY_PORT`, `BGUTIL_TELEMETRY_URL`, `YOUTUBE_FORCE_IPV4`, `YOUTUBE_WPC_ENABLED` (status/request flag; WPC belum diaktifkan), `MAX_GALLERY_ITEMS`, `MAX_GALLERY_FILE_MB`, `MAX_GALLERY_VIDEO_MB`, dan `MAX_GALLERY_TOTAL_MB`.
 
 ## Tes dan batas verifikasi
 
-Folder `tests/` berisi 91 tes offline untuk parser Instagram/Threads campuran, deteksi URL gallery-dl, urutan `sourceIndex`, pemetaan ID unduhan, ZIP yang berisi foto dan video, unduhan CDN streaming, partial failure, validasi host/redirect, endpoint inspect/download, health, kompatibilitas Cobalt, preview, MP3, durasi, dan kualitas. Tes ini memvalidasi kontrak dan perilaku lokal; tes offline bukan bukti bahwa setiap tautan live dari tiap platform akan berhasil diekstrak.
+Folder `tests/` berisi 101 tes offline untuk parser Instagram/Threads campuran, deteksi URL gallery-dl, urutan `sourceIndex`, pemetaan ID unduhan, ZIP yang berisi foto dan video, unduhan CDN streaming, partial failure, validasi host/redirect, endpoint inspect/download, health, kompatibilitas Cobalt, preview, MP3, durasi, dan kualitas. Tes ini memvalidasi kontrak dan perilaku lokal; tes offline bukan bukti bahwa setiap tautan live dari tiap platform akan berhasil diekstrak.
 
 ## Urutan API di frontend Petik
 
@@ -106,6 +110,18 @@ Folder `tests/` berisi 91 tes offline untuk parser Instagram/Threads campuran, d
 3. API Cobalt eksternal sebagai cadangan video/audio yang sudah ada.
 
 ## Riwayat rilis
+
+### v1.11.0 — YouTube Provider Telemetry, HLS Recovery, dan IPv4
+
+- Menambahkan `pot_telemetry.py`, proxy penerus BgUtils yang hanya terikat ke loopback.
+- Mengukur permintaan `/get_pot`, status HTTP, dan respons yang berisi field `poToken` tanpa menyimpan token/body.
+- Menggunakan telemetry proxy otomatis bila siap; fallback langsung ke BgUtils bila proxy gagal dimulai.
+- Memisahkan strategi `web_safari_hls` dari percobaan `web_safari` biasa, menolak HLS-only pada percobaan normal, serta membatasi unduhan HLS ke format muxed yang memiliki audio dan video.
+- Memaksa IPv4 untuk yt-dlp YouTube melalui `source_address=0.0.0.0` (dapat dimatikan dengan `YOUTUBE_FORCE_IPV4=0`).
+- Memisahkan counter provider lifetime dari delta permintaan pada upaya terakhir.
+- Menambahkan petunjuk akar masalah bot-check berdasarkan bukti provider, tanpa menyatakan blokir IP sebagai kepastian.
+- Menambahkan status WPC ke `/health`; WPC tetap tidak diinstal/diaktifkan pada image standar karena memerlukan Chromium.
+- Mempertahankan BgUtils 2.0.2, Deno/EJS, resolver sosial, galeri mixed media, preview, Direct Link, dan MP3.
 
 ### v1.10.0 — YouTube Client Fallback dan Diagnostik PO Token
 
