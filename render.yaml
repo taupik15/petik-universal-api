@@ -24,5 +24,7 @@ services:
         value: "20"
       - key: MAX_GALLERY_FILE_MB
         value: "20"
+      - key: MAX_GALLERY_VIDEO_MB
+        value: "140"
       - key: MAX_GALLERY_TOTAL_MB
-        value: "60"
+        value: "300"

@@ -33,11 +33,12 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 from yt_dlp import YoutubeDL
 
-APP_VERSION = "1.7.0"
+APP_VERSION = "1.8.0"
 MAX_GALLERY_ITEMS = max(1, min(30, int(os.getenv("MAX_GALLERY_ITEMS", "20"))))
 MAX_GALLERY_SOURCE_ITEMS = MAX_GALLERY_ITEMS * 2  # Mixed carousels can contain video entries between photos.
 MAX_GALLERY_FILE_BYTES = int(os.getenv("MAX_GALLERY_FILE_MB", "20")) * 1024 * 1024
-MAX_GALLERY_TOTAL_BYTES = int(os.getenv("MAX_GALLERY_TOTAL_MB", "60")) * 1024 * 1024
+MAX_GALLERY_TOTAL_BYTES = int(os.getenv("MAX_GALLERY_TOTAL_MB", "300")) * 1024 * 1024
+MAX_GALLERY_VIDEO_BYTES = int(os.getenv("MAX_GALLERY_VIDEO_MB", "140")) * 1024 * 1024
 GALLERY_PLATFORMS = {"instagram", "facebook", "twitter", "pinterest", "reddit"}
 THREADS_PAGE_HOSTS = {"threads.net", "threads.com"}
 THREADS_MEDIA_SUFFIXES = (".cdninstagram.com", ".fbcdn.net", ".threads.net", ".threads.com", ".fbsbx.com")
@@ -248,11 +249,14 @@ def _extract_info(url: str) -> dict:
         info = ydl.extract_info(url, download=False)
     if not info:
         raise RuntimeError("Platform tidak mengembalikan informasi media.")
-    if info.get("_type") == "playlist":
-        entries = [entry for entry in (info.get("entries") or []) if entry]
+    if info.get("_type") in {"playlist", "multi_video"}:
+        entries = [entry for entry in (info.get("entries") or []) if isinstance(entry, dict)]
         if not entries:
             raise RuntimeError("Postingan tidak memiliki media yang bisa diproses.")
-        info = entries[0]
+        # Keep the first item as the primary video/audio target for the existing
+        # quality picker, but preserve the ordered entries for the mixed gallery.
+        info = dict(entries[0])
+        info["_petik_entries"] = entries[:MAX_GALLERY_SOURCE_ITEMS]
     duration = info.get("duration")
     if duration and duration > MAX_DURATION_SECONDS:
         raise RuntimeError(f"Durasi melebihi batas {MAX_DURATION_SECONDS // 60} menit.")
@@ -450,13 +454,94 @@ def _image_extension_from_url(value: str) -> str | None:
     return None
 
 
-def _parse_gallery_urls(output: str) -> list[dict]:
-    """Convert gallery-dl's -g output into a safe image manifest.
+VIDEO_EXTENSIONS = {".mp4", ".m4v", ".mov", ".webm", ".mkv", ".avi", ".3gp", ".ts", ".m3u8", ".mpd"}
+DIRECT_VIDEO_EXTENSIONS = VIDEO_EXTENSIONS - {".ts", ".m3u8", ".mpd"}
 
-    IDs retain the original URL order (including skipped non-image entries), so
-    mixed photo/video galleries can still be selected with gallery-dl --filter.
-    Signed CDN URLs commonly put image format in the query instead of the path.
-    """
+
+def _is_direct_video_url(value: str) -> bool:
+    extension = _video_extension_from_url(value)
+    return extension in DIRECT_VIDEO_EXTENSIONS if extension else False
+
+
+def _video_extension_from_url(value: str) -> str | None:
+    try:
+        parsed = urlparse(value)
+        suffix = Path(unquote(parsed.path)).suffix.lower()
+        if suffix in VIDEO_EXTENSIONS:
+            return suffix
+        query = parse_qs(parsed.query, keep_blank_values=False)
+        for key in ("format", "fm", "ext", "extension", "mime", "mime_type", "content_type", "filename", "file", "name"):
+            for raw in query.get(key, []):
+                token = unquote(str(raw)).lower().strip().split(";", 1)[0]
+                if token.startswith("video/"):
+                    token = token.split("/", 1)[1]
+                if token in {item.lstrip(".") for item in VIDEO_EXTENSIONS}:
+                    return f".{token}"
+                suffix = Path(token.split("?", 1)[0]).suffix.lower()
+                if suffix in VIDEO_EXTENSIONS:
+                    return suffix
+    except Exception:
+        return None
+    return None
+
+
+def _media_url_key(value: str) -> str:
+    parsed = urlparse(value)
+    return f"{(parsed.hostname or '').lower()}{unquote(parsed.path).lower()}"
+
+
+def _normalise_media_items(items: list[dict]) -> list[dict]:
+    """Merge extractor manifests, deduplicate CDN URLs and assign stable ordered IDs."""
+    unique: dict[str, dict] = {}
+    for item in items:
+        if not isinstance(item, dict) or not isinstance(item.get("url"), str):
+            continue
+        item_type = item.get("type") or ("video" if item.get("kind") == "video" else "photo")
+        if item_type not in {"photo", "video"}:
+            continue
+        value = item["url"]
+        if urlparse(value).scheme != "https" or not _safe_preview_url(value):
+            continue
+        key = _media_url_key(value)
+        if key not in unique:
+            unique[key] = {**item, "type": item_type, "kind": "video" if item_type == "video" else "image"}
+        else:
+            old = unique[key]
+            if not old.get("thumbnail") and item.get("thumbnail"):
+                old["thumbnail"] = item["thumbnail"]
+            if not old.get("duration") and item.get("duration"):
+                old["duration"] = item["duration"]
+    ordered = sorted(unique.values(), key=lambda item: int(item.get("sourceIndex") or item.get("id") or 999999))
+    result: list[dict] = []
+    counters = {"photo": 0, "video": 0}
+    for index, item in enumerate(ordered[:MAX_GALLERY_ITEMS], 1):
+        item_type = item["type"]
+        counters[item_type] += 1
+        prefix = "video" if item_type == "video" else "foto"
+        extension = str(item.get("extension") or ("mp4" if item_type == "video" else "jpg")).lstrip(".")
+        item["id"] = index
+        item["index"] = index
+        item["extension"] = extension
+        item["filename"] = f"{prefix}-{counters[item_type]:03d}.{extension}"
+        item["label"] = f"{prefix.title()} {counters[item_type]}"
+        item["directUrl"] = _safe_preview_url(item.get("directUrl")) or item["url"]
+        result.append(item)
+    return result
+
+
+def _media_photo_alias(items: list[dict]) -> list[dict]:
+    """Legacy photoItems contract: photo-only IDs remain compact and sequential."""
+    photos = [dict(item) for item in items if item.get("type") == "photo"]
+    for index, item in enumerate(photos, 1):
+        item["mediaIndex"] = item.get("id")
+        item["id"] = index
+        item["label"] = f"Foto {index}"
+        item["filename"] = f"foto-{index:03d}.{item.get('extension') or 'jpg'}"
+    return photos
+
+
+def _parse_gallery_media_urls(output: str) -> list[dict]:
+    """Parse ordered gallery-dl URLs for supported image and video attachments."""
     found: list[dict] = []
     seen: set[str] = set()
     source_index = 0
@@ -471,33 +556,49 @@ def _parse_gallery_urls(output: str) -> list[dict]:
             parsed = urlparse(value)
             if parsed.scheme != "https" or not parsed.hostname or parsed.username or parsed.password:
                 continue
-            suffix = _image_extension_from_url(value)
-            if not suffix:
+            image_ext = _image_extension_from_url(value)
+            video_ext = _video_extension_from_url(value)
+            if image_ext:
+                item_type, suffix = "photo", image_ext
+            elif video_ext and video_ext not in {".m3u8", ".mpd", ".ts"}:
+                item_type, suffix = "video", video_ext
+            else:
                 continue
-            dedupe_key = f"{parsed.hostname.lower()}{unquote(parsed.path).lower()}"
-            if dedupe_key in seen:
+            key = _media_url_key(value)
+            if key in seen:
                 continue
-            seen.add(dedupe_key)
+            seen.add(key)
+            prefix = "video" if item_type == "video" else "foto"
+            count = sum(1 for item in found if item["type"] == item_type) + 1
             filename = Path(unquote(parsed.path)).name
             if not Path(filename).suffix:
-                filename = f"foto-{len(found) + 1}{suffix}"
+                filename = f"{prefix}-{count:03d}{suffix}"
             found.append({
-                "id": source_index,
-                "url": value,
-                "thumbnail": value,
-                "extension": suffix.lstrip("."),
-                "filename": filename[:160],
-                "label": f"Foto {len(found) + 1}",
-                "kind": "image",
+                "id": len(found) + 1, "sourceIndex": source_index, "type": item_type,
+                "kind": "video" if item_type == "video" else "image", "url": value, "directUrl": value,
+                "thumbnail": value if item_type == "photo" else None, "extension": suffix.lstrip("."),
+                "filename": filename[:160], "label": f"{prefix.title()} {count}",
             })
-            if len(found) >= MAX_GALLERY_ITEMS:
-                break
         except Exception:
             continue
-    return found
+        if len(found) >= MAX_GALLERY_ITEMS:
+            break
+    return _normalise_media_items(found)
 
 
-def _gallery_list_images(url: str, platform: str) -> list[dict]:
+def _parse_gallery_urls(output: str) -> list[dict]:
+    """Legacy photo-only parser retaining gallery-dl's original source numbers."""
+    media = _parse_gallery_media_urls(output)
+    photos = [dict(item) for item in media if item.get("type") == "photo"]
+    for item in photos:
+        item["id"] = int(item.get("sourceIndex") or item.get("id") or 0)
+        item["kind"] = "image"
+        item.pop("type", None)
+    return photos
+
+
+def _gallery_list_media(url: str, platform: str) -> list[dict]:
+    """Enumerate one ordered, mixed gallery-dl manifest for a public post."""
     if platform not in GALLERY_PLATFORMS:
         return []
     executable = _gallery_command()
@@ -513,7 +614,7 @@ def _gallery_list_images(url: str, platform: str) -> list[dict]:
             if detail:
                 print(f"[gallery-dl:{platform}] {detail[-1][:300]}")
             return []
-        return _parse_gallery_urls(result.stdout)
+        return _parse_gallery_media_urls(result.stdout)
     except subprocess.TimeoutExpired:
         print(f"[gallery-dl:{platform}] timeout after 40 seconds")
         return []
@@ -521,6 +622,62 @@ def _gallery_list_images(url: str, platform: str) -> list[dict]:
         print(f"[gallery-dl:{platform}] unavailable: {exc}")
         return []
 
+
+def _gallery_list_images(url: str, platform: str) -> list[dict]:
+    """Backward-compatible photo-only view over the ordered mixed manifest."""
+    return [dict(item) for item in _gallery_list_media(url, platform) if item.get("type") == "photo"]
+
+
+def _gallery_list_videos(url: str, platform: str) -> list[dict]:
+    """Backward-compatible video-only view over the ordered mixed manifest."""
+    return [dict(item) for item in _gallery_list_media(url, platform) if item.get("type") == "video"]
+
+
+def _gallery_source_indices(media_items: list[dict], selected_ids: list[int]) -> list[int]:
+    """Translate UI's sequential mixed-media IDs to gallery-dl's source item numbers."""
+    lookup = {int(item.get("id")): int(item.get("sourceIndex") or item.get("id"))
+              for item in media_items if isinstance(item, dict) and item.get("id") is not None}
+    if any(item_id not in lookup for item_id in selected_ids):
+        raise RuntimeError("Pilihan media tidak cocok dengan daftar sumber. Ambil ulang tautannya.")
+    return [lookup[item_id] for item_id in selected_ids]
+
+
+def _gallery_dl_indices_for_items(url: str, platform: str, selected_items: list[dict]) -> list[int]:
+    """Map selected CDN objects back to gallery-dl item numbers for safe fallback."""
+    manifest = _gallery_list_media(url, platform)
+    by_url = {_media_url_key(str(item.get("url") or "")): int(item.get("sourceIndex") or item.get("id") or 0)
+              for item in manifest}
+    mapped = []
+    for item in selected_items:
+        key = _media_url_key(str(item.get("url") or ""))
+        source_index = by_url.get(key)
+        if not source_index:
+            raise RuntimeError("Extractor cadangan tidak menemukan media terpilih yang sama. Ambil ulang tautannya.")
+        mapped.append(source_index)
+    return mapped
+
+
+def _gallery_download_failures(media_items: list[dict], selected_ids: list[int], source_indices: list[int], files: list[Path]) -> list[dict]:
+    """Report partial gallery-dl results by matching the source number in each filename."""
+    downloaded_sources: set[int] = set()
+    for file_path in files:
+        match = re.match(r"^0*(\d+)(?:[._-]|$)", file_path.name)
+        if match:
+            downloaded_sources.add(int(match.group(1)))
+    by_id = {int(item.get("id")): item for item in media_items
+             if isinstance(item, dict) and item.get("id") is not None}
+    failures: list[dict] = []
+    for media_id, source_index in zip(selected_ids, source_indices):
+        if source_index in downloaded_sources:
+            continue
+        item = by_id.get(media_id, {})
+        media_type = item.get("type") or ("video" if item.get("kind") == "video" else "photo")
+        failures.append({
+            "id": media_id,
+            "type": media_type,
+            "message": "Extractor tidak mengembalikan berkas untuk item ini.",
+        })
+    return failures
 
 def _safe_social_media_url(value: str) -> bool:
     try:
@@ -552,8 +709,47 @@ def _instagram_shortcode_to_media_id(shortcode: str) -> str:
     return str(value)
 
 
-def _instagram_photo_items(media: dict | list) -> list[dict]:
-    """Normalize Instagram logged-out GraphQL/product media into photo items."""
+def _instagram_best_image(node: dict) -> str | None:
+    image_url = node.get("display_url") or node.get("display_src") or node.get("thumbnail_src")
+    if isinstance(image_url, str) and _safe_social_media_url(image_url):
+        return image_url
+    versions = node.get("image_versions2")
+    candidates = versions.get("candidates") if isinstance(versions, dict) else []
+    if not isinstance(candidates, list):
+        candidates = []
+    candidates = [item for item in candidates if isinstance(item, dict)
+                  and isinstance(item.get("url"), str) and _safe_social_media_url(item["url"])]
+    resources = node.get("display_resources")
+    if not candidates and isinstance(resources, list):
+        candidates = [{"url": item.get("src"), "width": item.get("config_width") or item.get("width") or 0,
+                       "height": item.get("config_height") or item.get("height") or 0}
+                      for item in resources if isinstance(item, dict) and isinstance(item.get("src"), str)
+                      and _safe_social_media_url(item["src"])]
+    best = max(candidates, key=lambda item: int(item.get("width") or 0) * int(item.get("height") or 0)) if candidates else None
+    return best.get("url") if best else None
+
+
+def _instagram_best_video(node: dict) -> str | None:
+    candidates = node.get("video_versions")
+    if isinstance(candidates, list):
+        candidates = [item for item in candidates if isinstance(item, dict)
+                      and isinstance(item.get("url"), str) and _safe_social_media_url(item["url"])
+                      and _is_direct_video_url(item["url"])]
+        best = max(candidates, key=lambda item: (
+            int(item.get("width") or 0) * int(item.get("height") or 0),
+            int(item.get("type") or 0), int(item.get("bitrate") or 0)
+        )) if candidates else None
+        if best:
+            return best["url"]
+    for key in ("video_url", "url"):
+        value = node.get(key)
+        if isinstance(value, str) and _safe_social_media_url(value) and _is_direct_video_url(value):
+            return value
+    return None
+
+
+def _instagram_media_items(media: dict | list) -> list[dict]:
+    """Normalize logged-out Instagram post/carousel data without dropping videos."""
     if isinstance(media, list):
         nodes = media
     elif isinstance(media, dict) and isinstance(media.get("carousel_media"), list):
@@ -563,52 +759,57 @@ def _instagram_photo_items(media: dict | list) -> list[dict]:
         edges = sidecar.get("edges") if isinstance(sidecar, dict) else None
         nodes = [edge.get("node") for edge in edges if isinstance(edge, dict) and isinstance(edge.get("node"), dict)] if isinstance(edges, list) else [media]
 
-    photos: list[dict] = []
+    items: list[dict] = []
     seen: set[str] = set()
     for source_index, node in enumerate(nodes, 1):
         if not isinstance(node, dict):
             continue
-        # Do not expose video posters as downloadable photos in mixed carousels.
-        if node.get("is_video") is True or str(node.get("media_type") or "") == "2" or node.get("video_url") or node.get("video_versions"):
-            continue
-
-        image_url = node.get("display_url") or node.get("display_src") or node.get("thumbnail_src")
-        if not isinstance(image_url, str) or not _safe_social_media_url(image_url):
-            image_url = None
-
-        if not image_url:
-            versions = node.get("image_versions2")
-            candidates = versions.get("candidates") if isinstance(versions, dict) else []
-            if not isinstance(candidates, list):
-                candidates = []
-            candidates = [item for item in candidates if isinstance(item, dict) and isinstance(item.get("url"), str) and _safe_social_media_url(item["url"])]
-            # Older GraphQL payloads expose display_resources instead.
-            resources = node.get("display_resources")
-            if not candidates and isinstance(resources, list):
-                candidates = [item for item in resources if isinstance(item, dict) and isinstance(item.get("src"), str) and _safe_social_media_url(item["src"])]
-                candidates = [{"url": item["src"], "width": item.get("config_width") or item.get("width") or 0,
-                               "height": item.get("config_height") or item.get("height") or 0} for item in candidates]
-            best = max(candidates, key=lambda item: int(item.get("width") or 0) * int(item.get("height") or 0)) if candidates else None
-            image_url = best.get("url") if best else None
-
-        if not isinstance(image_url, str) or not _safe_social_media_url(image_url):
-            continue
-        canonical = image_url.split("?", 1)[0]
+        is_video = (node.get("is_video") is True or str(node.get("media_type") or "") == "2"
+                    or bool(node.get("video_versions") or node.get("video_url")))
+        if is_video:
+            media_url = _instagram_best_video(node)
+            if not media_url:
+                # A video poster is decorative; do not expose it as a photo.
+                continue
+            extension = _video_extension_from_url(media_url) or ".mp4"
+            thumbnail = _instagram_best_image(node) or node.get("thumbnail_url")
+            item_type = "video"
+        else:
+            media_url = _instagram_best_image(node)
+            if not media_url:
+                continue
+            extension = _image_extension_from_url(media_url) or ".jpg"
+            thumbnail = media_url
+            item_type = "photo"
+        canonical = _media_url_key(media_url)
         if canonical in seen:
             continue
         seen.add(canonical)
-        suffix = _image_extension_from_url(image_url) or ".jpg"
-        photos.append({
-            "id": source_index,
-            "url": image_url,
-            "thumbnail": image_url,
-            "extension": suffix.lstrip("."),
-            "filename": f"foto-{len(photos) + 1:03d}{suffix}",
-            "label": f"Foto {len(photos) + 1}",
-            "kind": "image",
+        count = sum(1 for item in items if item["type"] == item_type) + 1
+        prefix = "video" if item_type == "video" else "foto"
+        filename = f"{prefix}-{count:03d}{extension}"
+        items.append({
+            "id": len(items) + 1, "sourceIndex": source_index, "type": item_type,
+            "kind": "video" if item_type == "video" else "image",
+            "url": media_url, "directUrl": media_url,
+            "thumbnail": thumbnail if isinstance(thumbnail, str) and _safe_social_media_url(thumbnail) else None,
+            "extension": extension.lstrip("."), "filename": filename,
+            "label": f"{prefix.title()} {count}",
+            "duration": node.get("video_duration") or node.get("duration") if item_type == "video" else None,
         })
-        if len(photos) >= MAX_GALLERY_ITEMS:
+        if len(items) >= MAX_GALLERY_ITEMS:
             break
+    return items
+
+
+def _instagram_photo_items(media: dict | list) -> list[dict]:
+    """Backward-compatible photo-only view of the Instagram mixed-media parser."""
+    photos = [dict(item) for item in _instagram_media_items(media) if item.get("type") == "photo"]
+    for index, item in enumerate(photos, 1):
+        item["mediaIndex"] = item.get("id")
+        item["id"] = index
+        item["label"] = f"Foto {index}"
+        item["filename"] = f"foto-{index:03d}.{item.get('extension') or 'jpg'}"
     return photos
 
 
@@ -674,8 +875,8 @@ def _curl_meta_page_get(session, url: str, *, headers: dict, timeout: int, platf
         return response
     raise RuntimeError("Terlalu banyak pengalihan halaman Meta.")
 
-def _instagram_public_gallery(url: str) -> list[dict]:
-    """Best-effort Instagram public resolver following the current yt-dlp logged-out query."""
+def _instagram_public_media(url: str) -> list[dict]:
+    """Best-effort logged-out Instagram resolver returning ordered photos and videos."""
     if not HAS_CURL_CFFI or curl_requests is None:
         return []
     match = re.search(r"instagram\.com/(?:p|reel|tv)/([A-Za-z0-9_-]+)", url)
@@ -771,9 +972,9 @@ def _instagram_public_gallery(url: str) -> list[dict]:
                     payload = response.json()
                     product = _instagram_find_product_info(payload)
                     if product:
-                        photos = _instagram_photo_items(product)
-                        if photos:
-                            return photos
+                        media_items = _instagram_media_items(product)
+                        if media_items:
+                            return media_items
             except Exception as exc:
                 print(f"[instagram-public-gallery] GraphQL: {str(exc)[:240]}")
 
@@ -782,12 +983,12 @@ def _instagram_public_gallery(url: str) -> list[dict]:
             try:
                 product = _instagram_find_product_info(json.loads(html_lib.unescape(raw_json)))
                 if product:
-                    photos = _instagram_photo_items(product)
-                    if photos:
-                        return photos
+                    media_items = _instagram_media_items(product)
+                    if media_items:
+                        return media_items
             except Exception:
                 continue
-        print("[instagram-public-gallery] no public photo payload was exposed")
+        print("[instagram-public-gallery] no public mixed-media payload was exposed")
         return []
     except Exception as exc:
         print(f"[instagram-public-gallery] {str(exc)[:240]}")
@@ -798,6 +999,11 @@ def _instagram_public_gallery(url: str) -> list[dict]:
                 session.close()
         except Exception:
             pass
+
+
+def _instagram_public_gallery(url: str) -> list[dict]:
+    """Backward-compatible Instagram photo-only gallery resolver."""
+    return [item for item in _instagram_public_media(url) if item.get("type") == "photo"]
 
 
 def _facebook_target_ids(value: str) -> set[str]:
@@ -1089,7 +1295,8 @@ def _threads_best_image(media: dict) -> str | None:
     return max(valid, default=(0, None), key=lambda pair: pair[0])[1]
 
 
-def _threads_photo_items(url: str, page_html: str) -> list[dict]:
+def _threads_media_items(url: str, page_html: str) -> list[dict]:
+    """Return the target Threads post's ordered photo/video attachments."""
     posts = _threads_collect_post_dicts(page_html)
     target = _threads_page_shortcode(url, page_html)
     selected = next((post for post in posts if post.get("code") == target), None) if target else None
@@ -1102,33 +1309,61 @@ def _threads_photo_items(url: str, page_html: str) -> list[dict]:
     if not isinstance(media_entries, list) or not media_entries:
         media_entries = [selected]
 
-    photos: list[dict] = []
+    items: list[dict] = []
     seen: set[str] = set()
-    for media in media_entries:
+    for source_index, media in enumerate(media_entries, 1):
         if not isinstance(media, dict):
             continue
-        # A carousel video can have a poster; do not expose it as a photo download.
-        if isinstance(media.get("video_versions"), list) and media.get("video_versions"):
+        versions = media.get("video_versions")
+        is_video = (isinstance(versions, list) and bool(versions)) or str(media.get("media_type") or "") == "2" or bool(media.get("video_url"))
+        if is_video:
+            candidates = [item for item in (versions or []) if isinstance(item, dict)
+                          and isinstance(item.get("url"), str) and _safe_threads_media_url(item["url"])
+                          and _is_direct_video_url(item["url"])]
+            best = max(candidates, key=lambda item: (
+                int(item.get("width") or 0) * int(item.get("height") or 0), int(item.get("type") or 0)
+            )) if candidates else None
+            media_url = best.get("url") if best else media.get("video_url")
+            if not isinstance(media_url, str) or not _safe_threads_media_url(media_url) or not _is_direct_video_url(media_url):
+                continue  # Never mislabel a video's poster as a photo.
+            item_type = "video"
+            extension = _video_extension_from_url(media_url)
+            thumbnail = _threads_best_image(media)
+        else:
+            media_url = _threads_best_image(media)
+            item_type = "photo"
+            extension = _image_extension_from_url(media_url) if media_url else None
+            thumbnail = media_url
+        if not media_url or not _safe_threads_media_url(media_url):
             continue
-        image_url = _threads_best_image(media)
-        if not image_url:
-            continue
-        canonical = image_url.split("?", 1)[0]
+        canonical = _media_url_key(media_url)
         if canonical in seen:
             continue
         seen.add(canonical)
-        suffix = _image_extension_from_url(image_url) or ".jpg"
-        photos.append({
-            "id": len(photos) + 1,
-            "url": image_url,
-            "thumbnail": image_url,
-            "extension": suffix.lstrip("."),
-            "filename": f"foto-{len(photos) + 1:03d}{suffix}",
-            "label": f"Foto {len(photos) + 1}",
-            "kind": "image",
+        count = sum(1 for item in items if item["type"] == item_type) + 1
+        prefix = "video" if item_type == "video" else "foto"
+        extension = extension or (".mp4" if item_type == "video" else ".jpg")
+        items.append({
+            "id": len(items) + 1, "sourceIndex": source_index, "type": item_type,
+            "kind": "video" if item_type == "video" else "image",
+            "url": media_url, "directUrl": media_url,
+            "thumbnail": thumbnail if isinstance(thumbnail, str) and _safe_threads_media_url(thumbnail) else None,
+            "extension": extension.lstrip("."), "filename": f"{prefix}-{count:03d}{extension}",
+            "label": f"{prefix.title()} {count}",
+            "duration": media.get("video_duration") or media.get("duration") if item_type == "video" else None,
         })
-        if len(photos) >= MAX_GALLERY_ITEMS:
+        if len(items) >= MAX_GALLERY_ITEMS:
             break
+    return items
+
+
+def _threads_photo_items(url: str, page_html: str) -> list[dict]:
+    """Backward-compatible photo-only view of the Threads media parser."""
+    photos = [dict(item) for item in _threads_media_items(url, page_html) if item.get("type") == "photo"]
+    for index, item in enumerate(photos, 1):
+        item["id"] = index
+        item["label"] = f"Foto {index}"
+        item["filename"] = f"foto-{index:03d}.{item.get('extension') or 'jpg'}"
     return photos
 
 
@@ -1200,16 +1435,21 @@ def _fetch_threads_page(url: str) -> str:
     return b"".join(chunks).decode("utf-8", errors="replace")
 
 
-def _threads_list_images(url: str) -> list[dict]:
+def _threads_list_media(url: str) -> list[dict]:
     try:
         page_html = _fetch_threads_page(url)
-        items = _threads_photo_items(url, page_html)
+        items = _threads_media_items(url, page_html)
         if not items:
-            print("[threads-gallery] no public image data matched the requested post")
+            print("[threads-gallery] no public photo/video data matched the requested post")
         return items
     except Exception as exc:
         print(f"[threads-gallery] {str(exc)[:300]}")
         return []
+
+
+def _threads_list_images(url: str) -> list[dict]:
+    """Backward-compatible photo-only listing."""
+    return [item for item in _threads_list_media(url) if item.get("type") == "photo"]
 
 
 def _extension_from_mime(content_type: str) -> str | None:
@@ -1255,101 +1495,190 @@ def _safe_social_stream(client: httpx.Client, url: str):
     raise RuntimeError("Terlalu banyak pengalihan dari CDN media.")
 
 
-def _download_social_gallery_items(url: str, platform: str, items: list[dict], indices: list[int]) -> tuple[Path, list[Path]]:
+def _looks_like_video(data: bytes, content_type: str) -> bool:
+    if content_type.startswith("video/"):
+        return True
+    # MP4/MOV family files carry an ISO-BMFF ftyp box near the start.
+    return len(data) >= 12 and data[4:8] == b"ftyp"
+
+
+def _video_extension_from_mime(content_type: str) -> str | None:
+    return {
+        "video/mp4": "mp4", "video/x-m4v": "m4v", "video/quicktime": "mov",
+        "video/webm": "webm", "video/3gpp": "3gp", "video/x-msvideo": "avi",
+    }.get(content_type.lower())
+
+
+def _download_meta_media_items(url: str, platform: str, items: list[dict], indices: list[int]) -> tuple[Path, list[Path], list[dict]]:
+    """Stream selected photo/video items to disk independently; keep partial successes."""
     if not indices or len(indices) > MAX_GALLERY_ITEMS:
-        raise ValueError(f"Pilih 1 sampai {MAX_GALLERY_ITEMS} foto.")
+        raise ValueError(f"Pilih 1 sampai {MAX_GALLERY_ITEMS} media.")
     chosen_indices = set(indices)
     chosen = [item for item in items if item.get("id") in chosen_indices]
     if len(chosen) != len(indices):
-        raise RuntimeError("Foto tidak lagi tersedia atau indeks galeri berubah. Ambil ulang tautannya.")
+        raise RuntimeError("Media tidak lagi tersedia atau urutan galeri berubah. Ambil ulang tautannya.")
 
-    job_dir = Path(tempfile.mkdtemp(prefix=f"{platform}-gallery-", dir=TEMP_ROOT))
+    job_dir = Path(tempfile.mkdtemp(prefix=f"{platform}-media-", dir=TEMP_ROOT))
     downloaded: list[Path] = []
+    failures: list[dict] = []
     total_bytes = 0
-    referer = "https://www.instagram.com/" if platform == "instagram" else "https://www.facebook.com/"
+    referer = "https://www.threads.net/" if platform == "threads" else "https://www.instagram.com/" if platform == "instagram" else "https://www.facebook.com/"
     headers = {
         "User-Agent": "Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) AppleWebKit/605.1.15 Version/17.0 Mobile/15E148 Safari/604.1",
-        "Referer": referer,
-        "Accept": "image/avif,image/webp,image/apng,image/*,*/*;q=0.8",
+        "Referer": referer, "Accept": "*/*",
     }
+    stream_context = _safe_threads_stream if platform == "threads" else _safe_social_stream
     try:
-        with httpx.Client(timeout=httpx.Timeout(30.0, connect=10.0), follow_redirects=False, headers=headers) as client:
+        with httpx.Client(timeout=httpx.Timeout(45.0, connect=12.0), follow_redirects=False, headers=headers) as client:
             for position, item in enumerate(chosen, 1):
-                if not _safe_social_media_url(str(item.get("url") or "")):
-                    raise RuntimeError("Alamat CDN foto tidak lolos pemeriksaan keamanan.")
-                with _safe_social_stream(client, item["url"]) as response:
-                    if not response.is_success:
-                        raise RuntimeError(f"CDN foto gagal diakses (HTTP {response.status_code}).")
-                    content_type = (response.headers.get("content-type") or "").split(";", 1)[0].lower()
-                    if not content_type.startswith("image/"):
-                        raise RuntimeError("Sumber tidak mengembalikan data foto yang valid.")
-                    parts: list[bytes] = []
-                    size = 0
-                    for chunk in response.iter_bytes():
-                        size += len(chunk)
-                        if size > MAX_GALLERY_FILE_BYTES:
-                            raise RuntimeError("Ada foto yang melebihi batas ukuran per berkas.")
-                        parts.append(chunk)
-                data = b"".join(parts)
-                if not _looks_like_image(data, content_type):
-                    raise RuntimeError("Isi berkas dari CDN bukan gambar yang valid.")
-                total_bytes += len(data)
-                if total_bytes > MAX_GALLERY_TOTAL_BYTES:
-                    raise RuntimeError("Total foto melebihi batas ukuran unduhan galeri.")
-                ext = _extension_from_mime(content_type) or str(item.get("extension") or "jpg").lstrip(".")
-                path = job_dir / f"foto-{position:03d}.{ext}"
-                path.write_bytes(data)
-                downloaded.append(path)
-        return job_dir, downloaded
+                media_type = item.get("type") or ("video" if item.get("kind") == "video" else "photo")
+                media_url = str(item.get("url") or "")
+                prefix = "video" if media_type == "video" else "foto"
+                extension = str(item.get("extension") or ("mp4" if media_type == "video" else "jpg")).lower().lstrip(".")
+                path = job_dir / f"{prefix}-{position:03d}.{extension}"
+                try:
+                    is_safe = _safe_threads_media_url(media_url) if platform == "threads" else _safe_social_media_url(media_url)
+                    if not is_safe:
+                        raise RuntimeError("Alamat CDN media tidak lolos pemeriksaan keamanan.")
+                    first_bytes = bytearray()
+                    item_bytes = 0
+                    with (stream_context(client, media_url, media=True) if platform == "threads" else stream_context(client, media_url)) as response:
+                        if not response.is_success:
+                            raise RuntimeError(f"CDN media gagal diakses (HTTP {response.status_code}).")
+                        content_type = (response.headers.get("content-type") or "").split(";", 1)[0].lower()
+                        max_bytes = MAX_GALLERY_VIDEO_BYTES if media_type == "video" else MAX_GALLERY_FILE_BYTES
+                        with path.open("wb") as destination:
+                            for chunk in response.iter_bytes():
+                                item_bytes += len(chunk)
+                                if item_bytes > max_bytes:
+                                    label = "Video" if media_type == "video" else "Foto"
+                                    raise RuntimeError(f"{label} melebihi batas ukuran per berkas.")
+                                if len(first_bytes) < 32:
+                                    first_bytes.extend(chunk[:32 - len(first_bytes)])
+                                destination.write(chunk)
+                    if media_type == "video":
+                        if not content_type.startswith("video/") and not _looks_like_video(bytes(first_bytes), content_type):
+                            raise RuntimeError("Isi berkas CDN bukan video yang valid.")
+                        resolved_extension = _video_extension_from_mime(content_type) or extension
+                    else:
+                        if not content_type.startswith("image/") or not _looks_like_image(bytes(first_bytes), content_type):
+                            raise RuntimeError("Isi berkas CDN bukan gambar yang valid.")
+                        resolved_extension = _extension_from_mime(content_type) or extension
+                    if item_bytes <= 0:
+                        raise RuntimeError("CDN mengirim berkas kosong.")
+                    if total_bytes + item_bytes > MAX_GALLERY_TOTAL_BYTES:
+                        raise RuntimeError("Total media melebihi batas ukuran unduhan galeri.")
+                    total_bytes += item_bytes
+                    if resolved_extension != extension:
+                        corrected = job_dir / f"{prefix}-{position:03d}.{resolved_extension}"
+                        path.replace(corrected)
+                        path = corrected
+                    downloaded.append(path)
+                except Exception as exc:
+                    path.unlink(missing_ok=True)
+                    failures.append({
+                        "id": item.get("id"), "type": media_type,
+                        "message": str(exc)[:180] or "Media gagal diunduh.",
+                    })
+        if not downloaded:
+            detail = failures[0].get("message") if failures else "Tidak ada berkas yang berhasil diunduh."
+            raise RuntimeError(f"Tidak ada media yang berhasil diunduh. {detail}")
+        return job_dir, downloaded, failures
     except Exception:
         shutil.rmtree(job_dir, ignore_errors=True)
         raise
 
-def _download_threads_gallery_files(url: str, indices: list[int]) -> tuple[Path, list[Path]]:
-    if not indices or len(indices) > MAX_GALLERY_ITEMS:
-        raise ValueError(f"Pilih 1 sampai {MAX_GALLERY_ITEMS} foto.")
-    items = _threads_list_images(url)
-    chosen_indices = set(indices)
-    chosen = [item for item in items if item["id"] in chosen_indices]
-    if len(chosen) != len(indices):
-        raise RuntimeError("Foto Threads tidak lagi tersedia atau indeks galeri berubah. Ambil ulang tautannya.")
+def _download_social_gallery_items(url: str, platform: str, items: list[dict], indices: list[int]) -> tuple[Path, list[Path], list[dict]]:
+    """Compatibility wrapper; now supports both photos and videos."""
+    return _download_meta_media_items(url, platform, items, indices)
 
-    job_dir = Path(tempfile.mkdtemp(prefix="threads-gallery-", dir=TEMP_ROOT))
-    downloaded: list[Path] = []
-    total_bytes = 0
-    headers = {"User-Agent": THREADS_CRAWLER_UA, "Referer": "https://www.threads.net/"}
-    try:
-        with httpx.Client(timeout=httpx.Timeout(30.0, connect=10.0), follow_redirects=False, headers=headers) as client:
-            for position, item in enumerate(chosen, 1):
-                if not _safe_threads_media_url(item["url"]):
-                    raise RuntimeError("Alamat CDN foto Threads tidak lolos pemeriksaan keamanan.")
-                with _safe_threads_stream(client, item["url"], media=True) as response:
-                    if not response.is_success:
-                        raise RuntimeError(f"CDN foto Threads gagal diakses (HTTP {response.status_code}).")
-                    content_type = (response.headers.get("content-type") or "").split(";", 1)[0].lower()
-                    if not content_type.startswith("image/"):
-                        raise RuntimeError("Sumber Threads tidak mengembalikan data foto yang valid.")
-                    parts: list[bytes] = []
-                    size = 0
-                    for chunk in response.iter_bytes():
-                        size += len(chunk)
-                        if size > MAX_GALLERY_FILE_BYTES:
-                            raise RuntimeError("Ada foto yang melebihi batas ukuran per berkas.")
-                        parts.append(chunk)
-                data = b"".join(parts)
-                if not _looks_like_image(data, content_type):
-                    raise RuntimeError("Isi berkas dari CDN bukan gambar yang valid.")
-                total_bytes += len(data)
-                if total_bytes > MAX_GALLERY_TOTAL_BYTES:
-                    raise RuntimeError("Total foto melebihi batas ukuran unduhan galeri.")
-                ext = _extension_from_mime(content_type) or item["extension"]
-                path = job_dir / f"foto-{position:03d}.{ext}"
-                path.write_bytes(data)
-                downloaded.append(path)
-        return job_dir, downloaded
-    except Exception:
-        shutil.rmtree(job_dir, ignore_errors=True)
-        raise
+def _download_threads_gallery_files(url: str, indices: list[int]) -> tuple[Path, list[Path], list[dict]]:
+    items = _threads_list_media(url)
+    return _download_meta_media_items(url, "threads", items, indices)
+
+
+def _ytdlp_gallery_video_items(info: dict | None, source_index_offset: int = 0) -> list[dict]:
+    """Expose ordered yt-dlp carousel/playlist entries as gallery video items."""
+    if not isinstance(info, dict):
+        return []
+    entries = info.get("_petik_entries")
+    if not isinstance(entries, list) or len(entries) < 2:
+        return []
+    items: list[dict] = []
+    for entry_number, entry in enumerate(entries, 1):
+        source_index = source_index_offset + entry_number
+        if not isinstance(entry, dict):
+            continue
+        media_url = entry.get("url")
+        if not isinstance(media_url, str) or urlparse(media_url).scheme != "https":
+            continue
+        ext = str(entry.get("ext") or _video_extension_from_url(media_url) or "mp4").lower().lstrip(".")
+        if f".{ext}" not in DIRECT_VIDEO_EXTENSIONS:
+            continue
+        thumbnail = entry.get("thumbnail")
+        if not isinstance(thumbnail, str) or urlparse(thumbnail).scheme != "https":
+            thumbnail = None
+        items.append({
+            "id": len(items) + 1, "sourceIndex": source_index, "type": "video", "kind": "video",
+            "url": media_url, "directUrl": media_url, "thumbnail": thumbnail,
+            "extension": ext, "filename": f"video-{len(items) + 1:03d}.{ext}",
+            "label": f"Video {len(items) + 1}", "duration": entry.get("duration"),
+        })
+    return items
+
+
+def _ytdlp_primary_video_item(info: dict | None, source_index: int = 999) -> dict | None:
+    """Return one progressive video attachment when a post also has photos."""
+    if not isinstance(info, dict):
+        return None
+    direct = _direct_media_urls(info, str(info.get("extractor_key") or "").lower()).get("video")
+    if not direct:
+        direct = _preview_url(info, str(info.get("extractor_key") or "").lower())
+    if not isinstance(direct, str) or urlparse(direct).scheme != "https":
+        return None
+    ext = _video_extension_from_url(direct) or ".mp4"
+    thumbnail = info.get("thumbnail")
+    if not isinstance(thumbnail, str) or urlparse(thumbnail).scheme != "https":
+        thumbnail = None
+    return {
+        "id": 1, "sourceIndex": source_index, "type": "video", "kind": "video",
+        "url": direct, "directUrl": direct, "thumbnail": thumbnail,
+        "extension": ext.lstrip("."), "filename": f"video-001{ext}", "label": "Video 1",
+        "duration": info.get("duration"),
+    }
+
+
+def _gallery_media_for_post(url: str, platform: str, info: dict | None) -> list[dict]:
+    """Collect mixed media from platform-specific public resolvers and gallery-dl."""
+    items: list[dict] = []
+    if platform == "threads":
+        items.extend(_threads_list_media(url))
+    elif platform == "instagram":
+        items.extend(_instagram_public_media(url))
+        if not items:
+            items.extend(_gallery_list_media(url, platform))
+    elif platform == "facebook":
+        # Prefer gallery-dl's single ordered post manifest when available. If it
+        # cannot enumerate the post, use the stricter ID-scoped Meta photo parser.
+        items.extend(_gallery_list_media(url, platform))
+        if not items:
+            for item in _facebook_public_gallery(url):
+                item = dict(item)
+                item.setdefault("type", "photo")
+                item.setdefault("sourceIndex", item.get("id"))
+                items.append(item)
+    elif platform in GALLERY_PLATFORMS:
+        items.extend(_gallery_list_media(url, platform))
+    # Only expose a selectable gallery on platforms whose download endpoint can
+    # map and fetch those attachments. Other platforms retain single video/audio flow.
+    if platform in GALLERY_PLATFORMS and not any(item.get("type") == "video" for item in items):
+        source_offset = max((int(item.get("sourceIndex") or item.get("id") or 0) for item in items), default=0)
+        items.extend(_ytdlp_gallery_video_items(info, source_offset))
+    if platform in GALLERY_PLATFORMS and any(item.get("type") == "photo" for item in items) and not any(item.get("type") == "video" for item in items):
+        primary_video = _ytdlp_primary_video_item(info, max((int(item.get("sourceIndex") or item.get("id") or 0) for item in items), default=0) + 1)
+        if primary_video:
+            items.append(primary_video)
+    return _normalise_media_items(items)
 
 
 def _inspect_payload(url: str, platform: str) -> dict:
@@ -1360,21 +1689,17 @@ def _inspect_payload(url: str, platform: str) -> dict:
     except Exception as exc:
         extraction_error = exc
 
-    if platform == "threads":
-        photo_items = _threads_list_images(url)
-    else:
-        photo_items = _gallery_list_images(url, platform)
-        if not photo_items and platform == "instagram":
-            photo_items = _instagram_public_gallery(url)
-        elif not photo_items and platform == "facebook":
-            photo_items = _facebook_public_gallery(url)
-    if info is None and not photo_items:
+    media_items = _gallery_media_for_post(url, platform, info)
+    photo_items = _media_photo_alias(media_items)
+    if info is None and not media_items:
         if extraction_error:
             raise extraction_error
         raise RuntimeError("Tidak ada media yang bisa diambil dari tautan ini.")
 
     videos, audios = _available_options(info, platform) if info else ([], [])
-    title = str((info or {}).get("title") or (f"Galeri foto · {platform.title()}" if photo_items else "Media"))[:300]
+    title = str((info or {}).get("title") or (f"Media · {platform.title()}" if media_items else "Media"))[:300]
+    video_count = sum(1 for item in media_items if item.get("type") == "video")
+    photo_count = sum(1 for item in media_items if item.get("type") == "photo")
     return {
         "success": True,
         "status": "ready",
@@ -1382,14 +1707,17 @@ def _inspect_payload(url: str, platform: str) -> dict:
         "title": title,
         "author": str((info or {}).get("uploader") or (info or {}).get("channel") or (info or {}).get("artist") or "")[:180] or None,
         "duration": (info or {}).get("duration"),
-        "thumbnail": _safe_thumbnail(info or {}) or (photo_items[0]["thumbnail"] if photo_items else None),
+        "thumbnail": _safe_thumbnail(info or {}) or next((item.get("thumbnail") for item in media_items if item.get("thumbnail")), None),
         "previewUrl": _preview_url(info, platform) if info else None,
         "directUrls": _direct_media_urls(info, platform),
         "videoOptions": videos,
         "audioOptions": audios,
+        "mediaItems": media_items,
         "photoItems": photo_items,
-        "galleryAvailable": bool(photo_items),
+        "mediaCounts": {"total": len(media_items), "photos": photo_count, "videos": video_count},
+        "galleryAvailable": bool(media_items),
         "galleryLimit": MAX_GALLERY_ITEMS,
+        "mediaLimit": MAX_GALLERY_ITEMS,
         "defaultVideoQuality": "max",
         "defaultAudioQuality": "best",
     }
@@ -1400,32 +1728,33 @@ def _download_gallery_files(url: str, indices: list[int]) -> tuple[Path, list[Pa
     if not executable:
         raise RuntimeError("Mesin galeri belum terpasang pada server. Pastikan gallery-dl selesai dipasang saat deployment.")
     if not indices or len(indices) > MAX_GALLERY_ITEMS:
-        raise ValueError(f"Pilih 1 sampai {MAX_GALLERY_ITEMS} foto.")
+        raise ValueError(f"Pilih 1 sampai {MAX_GALLERY_ITEMS} media.")
     if any(type(index) is not int or index < 1 or index > MAX_GALLERY_SOURCE_ITEMS for index in indices):
-        raise ValueError("Nomor foto yang dipilih tidak valid.")
+        raise ValueError("Nomor media yang dipilih tidak valid.")
     job_dir = Path(tempfile.mkdtemp(prefix="gallery-", dir=TEMP_ROOT))
     command = [executable, "--config-ignore", "--no-input", "--no-colors", "--quiet",
-               "--no-mtime", "--no-skip", "--filesize-max", f"{max(1, MAX_GALLERY_FILE_BYTES // (1024 * 1024))}M",
+               "--no-mtime", "--no-skip", "--filesize-max", f"{max(1, max(MAX_GALLERY_FILE_BYTES, MAX_GALLERY_VIDEO_BYTES) // (1024 * 1024))}M",
                "--range", f"1-{MAX_GALLERY_SOURCE_ITEMS}", "--filter",
                "num in (" + ",".join(str(i) for i in indices) + ")",
                "--directory", str(job_dir), "--filename", "{num:>03}.{extension}", "--", url]
     try:
         result = subprocess.run(command, capture_output=True, text=True, encoding="utf-8",
                                 errors="replace", timeout=150, check=False)
-        files = sorted(path for path in job_dir.rglob("*") if path.is_file() and path.suffix.lower() in IMAGE_EXTENSIONS)
+        files = sorted(path for path in job_dir.rglob("*") if path.is_file() and path.suffix.lower() in (IMAGE_EXTENSIONS | VIDEO_EXTENSIONS))
         if result.returncode not in (0, 1) or not files:
-            detail = (result.stderr or result.stdout or "Extractor galeri tidak menemukan foto.").strip().splitlines()[-1][:240]
-            raise RuntimeError(detail or "Gagal mengunduh foto dari sumber.")
+            detail = (result.stderr or result.stdout or "Extractor galeri tidak menemukan media yang dipilih.").strip().splitlines()[-1][:240]
+            raise RuntimeError(detail or "Gagal mengunduh media dari sumber.")
         if len(files) > len(indices):
             files = files[:len(indices)]
         total = 0
         for file_path in files:
             size = file_path.stat().st_size
             total += size
-            if size <= 0 or size > MAX_GALLERY_FILE_BYTES:
-                raise RuntimeError("Ada foto yang melebihi batas ukuran per berkas.")
+            limit = MAX_GALLERY_VIDEO_BYTES if file_path.suffix.lower() in VIDEO_EXTENSIONS else MAX_GALLERY_FILE_BYTES
+            if size <= 0 or size > limit:
+                raise RuntimeError("Ada media yang melebihi batas ukuran per berkas.")
             if total > MAX_GALLERY_TOTAL_BYTES:
-                raise RuntimeError("Total foto melebihi batas ukuran unduhan galeri.")
+                raise RuntimeError("Total media melebihi batas ukuran unduhan galeri.")
         return job_dir, files
     except Exception:
         shutil.rmtree(job_dir, ignore_errors=True)
@@ -1598,7 +1927,7 @@ def server_info(request: Request):
             "url": _base_url(request),
             "services": SERVICES,
             "durationLimit": MAX_DURATION_SECONDS,
-            "features": ["inspect", "quality-picker", "audio-mp3", "photo-gallery", "multi-image-selection", "zip-download", "threads-public-photo-gallery", "temporary-tunnel"],
+            "features": ["inspect", "quality-picker", "audio-mp3", "mixed-media-gallery", "multi-media-selection", "mixed-media-zip-download", "threads-public-photo-video-gallery", "temporary-tunnel"],
         },
         "git": {"remote": "Petik Universal Extractor"},
     }
@@ -1641,12 +1970,18 @@ def health():
         "galleryDlAvailable": bool(_gallery_command()),
         "galleryDlVersion": _gallery_version(),
         "galleryPlatforms": sorted(GALLERY_PLATFORMS | {"threads"}),
+        "threadsMediaResolver": "public-page-json-photo-video",
         "threadsPhotoResolver": "public-page-json",
+        "instagramMediaResolver": "gallery-dl+logged-out-graphql+page-json-photo-video",
         "instagramPhotoResolver": "gallery-dl+logged-out-graphql+page-json",
         "facebookPhotoResolver": "gallery-dl+og-image+post-scoped-json",
+        "mixedMediaAvailable": True,
         "socialPublicFallbackAvailable": HAS_CURL_CFFI,
         "instagramPublicFallbackAvailable": HAS_CURL_CFFI,
         "maxGalleryItems": MAX_GALLERY_ITEMS,
+        "maxGalleryFileMB": MAX_GALLERY_FILE_BYTES // (1024 * 1024),
+        "maxGalleryVideoMB": MAX_GALLERY_VIDEO_BYTES // (1024 * 1024),
+        "maxGalleryTotalMB": MAX_GALLERY_TOTAL_BYTES // (1024 * 1024),
         "javascriptRuntime": "deno" if shutil.which("deno") else "missing",
     }
 
@@ -1751,66 +2086,85 @@ def download_gallery(payload: dict, request: Request):
     if limited:
         return limited
     job_dir: Path | None = None
+    failures: list[dict] = []
     try:
         normalised, error = _normalise_request(payload)
         if error:
             return error
         url, platform = normalised
         if platform not in GALLERY_PLATFORMS and platform != "threads":
-            return _error("error.api.gallery.unsupported", "Platform ini belum memiliki extractor galeri foto Petik.", 400, platform)
+            return _error("error.api.gallery.unsupported", "Platform ini belum memiliki extractor galeri campuran Petik.", 400, platform)
         raw_indices = payload.get("indices")
         if not isinstance(raw_indices, list) or not raw_indices or len(raw_indices) > MAX_GALLERY_ITEMS:
-            return _error("error.api.gallery.selection", f"Pilih 1 sampai {MAX_GALLERY_ITEMS} foto.", 400, platform)
+            return _error("error.api.gallery.selection", f"Pilih 1 sampai {MAX_GALLERY_ITEMS} media.", 400, platform)
         if any(type(value) is not int or value < 1 or value > MAX_GALLERY_SOURCE_ITEMS for value in raw_indices) or len(set(raw_indices)) != len(raw_indices):
-            return _error("error.api.gallery.selection", "Daftar pilihan foto tidak valid.", 400, platform)
+            return _error("error.api.gallery.selection", "Daftar pilihan media tidak valid.", 400, platform)
+
         if platform == "threads":
-            job_dir, files = _download_threads_gallery_files(url, raw_indices)
+            items = _threads_list_media(url)
+            if not items:
+                raise RuntimeError("Media Threads tidak lagi tersedia secara publik. Ambil ulang tautannya.")
+            job_dir, files, failures = _download_meta_media_items(url, platform, items, raw_indices)
         elif platform in {"instagram", "facebook"}:
-            items = _gallery_list_images(url, platform)
-            if not items and platform == "instagram":
-                items = _instagram_public_gallery(url)
-            elif not items and platform == "facebook":
-                items = _facebook_public_gallery(url)
-            if items:
-                try:
-                    job_dir, files = _download_social_gallery_items(url, platform, items, raw_indices)
-                except Exception as direct_error:
-                    # If a CDN rejects the direct anonymous fetch, retain the
-                    # upstream gallery-dl downloader as a second chance.
-                    try:
-                        job_dir, files = _download_gallery_files(url, raw_indices)
-                    except Exception as fallback_error:
-                        raise RuntimeError(
-                            f"Unduhan CDN gagal ({str(direct_error)[:140]}). Fallback gallery-dl juga gagal ({str(fallback_error)[:140]})."
-                        ) from fallback_error
+            if platform == "instagram":
+                items = _instagram_public_media(url)
+                if not items:
+                    items = _gallery_list_media(url, platform)
             else:
-                # Some gallery-dl extractors can download content not exposed
-                # by the logged-out page fallback; preserve that path.
-                job_dir, files = _download_gallery_files(url, raw_indices)
+                items = _gallery_list_media(url, platform)
+                if not items:
+                    items = _normalise_media_items(_facebook_public_gallery(url))
+            if not items:
+                raise RuntimeError("Extractor tidak menemukan item foto/video publik pada postingan ini.")
+            try:
+                job_dir, files, failures = _download_social_gallery_items(url, platform, items, raw_indices)
+            except Exception as direct_error:
+                # Never use a UI index as a gallery-dl index without matching URLs.
+                source_indices = _gallery_dl_indices_for_items(
+                    url, platform, [item for item in items if int(item.get("id") or 0) in set(raw_indices)]
+                )
+                try:
+                    job_dir, files = _download_gallery_files(url, source_indices)
+                    failures = _gallery_download_failures(items, raw_indices, source_indices, files)
+                except Exception as fallback_error:
+                    raise RuntimeError(
+                        f"Unduhan media langsung gagal ({str(direct_error)[:140]}). Fallback gallery-dl juga gagal ({str(fallback_error)[:140]})."
+                    ) from fallback_error
         else:
-            job_dir, files = _download_gallery_files(url, raw_indices)
+            items = _gallery_list_media(url, platform)
+            if not items:
+                raise RuntimeError("Extractor tidak menemukan daftar media publik untuk tautan ini.")
+            source_indices = _gallery_source_indices(items, raw_indices)
+            job_dir, files = _download_gallery_files(url, source_indices)
+            failures = _gallery_download_failures(items, raw_indices, source_indices, files)
+
         zip_requested = bool(payload.get("zip"))
         if zip_requested:
-            archive = job_dir / "petik-foto.zip"
+            archive = job_dir / "petik-media.zip"
             with zipfile.ZipFile(archive, "w", compression=zipfile.ZIP_STORED) as bundle:
                 for index, file_path in enumerate(files, 1):
                     suffix = file_path.suffix.lower()
-                    bundle.write(file_path, arcname=f"foto-{index:03d}{suffix}")
-            token = _store_file(archive, "petik-foto.zip")
-            job_dir = None  # The temporary archive folder is retained until its token expires.
+                    prefix = "video" if suffix in VIDEO_EXTENSIONS else "foto"
+                    bundle.write(file_path, arcname=f"{prefix}-{index:03d}{suffix}")
+            token = _store_file(archive, "petik-media.zip")
+            job_dir = None
             return {"status": "tunnel", "url": f"{_base_url(request)}/api/file/{token}",
-                    "filename": "petik-foto.zip", "count": len(files), "service": platform}
+                    "filename": "petik-media.zip", "count": len(files), "service": platform,
+                    "failedCount": len(failures), "failures": failures}
 
         file_results = []
-        for file_path in files:
+        for index, file_path in enumerate(files, 1):
             single_dir = Path(tempfile.mkdtemp(prefix="gallery-file-", dir=TEMP_ROOT))
-            target = single_dir / (file_path.name[:140] or f"foto{file_path.suffix.lower()}")
+            suffix = file_path.suffix.lower()
+            prefix = "video" if suffix in VIDEO_EXTENSIONS else "foto"
+            target = single_dir / (file_path.name[:140] or f"{prefix}-{index:03d}{suffix}")
             shutil.copy2(file_path, target)
             token = _store_file(target, target.name)
             file_results.append({"url": f"{_base_url(request)}/api/file/{token}", "filename": target.name})
         shutil.rmtree(job_dir, ignore_errors=True)
         job_dir = None
-        return {"status": "ready", "files": file_results, "count": len(file_results), "service": platform}
+        return {"status": "ready", "files": file_results, "count": len(file_results), "service": platform,
+                "failedCount": len(failures), "failures": failures}
     except ValueError as exc:
         return _error("error.api.gallery.selection", str(exc), 400)
     except Exception as exc:
