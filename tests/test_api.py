@@ -29,7 +29,7 @@ def test_health_endpoint_and_version():
     response = client.get("/health")
     assert response.status_code == 200
     assert response.json()["status"] == "healthy"
-    assert response.json()["version"] == "1.10.0"
+    assert response.json()["version"] == "1.11.0"
     assert "javascriptRuntime" in response.json()
     assert response.json()["youtubePoTokenProvider"] == "bgutil-http"
     assert isinstance(response.json()["youtubePoTokenProviderReady"], bool)
@@ -794,8 +794,8 @@ def test_instagram_public_fallback_uses_anonymous_graphql_session(monkeypatch):
 
 def test_health_reports_gallery_and_public_fallback_capabilities():
     body = client.get("/health").json()
-    assert body["version"] == "1.10.0"
-    assert body["youtubeClientFallbacks"] == ["web_safari", "web_embedded", "tv"] or body["youtubeClientFallbacks"] == ["mweb", "web_safari", "web_embedded", "tv"]
+    assert body["version"] == "1.11.0"
+    assert body["youtubeClientFallbacks"] == ["web_safari", "web_safari_hls", "web_embedded", "tv"] or body["youtubeClientFallbacks"] == ["mweb", "web_safari", "web_safari_hls", "web_embedded", "tv"]
     assert "youtubeDiagnostics" in body
     assert body["youtubeDiagnostics"]["tokenGenerationObserved"] in (True, False)
     assert "threads" in body["galleryPlatforms"]
@@ -1257,8 +1257,8 @@ def test_youtube_uses_mweb_with_bgutil_and_safe_diagnostics_when_ready(monkeypat
 def test_youtube_fallback_clients_are_selected_from_provider_state(monkeypatch):
     ready = api._youtube_client_candidates(True)
     unavailable = api._youtube_client_candidates(False)
-    assert ready == ["mweb", "web_safari", "web_embedded", "tv"]
-    assert unavailable == ["web_safari", "web_embedded", "tv"]
+    assert ready == ["mweb", "web_safari", "web_safari_hls", "web_embedded", "tv"]
+    assert unavailable == ["web_safari", "web_safari_hls", "web_embedded", "tv"]
 
 
 def test_youtube_safari_fallback_keeps_provider_available(monkeypatch):
@@ -1467,3 +1467,209 @@ def test_bgutil_provider_status_rejects_version_mismatch(monkeypatch):
     status = api._bgutil_provider_status()
     assert status["serverAvailable"] is True
     assert status["ready"] is False
+
+
+# v1.11 YouTube diagnostics, explicit HLS strategy, and local telemetry proxy tests.
+
+def test_health_exposes_v111_youtube_diagnostics_without_sensitive_fields():
+    payload = client.get("/health").json()
+    assert payload["version"] == "1.11.0"
+    assert "youtubePoTokenTelemetryAvailable" in payload
+    assert payload["youtubeForceIPv4"] is True
+    assert payload["youtubeWpc"]["runtimeEnabled"] is False
+    diagnostics = payload["youtubeDiagnostics"]
+    for key in (
+        "providerTelemetryAvailable", "providerRequestCount", "providerHttpSuccessCount",
+        "providerHttpFailureCount", "providerTokenResponseCount", "providerLastStatusCode",
+        "providerLastRequestAt", "providerLastTokenResponseAt", "rootCauseHint",
+    ):
+        assert key in diagnostics
+    forbidden = {"poToken", "cookies", "visitorData", "signedUrl", "sourceUrl"}
+    assert forbidden.isdisjoint(diagnostics)
+
+
+def test_youtube_hls_strategy_maps_to_web_safari_and_forces_ipv4(monkeypatch):
+    monkeypatch.setattr(api, "_bgutil_provider_status", lambda: {
+        "ready": True, "baseUrl": "http://127.0.0.1:4416",
+        "clientBaseUrl": "http://127.0.0.1:4417",
+    })
+    monkeypatch.setenv("YOUTUBE_FORCE_IPV4", "1")
+    options = api._yt_common_options("youtube", "web_safari_hls")
+    assert options["extractor_args"]["youtube"]["player_client"] == ["web_safari"]
+    assert options["extractor_args"]["youtubepot-bgutilhttp"]["base_url"] == ["http://127.0.0.1:4417"]
+    assert options["source_address"] == "0.0.0.0"
+
+
+def test_youtube_hls_strategy_requires_real_hls_protocol():
+    assert api._youtube_info_has_downloadable_formats({"formats": [
+        {"url": "https://cdn.example/video.mp4", "protocol": "https", "ext": "mp4"},
+        {"url": "https://cdn.example/manifest.m3u8", "protocol": "m3u8_native", "ext": "mp4"},
+    ]}, hls_only=True)
+    hls_only = {"formats": [
+        {"url": "https://cdn.example/manifest.m3u8", "protocol": "m3u8_native", "ext": "mp4"},
+    ]}
+    assert not api._youtube_info_has_downloadable_formats(hls_only, exclude_hls=True)
+    assert not api._youtube_info_has_downloadable_formats({"formats": [
+        {"url": "https://cdn.example/video.mp4", "protocol": "https", "ext": "mp4"},
+        {"url": "https://cdn.example/sabr", "protocol": "sabr", "ext": "mp4"},
+    ]}, hls_only=True)
+
+
+def test_youtube_hls_format_selector_respects_quality_and_requires_audio():
+    best = api._youtube_hls_format_selector("max")
+    assert "protocol^=m3u8" in best and "protocol^=hls" in best
+    assert "[vcodec!=none][acodec!=none]" in best
+    assert "/best[protocol^=m3u8]" not in best
+    limited = api._youtube_hls_format_selector("720")
+    assert limited.count("[height<=720]") == 2
+
+
+def test_youtube_root_cause_hint_distinguishes_provider_evidence():
+    assert api._youtube_root_cause_hint({
+        "lastErrorCode": "bot_check", "providerTelemetryAvailable": False,
+        "providerAdvertised": True,
+    }) == "provider_telemetry_unavailable_token_request_result_unknown"
+    assert "no_token_request" in api._youtube_root_cause_hint({
+        "lastErrorCode": "bot_check", "providerAdvertised": True,
+        "providerRequestCount": 0, "providerTokenResponseCount": 0,
+    })
+    assert "no_po_token_response" in api._youtube_root_cause_hint({
+        "lastErrorCode": "bot_check", "providerRequestsThisAttempt": 2,
+        "providerTokenResponsesThisAttempt": 0,
+    })
+    assert "possible_ip_or_session_restriction" in api._youtube_root_cause_hint({
+        "lastErrorCode": "bot_check", "providerRequestsThisAttempt": 2,
+        "providerTokenResponsesThisAttempt": 1,
+    })
+
+
+def test_refresh_youtube_provider_diagnostics_uses_aggregate_proxy_stats():
+    api._refresh_youtube_provider_diagnostics({
+        "telemetryAvailable": True,
+        "telemetry": {
+            "requestCount": 3, "httpSuccessCount": 2, "httpFailureCount": 1,
+            "tokenResponseCount": 2, "lastStatusCode": 502,
+            "lastRequestAt": "2026-11-28T06:00:00Z",
+            "lastTokenResponseAt": "2026-11-28T05:59:00Z",
+        },
+    })
+    state = api._youtube_diagnostics_snapshot()
+    assert state["providerTelemetryAvailable"] is True
+    assert state["providerRequestCount"] == 3
+    assert state["providerTokenResponseCount"] == 2
+    assert state["tokenGenerationObserved"] is True
+    assert state["providerLastStatusCode"] == 502
+
+
+def test_pot_telemetry_metrics_only_keep_aggregate_counts():
+    import pot_telemetry
+    metrics = pot_telemetry.Metrics()
+    metrics.record(200, True)
+    metrics.record(502, False)
+    snapshot = metrics.snapshot()
+    assert snapshot["requestCount"] == 2
+    assert snapshot["httpSuccessCount"] == 1
+    assert snapshot["httpFailureCount"] == 1
+    assert snapshot["tokenResponseCount"] == 1
+    assert snapshot["lastStatusCode"] == 502
+    assert "poToken" not in snapshot
+    assert "payload" not in snapshot
+
+
+def test_wpc_is_not_enabled_by_default_even_if_health_is_requested(monkeypatch):
+    monkeypatch.delenv("YOUTUBE_WPC_ENABLED", raising=False)
+    payload = client.get("/health").json()["youtubeWpc"]
+    assert payload["requested"] is False
+    assert payload["runtimeEnabled"] is False
+
+
+
+def test_pot_telemetry_proxy_forwards_request_and_counts_token_response():
+    import json
+    import threading
+    from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+    from urllib.request import Request, urlopen
+    import pot_telemetry
+
+    class FakeProvider(BaseHTTPRequestHandler):
+        def do_POST(self):
+            length = int(self.headers.get("Content-Length", "0"))
+            self.rfile.read(length)
+            body = json.dumps({"poToken": "never-store-this-value", "contentBinding": "x"}).encode()
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+        def log_message(self, *_args):
+            return
+
+    upstream = ThreadingHTTPServer(("127.0.0.1", 0), FakeProvider)
+    upstream_thread = threading.Thread(target=upstream.serve_forever, daemon=True)
+    upstream_thread.start()
+    metrics = pot_telemetry.Metrics()
+    proxy = ThreadingHTTPServer(("127.0.0.1", 0), pot_telemetry.make_handler(
+        f"http://127.0.0.1:{upstream.server_port}", metrics
+    ))
+    proxy_thread = threading.Thread(target=proxy.serve_forever, daemon=True)
+    proxy_thread.start()
+    try:
+        request = Request(
+            f"http://127.0.0.1:{proxy.server_port}/get_pot",
+            data=b'{"content_binding":"safe-test"}',
+            headers={"Content-Type": "application/json"}, method="POST",
+        )
+        with urlopen(request, timeout=3) as response:
+            returned = json.loads(response.read().decode())
+        assert returned["poToken"] == "never-store-this-value"
+        stats_request = Request(f"http://127.0.0.1:{proxy.server_port}/stats")
+        with urlopen(stats_request, timeout=3) as response:
+            stats = json.loads(response.read().decode())
+        assert stats["requestCount"] == 1
+        assert stats["httpSuccessCount"] == 1
+        assert stats["tokenResponseCount"] == 1
+        assert "never-store-this-value" not in json.dumps(stats)
+    finally:
+        proxy.shutdown(); proxy.server_close()
+        upstream.shutdown(); upstream.server_close()
+
+
+def test_extract_info_runs_web_safari_hls_as_separate_strategy_after_regular_safari_fails(monkeypatch):
+    monkeypatch.setattr(api, "youtube_client_cache", {})
+    monkeypatch.setattr(api, "_bgutil_provider_status", lambda: {
+        "ready": True, "baseUrl": "http://127.0.0.1:4416",
+    })
+    calls = []
+
+    class FakeYDL:
+        def __init__(self, options):
+            self.options = options
+        def __enter__(self):
+            return self
+        def __exit__(self, *args):
+            return False
+        def extract_info(self, url, download=False):
+            client = self.options["extractor_args"]["youtube"]["player_client"][0]
+            calls.append(client)
+            if client == "mweb":
+                raise RuntimeError("Sign in to confirm you're not a bot")
+            if client == "web_safari":
+                return {"id": "demo", "title": "Demo", "formats": [
+                    {"format_id": "hls", "url": "https://media.example/manifest.m3u8",
+                     "protocol": "m3u8_native", "ext": "mp4", "vcodec": "avc1", "acodec": "mp4a"}
+                ]}
+            raise AssertionError("later fallback should not be reached")
+
+    monkeypatch.setattr(api, "YoutubeDL", FakeYDL)
+    info = api._extract_info("https://youtu.be/abcdefghijk")
+    assert calls == ["mweb", "web_safari", "web_safari"]
+    assert info["_petik_youtube_client"] == "web_safari_hls"
+    diagnostics = api._youtube_diagnostics_snapshot()
+    assert diagnostics["lastStrategy"] == "web_safari_hls"
+    assert diagnostics["hlsFormatsObserved"] is True
+    assert any(
+        item["client"] == "web_safari" and item["outcome"] == "failed"
+        and item["errorCode"] == "no_downloadable_formats"
+        for item in diagnostics["clientOutcomes"]
+    )
+    assert "web_safari_hls" in diagnostics["attemptedClients"]
