@@ -32,6 +32,16 @@ services:
         value: "http://127.0.0.1:4417"
       - key: YOUTUBE_FORCE_IPV4
         value: "1"
+      - key: YOUTUBE_MIN_ATTEMPT_INTERVAL_SECONDS
+        value: "5"
+      - key: YOUTUBE_CLIENT_FALLBACK_INTERVAL_SECONDS
+        value: "2"
+      - key: YOUTUBE_RATE_LIMIT_COOLDOWN_SECONDS
+        value: "300"
+      - key: YOUTUBE_SLEEP_INTERVAL_REQUESTS
+        value: "1"
+      - key: YOUTUBE_INFO_CACHE_TTL_SECONDS
+        value: "45"
       - key: YOUTUBE_WPC_ENABLED
         value: "0"
       - key: YOUTUBE_POT_PROVIDER_MODE

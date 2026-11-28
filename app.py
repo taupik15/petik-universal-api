@@ -1,12 +1,14 @@
 from __future__ import annotations
 
 import os
+import copy
 import base64
 import binascii
 import ipaddress
 import re
 import json
 import logging
+import math
 import html as html_lib
 import shutil
 import secrets
@@ -36,7 +38,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 from yt_dlp import YoutubeDL
 
-APP_VERSION = "1.13.0"
+APP_VERSION = "1.14.0"
 MAX_GALLERY_ITEMS = max(1, min(30, int(os.getenv("MAX_GALLERY_ITEMS", "20"))))
 MAX_GALLERY_SOURCE_ITEMS = MAX_GALLERY_ITEMS * 2  # Mixed carousels can contain video entries between photos.
 MAX_GALLERY_FILE_BYTES = int(os.getenv("MAX_GALLERY_FILE_MB", "20")) * 1024 * 1024
@@ -112,10 +114,45 @@ preview_cache: dict[str, tuple[str, dict, float]] = {}
 
 # Only safe, non-sensitive YouTube diagnostics are retained in memory. Never
 # store source URLs, cookies, visitor data, PO Tokens, or signed media URLs.
-YOUTUBE_CLIENTS_WITH_PROVIDER = ("mweb", "web_safari")
-# web_safari_hls is a separate diagnostic strategy: same player client, but
-# download must select an HLS manifest rather than silently falling back to DASH.
-YOUTUBE_CLIENT_FALLBACKS = ("mweb", "web_safari", "web_safari_hls", "web_embedded", "tv")
+# yt-dlp 2026.11.23's maintained anonymous defaults are tv_samsung + visionos.
+# "default" delegates that set to yt-dlp so it can evolve with upstream releases.
+# mweb remains an explicit PO-token route when BgUtils/WPC is ready.
+YOUTUBE_CLIENTS_WITH_PROVIDER = ("mweb",)
+YOUTUBE_CLIENT_FALLBACKS = ("tv_samsung", "visionos", "web", "mweb", "web_embedded")
+YOUTUBE_EXTRA_CLIENT_ALLOWLIST = {
+    "tv_samsung", "visionos", "ios_producer", "web_safari", "tv_downgraded", "tv_simply"
+}
+def _bounded_env_float(name: str, default: float, minimum: float, maximum: float) -> float:
+    try:
+        value = float(os.getenv(name, str(default)))
+    except (TypeError, ValueError):
+        value = default
+    if not math.isfinite(value):
+        value = default
+    return max(minimum, min(maximum, value))
+
+
+def _bounded_env_int(name: str, default: int, minimum: int, maximum: int) -> int:
+    try:
+        value = int(os.getenv(name, str(default)))
+    except (TypeError, ValueError):
+        value = default
+    return max(minimum, min(maximum, value))
+
+
+YOUTUBE_MIN_ATTEMPT_INTERVAL_SECONDS = _bounded_env_float("YOUTUBE_MIN_ATTEMPT_INTERVAL_SECONDS", 5.0, 0.0, 60.0)
+YOUTUBE_CLIENT_FALLBACK_INTERVAL_SECONDS = _bounded_env_float("YOUTUBE_CLIENT_FALLBACK_INTERVAL_SECONDS", 2.0, 0.0, 30.0)
+YOUTUBE_RATE_LIMIT_COOLDOWN_SECONDS = _bounded_env_int("YOUTUBE_RATE_LIMIT_COOLDOWN_SECONDS", 300, 30, 3600)
+YOUTUBE_SLEEP_INTERVAL_REQUESTS = _bounded_env_float("YOUTUBE_SLEEP_INTERVAL_REQUESTS", 1.0, 0.0, 10.0)
+YOUTUBE_INFO_CACHE_TTL_SECONDS = _bounded_env_int("YOUTUBE_INFO_CACHE_TTL_SECONDS", 45, 0, 180)
+YOUTUBE_INFO_CACHE_MAX = 64
+YOUTUBE_RATE_LOCK = threading.Lock()
+YOUTUBE_NETWORK_PROBE_LOCK = threading.Lock()
+YOUTUBE_INFO_CACHE: dict[str, tuple[dict, float]] = {}
+youtube_last_attempt_monotonic = 0.0
+youtube_cooldown_until_monotonic = 0.0
+youtube_429_count = 0
+youtube_network_probe_last_monotonic = 0.0
 YOUTUBE_DIAGNOSTICS_LOCK = threading.Lock()
 YOUTUBE_DIAGNOSTICS = {
     "lastOutcome": "not-run",
@@ -150,6 +187,12 @@ YOUTUBE_DIAGNOSTICS = {
     "attemptStartedAt": None,
     "errorEvents": [],
     "httpStatus": None,
+    "http429Observed": False,
+    "lastHttp429Client": None,
+    "lastHttp429Stage": None,
+    "lastHttp429At": None,
+    "cooldownRemainingSeconds": 0,
+    "infoCacheHit": False,
     "providerMode": "bgutil",
     "updatedAt": None,
 }
@@ -347,7 +390,7 @@ def _bgutil_provider_status() -> dict:
         try:
             request = urllib.request.Request(
                 f"{base_url}/ping",
-                headers={"User-Agent": "Petik-Health/1.13.0"},
+                headers={"User-Agent": "Petik-Health/1.14.0"},
             )
             with urllib.request.urlopen(request, timeout=1.2) as response:
                 payload = json.loads(response.read(4096).decode("utf-8", errors="replace"))
@@ -360,7 +403,7 @@ def _bgutil_provider_status() -> dict:
         try:
             request = urllib.request.Request(
                 f"{telemetry_url}/stats",
-                headers={"User-Agent": "Petik-Health/1.13.0"},
+                headers={"User-Agent": "Petik-Health/1.14.0"},
             )
             with urllib.request.urlopen(request, timeout=0.8) as response:
                 candidate = json.loads(response.read(4096).decode("utf-8", errors="replace"))
@@ -475,6 +518,158 @@ def _youtube_error_code(message: str) -> str:
     return "extractor_error"
 
 
+def _youtube_rate_control_snapshot() -> dict:
+    now = time.monotonic()
+    with YOUTUBE_RATE_LOCK:
+        cooldown = max(0, int(round(youtube_cooldown_until_monotonic - now)))
+    return {
+        "minimumAttemptIntervalSeconds": YOUTUBE_MIN_ATTEMPT_INTERVAL_SECONDS,
+        "clientFallbackIntervalSeconds": YOUTUBE_CLIENT_FALLBACK_INTERVAL_SECONDS,
+        "cooldownSeconds": YOUTUBE_RATE_LIMIT_COOLDOWN_SECONDS,
+        "cooldownRemainingSeconds": cooldown,
+        "sleepBetweenExtractorRequestsSeconds": YOUTUBE_SLEEP_INTERVAL_REQUESTS,
+        "inspectCacheTtlSeconds": YOUTUBE_INFO_CACHE_TTL_SECONDS,
+    }
+
+
+def _activate_youtube_cooldown(client: str | None, stage: str | None) -> None:
+    global youtube_cooldown_until_monotonic, youtube_429_count
+    now = time.monotonic()
+    with YOUTUBE_RATE_LOCK:
+        youtube_cooldown_until_monotonic = max(
+            youtube_cooldown_until_monotonic, now + YOUTUBE_RATE_LIMIT_COOLDOWN_SECONDS
+        )
+        youtube_429_count += 1
+    _update_youtube_diagnostics(
+        http429Observed=True,
+        lastHttp429Client=client,
+        lastHttp429Stage=stage,
+        lastHttp429At=time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+        lastErrorCode="http_429",
+        lastErrorEvent="http_429",
+        lastErrorStage=stage or "http_429",
+        httpStatus=429,
+    )
+
+
+def _youtube_fallback_pause() -> None:
+    """Space distinct client attempts; the 429 path never reaches this pause."""
+    if YOUTUBE_CLIENT_FALLBACK_INTERVAL_SECONDS > 0:
+        time.sleep(YOUTUBE_CLIENT_FALLBACK_INTERVAL_SECONDS)
+
+
+def _youtube_request_gate(*, allow_recent_inspect_followup: bool = False) -> None:
+    """Honor cooldown and spacing; permit one immediate save after a fresh inspect."""
+    global youtube_last_attempt_monotonic
+    now = time.monotonic()
+    with YOUTUBE_RATE_LOCK:
+        remaining = youtube_cooldown_until_monotonic - now
+        if remaining > 0:
+            wait_for = 0.0
+        else:
+            wait_for = 0.0 if allow_recent_inspect_followup else max(
+                0.0, YOUTUBE_MIN_ATTEMPT_INTERVAL_SECONDS - (now - youtube_last_attempt_monotonic)
+            )
+    if remaining > 0:
+        seconds = max(1, int(round(remaining)))
+        _update_youtube_diagnostics(
+            lastOutcome="cooldown-blocked", lastStage="rate_limit_cooldown",
+            lastErrorCode="http_429", lastErrorEvent="http_429", lastErrorStage="rate_limit_cooldown",
+            httpStatus=429, cooldownRemainingSeconds=seconds,
+        )
+        raise RuntimeError(f"YouTube HTTP Error 429: permintaan ditahan sementara selama cooldown ({seconds} detik tersisa).")
+    if wait_for > 0:
+        time.sleep(wait_for)
+    with YOUTUBE_RATE_LOCK:
+        now = time.monotonic()
+        remaining = youtube_cooldown_until_monotonic - now
+        if remaining > 0:
+            seconds = max(1, int(round(remaining)))
+            _update_youtube_diagnostics(
+                lastOutcome="cooldown-blocked", lastStage="rate_limit_cooldown",
+                lastErrorCode="http_429", lastErrorEvent="http_429", lastErrorStage="rate_limit_cooldown",
+                httpStatus=429, cooldownRemainingSeconds=seconds,
+            )
+            raise RuntimeError(f"YouTube HTTP Error 429: permintaan ditahan sementara selama cooldown ({seconds} detik tersisa).")
+        youtube_last_attempt_monotonic = now
+    _update_youtube_diagnostics(cooldownRemainingSeconds=0)
+
+
+def _get_cached_youtube_info(url: str) -> dict | None:
+    if YOUTUBE_INFO_CACHE_TTL_SECONDS <= 0:
+        return None
+    now = time.monotonic()
+    with state_lock:
+        cached = YOUTUBE_INFO_CACHE.get(url)
+        if not cached:
+            return None
+        if cached[1] <= now:
+            YOUTUBE_INFO_CACHE.pop(url, None)
+            return None
+        return copy.deepcopy(cached[0])
+
+
+def _cache_youtube_info(url: str, info: dict) -> None:
+    if YOUTUBE_INFO_CACHE_TTL_SECONDS <= 0:
+        return
+    now = time.monotonic()
+    with state_lock:
+        for key, value in list(YOUTUBE_INFO_CACHE.items()):
+            if value[1] <= now:
+                YOUTUBE_INFO_CACHE.pop(key, None)
+        YOUTUBE_INFO_CACHE[url] = (copy.deepcopy(info), now + YOUTUBE_INFO_CACHE_TTL_SECONDS)
+        while len(YOUTUBE_INFO_CACHE) > YOUTUBE_INFO_CACHE_MAX:
+            YOUTUBE_INFO_CACHE.pop(next(iter(YOUTUBE_INFO_CACHE)))
+
+
+def _consume_youtube_inspect_cache(url: str) -> bool:
+    """Allow one immediate download following a successful inspection of this URL."""
+    now = time.monotonic()
+    with state_lock:
+        cached = YOUTUBE_INFO_CACHE.pop(url, None)
+    return bool(cached and cached[1] > now)
+
+
+def _youtube_safe_extractor_overrides() -> dict:
+    """Read optional, allowlisted test knobs without exposing secret values."""
+    result: dict = {}
+    host = os.getenv("YOUTUBE_INNERTUBE_HOST", "").strip().lower()
+    allowed_hosts = {"youtubei.googleapis.com", "www.youtube.com", "music.youtube.com", "studio.youtube.com"}
+    if host in allowed_hosts:
+        result["innertube_host"] = [host]
+    key = os.getenv("YOUTUBE_INNERTUBE_KEY", "").strip()
+    if key and len(key) <= 256 and re.fullmatch(r"[A-Za-z0-9._-]+", key):
+        result["innertube_key"] = [key]
+    raw_skip = os.getenv("YOUTUBE_PLAYER_SKIP", "")
+    skip_values = [item.strip().lower() for item in raw_skip.split(",") if item.strip()]
+    skip_values = [item for item in skip_values if item in {"configs", "webpage", "js", "initial_data"}]
+    if skip_values:
+        result["player_skip"] = sorted(set(skip_values))
+    visitor_data = os.getenv("YOUTUBE_VISITOR_DATA", "").strip()
+    if (
+        visitor_data and len(visitor_data) <= 512
+        and re.fullmatch(r"[A-Za-z0-9_-]+={0,2}", visitor_data)
+        and {"webpage", "configs"}.issubset(set(skip_values))
+        and not _youtube_cookie_configured()
+    ):
+        result["visitor_data"] = [visitor_data]
+    return result
+
+
+def _youtube_extra_clients() -> list[str]:
+    values = [item.strip().lower() for item in os.getenv("YOUTUBE_EXTRA_CLIENTS", "").split(",") if item.strip()]
+    return list(dict.fromkeys(item for item in values if item in YOUTUBE_EXTRA_CLIENT_ALLOWLIST))
+
+
+def _youtube_impersonate_target() -> str | None:
+    if not HAS_CURL_CFFI:
+        return None
+    value = os.getenv("YOUTUBE_HTTP_IMPERSONATE", "").strip().lower()
+    if re.fullmatch(r"(?:chrome|safari|firefox|edge)(?:[-_]?[0-9]{2,3})?", value):
+        return value
+    return None
+
+
 def _youtube_diagnostics_snapshot() -> dict:
     with YOUTUBE_DIAGNOSTICS_LOCK:
         return {
@@ -492,7 +687,7 @@ def _youtube_error_priority(code: str | None) -> int:
     return {
         None: 0, "extractor_error": 1, "timeout": 2, "http_5xx": 3,
         "no_downloadable_formats": 4, "no_hls_formats": 4, "http_403": 5,
-        "http_429": 6, "po_token": 7, "login_required": 8, "bot_check": 9,
+        "po_token": 7, "login_required": 8, "bot_check": 9, "http_429": 10,
     }.get(code, 2)
 
 
@@ -571,6 +766,7 @@ class _YtDlpDiagnosticLogger:
         self.first_error_stage: str | None = None
         self.first_error_code: str | None = None
         self.http_status: int | None = None
+        self.http_429_seen = False
         self.stage_events: list[dict] = []
 
     def _stage(self, stage: str, *, update_current: bool = True) -> None:
@@ -601,6 +797,13 @@ class _YtDlpDiagnosticLogger:
             self._stage("youtube_bot_check", update_current=False)
         if status is not None:
             self.http_status = status
+        if status == 429 or code == "http_429":
+            self.http_429_seen = True
+            _update_youtube_diagnostics(
+                http429Observed=True, lastHttp429Client=self.client,
+                lastHttp429Stage=self.last_stage,
+                lastHttp429At=time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+            )
         if _youtube_error_priority(code) > _youtube_error_priority(self.first_error_code):
             self.first_error_code = code
             self.first_error_stage = self.last_stage
@@ -672,6 +875,12 @@ def _begin_youtube_diagnostics_attempt(provider: dict, outcome: str) -> None:
         attemptStartedAt=time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
         errorEvents=[],
         httpStatus=None,
+        http429Observed=False,
+        lastHttp429Client=None,
+        lastHttp429Stage=None,
+        lastHttp429At=None,
+        infoCacheHit=False,
+        cooldownRemainingSeconds=_youtube_rate_control_snapshot()["cooldownRemainingSeconds"],
         providerMode=os.getenv("YOUTUBE_POT_PROVIDER_MODE", "bgutil").strip().lower(),
         lastOutcome=outcome,
         lastStage="attempt_started",
@@ -707,6 +916,8 @@ def _begin_youtube_diagnostics_attempt(provider: dict, outcome: str) -> None:
 def _youtube_root_cause_hint(diagnostics: dict) -> str | None:
     code = diagnostics.get("lastErrorCode")
     stage = diagnostics.get("lastErrorStage") or diagnostics.get("lastStage")
+    if diagnostics.get("http429Observed") or code == "http_429":
+        return "youtube_http_429_seen_stop_fallback_and_wait_for_process_cooldown"
     if code == "bot_check":
         if stage == "innertube_player_api":
             return "innertube_player_api_bot_check_before_format_delivery_possible_session_or_egress_reputation"
@@ -811,9 +1022,11 @@ def _youtube_client_candidates(
     provider_ready: bool, preferred: str | None = None, wpc_ready: bool = False
 ) -> list[str]:
     candidates = list(YOUTUBE_CLIENT_FALLBACKS)
-    if not (provider_ready or wpc_ready):
-        # mweb needs a registered provider for GVS PO Token requests.
+    if not (provider_ready or wpc_ready) and "mweb" in candidates:
         candidates.remove("mweb")
+    for extra in _youtube_extra_clients():
+        if extra not in candidates:
+            candidates.append(extra)
     if preferred in candidates:
         candidates.remove(preferred)
         candidates.insert(0, preferred)
@@ -912,22 +1125,38 @@ def _yt_common_options(platform: str | None = None, youtube_client: str | None =
         wpc = _wpc_status()
         provider_mode = os.getenv("YOUTUBE_POT_PROVIDER_MODE", "bgutil").strip().lower()
         wpc_selected = bool(wpc.get("runtimeEnabled") and provider_mode == "wpc")
-        strategy = youtube_client or ("mweb" if (provider.get("ready") or wpc_selected) else "web_safari")
+        strategy = youtube_client or ("mweb" if (provider.get("ready") or wpc_selected) else "tv_samsung")
         client = "web_safari" if strategy == "web_safari_hls" else strategy
-        extractor_args = {"youtube": {"player_client": [client]}}
+        youtube_args = {}
+        # Use one explicit client per Petik attempt. The yt-dlp "default" alias
+        # expands to multiple internal clients, which makes a precise stop on 429
+        # harder to enforce. Petik owns the sequential fallback order instead.
+        if client != "default":
+            youtube_args["player_client"] = [client]
+        youtube_args.update(_youtube_safe_extractor_overrides())
+        extractor_args = {"youtube": youtube_args} if youtube_args else {}
+        if "visitor_data" in youtube_args:
+            extractor_args["youtubetab"] = {"skip": ["webpage"]}
         if wpc_selected and wpc.get("browserPath"):
             # WPC is an external yt-dlp PO Token provider; its browser binary is
             # explicit to avoid relying on environment-specific auto-discovery.
             extractor_args["youtubepot-wpc"] = {"browser_path": [wpc["browserPath"]]}
         elif provider.get("ready") and client in YOUTUBE_CLIENTS_WITH_PROVIDER:
+            extractor_args.setdefault("youtube", {})
             extractor_args["youtubepot-bgutilhttp"] = {"base_url": [provider.get("clientBaseUrl") or provider["baseUrl"]]}
         if os.getenv("YOUTUBE_FORCE_IPV4", "1").strip() == "1":
             options["source_address"] = "0.0.0.0"
         cookie_file = _youtube_cookies_file()
         if cookie_file:
             options["cookiefile"] = cookie_file
+        if YOUTUBE_SLEEP_INTERVAL_REQUESTS > 0:
+            options["sleep_interval_requests"] = YOUTUBE_SLEEP_INTERVAL_REQUESTS
+        impersonate = _youtube_impersonate_target()
+        if impersonate:
+            options["impersonate"] = impersonate
+        if extractor_args:
+            options["extractor_args"] = extractor_args
         options.update({
-            "extractor_args": extractor_args,
             "logger": _YtDlpDiagnosticLogger(client),
             "verbose": True,
             # Warnings are routed through the filtered logger above; raw yt-dlp
@@ -943,7 +1172,15 @@ def _extract_info(url: str) -> dict:
         return _extract_info_impl(url)
     try:
         with YOUTUBE_ATTEMPT_LOCK:
-            return _extract_info_impl(url)
+            cached = _get_cached_youtube_info(url)
+            if cached is not None:
+                _update_youtube_diagnostics(infoCacheHit=True, lastOutcome="cache-hit", lastStage="inspect_cache")
+                return cached
+            _youtube_request_gate()
+            info = _extract_info_impl(url)
+            if isinstance(info, dict):
+                _cache_youtube_info(url, info)
+            return info
     finally:
         _cleanup_youtube_cookie_file()
 
@@ -1003,15 +1240,18 @@ def _extract_info_impl(url: str) -> dict:
                 break
             except Exception as exc:
                 last_exception = exc
-                code = _youtube_error_code(exc)
+                observed_429 = bool(getattr(diagnostic_logger, "http_429_seen", False))
+                code = "http_429" if observed_429 else _youtube_error_code(exc)
+                stage = "http_429" if observed_429 else getattr(diagnostic_logger, "last_stage", None)
+                is_rate_limited = observed_429 or code == "http_429"
+                if is_rate_limited:
+                    _activate_youtube_cooldown(client, stage or "http_429")
                 previous_client, previous_error_code = client, code
                 failures.append(f"{client}:{code}")
-                _record_youtube_attempt(
-                    client, "failed", code,
-                    stage=getattr(diagnostic_logger, "last_stage", None),
-                )
-                if index >= len(clients) - 1 or not _youtube_should_fallback(exc):
+                _record_youtube_attempt(client, "failed", code, stage=stage)
+                if is_rate_limited or index >= len(clients) - 1 or not _youtube_should_fallback(exc):
                     break
+                _youtube_fallback_pause()
         if info is None:
             detail = str(last_exception)[:240] if last_exception else "YouTube tidak mengembalikan media yang dapat diunduh."
             _finish_youtube_diagnostics(
@@ -2636,14 +2876,17 @@ def _download_media_impl(url: str, mode: str, quality: str) -> tuple[Path, str, 
             shutil.rmtree(job_dir, ignore_errors=True)
             if platform != "youtube":
                 raise
-            code = _youtube_error_code(exc)
+            observed_429 = bool(getattr(diagnostic_logger, "http_429_seen", False))
+            code = "http_429" if observed_429 else _youtube_error_code(exc)
+            stage = "http_429" if observed_429 else getattr(diagnostic_logger, "last_stage", None)
+            is_rate_limited = observed_429 or code == "http_429"
+            if is_rate_limited:
+                _activate_youtube_cooldown(str(client), stage or "http_429")
             previous_client, previous_error_code = str(client), code
-            _record_youtube_attempt(
-                str(client), "download-failed", code,
-                stage=getattr(diagnostic_logger, "last_stage", None),
-            )
-            if index >= len(clients) - 1 or not _youtube_should_fallback(exc):
+            _record_youtube_attempt(str(client), "download-failed", code, stage=stage)
+            if is_rate_limited or index >= len(clients) - 1 or not _youtube_should_fallback(exc):
                 break
+            _youtube_fallback_pause()
 
     if platform == "youtube":
         _finish_youtube_diagnostics("download-failed", _youtube_error_code(last_error))
@@ -2658,6 +2901,8 @@ def _download_media(url: str, mode: str, quality: str) -> tuple[Path, str, dict]
         return _download_media_impl(url, mode, quality)
     try:
         with YOUTUBE_ATTEMPT_LOCK:
+            followup = _consume_youtube_inspect_cache(url)
+            _youtube_request_gate(allow_recent_inspect_followup=followup)
             return _download_media_impl(url, mode, quality)
     finally:
         _cleanup_youtube_cookie_file()
@@ -2847,6 +3092,20 @@ def health():
             "recommendedForFreePlan": False,
         },
         "youtubeCookiesConfigured": _youtube_cookie_configured(),
+        "youtubeRateControl": _youtube_rate_control_snapshot(),
+        "youtubeHttpImpersonation": {
+            "available": HAS_CURL_CFFI,
+            "enabled": bool(_youtube_impersonate_target()),
+            "target": _youtube_impersonate_target(),
+        },
+        "youtubeExperimentalOptions": {
+            "playerSkip": _youtube_safe_extractor_overrides().get("player_skip", []),
+            "innertubeHostConfigured": "innertube_host" in _youtube_safe_extractor_overrides(),
+            "innertubeKeyConfigured": "innertube_key" in _youtube_safe_extractor_overrides(),
+            "visitorDataConfigured": "visitor_data" in _youtube_safe_extractor_overrides(),
+            "extraClients": _youtube_extra_clients(),
+        },
+        "renderRuntime": {"detected": os.getenv("RENDER", "").lower() == "true"},
         "youtubeClientFallbacks": _youtube_client_candidates(bool(pot_provider["ready"]), wpc_ready=wpc_ready),
         "youtubeDownloadFallbacks": _youtube_client_candidates(bool(pot_provider["ready"]), wpc_ready=wpc_ready),
         "youtubeDiagnostics": youtube_diagnostics,
@@ -2945,6 +3204,71 @@ def preview_media(request: Request, url: str):
             except Exception: pass
         preview_slots.release()
         return JSONResponse({"success": False, "error": str(exc)[:300]}, status_code=502)
+
+@app.get("/api/diagnostics/youtube-network")
+def youtube_network_diagnostics(request: Request):
+    """On-demand, fixed-destination reachability probe; no IP or response body is exposed."""
+    global youtube_network_probe_last_monotonic
+    if _rate_limited(_client_key(request)):
+        return _error("error.api.rate.limit", "Terlalu banyak permintaan diagnostik.", 429)
+    now = time.monotonic()
+    with YOUTUBE_NETWORK_PROBE_LOCK:
+        remaining = 120 - (now - youtube_network_probe_last_monotonic)
+        if remaining > 0:
+            return JSONResponse({
+                "success": False, "status": "cooldown",
+                "retryAfterSeconds": max(1, int(round(remaining))),
+                "message": "Tes jaringan YouTube dibatasi maksimal sekali setiap 120 detik.",
+            }, status_code=429)
+        youtube_network_probe_last_monotonic = now
+
+    checks = []
+    for label, target in (
+        ("youtube_watch", "https://www.youtube.com/generate_204"),
+        ("innertube_host", "https://youtubei.googleapis.com/"),
+    ):
+        started = time.monotonic()
+        status = None
+        outcome = "network_error"
+        try:
+            req = urllib.request.Request(
+                target,
+                headers={"User-Agent": "Mozilla/5.0 Petik-Network-Diagnostic/1.14.0", "Accept": "*/*"},
+                method="GET",
+            )
+            with urllib.request.urlopen(req, timeout=8) as response:
+                status = int(response.status)
+                outcome = "rate_limited" if status == 429 else "reachable"
+                response.read(1)
+        except urllib.error.HTTPError as exc:
+            status = int(exc.code)
+            outcome = "rate_limited" if status == 429 else "reachable"
+            try:
+                exc.close()
+            except Exception:
+                pass
+        except Exception:
+            outcome = "network_error"
+        checks.append({
+            "endpoint": label, "statusCode": status, "outcome": outcome,
+            "elapsedMs": max(0, int((time.monotonic() - started) * 1000)),
+        })
+        # A probe that receives 429 stops immediately; do not hit another
+        # YouTube endpoint after the upstream has already asked us to slow down.
+        if outcome == "rate_limited":
+            break
+    rate_limited = any(item["outcome"] == "rate_limited" for item in checks)
+    if rate_limited:
+        limited_endpoint = next((item["endpoint"] for item in checks if item["outcome"] == "rate_limited"), "youtube_network")
+        _activate_youtube_cooldown("network_probe", limited_endpoint)
+    reachable = all(item["outcome"] != "network_error" for item in checks)
+    return JSONResponse({
+        "success": reachable and not rate_limited,
+        "status": "rate_limited" if rate_limited else "reachable" if reachable else "network_error",
+        "checks": checks,
+        "note": "Status 4xx selain 429 hanya membuktikan host merespons; bukan bukti Player API dapat mengekstrak video.",
+    }, status_code=200 if reachable and not rate_limited else 503)
+
 
 @app.post("/api/inspect")
 def inspect_media(payload: dict, request: Request):
