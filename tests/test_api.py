@@ -29,7 +29,7 @@ def test_health_endpoint_and_version():
     response = client.get("/health")
     assert response.status_code == 200
     assert response.json()["status"] == "healthy"
-    assert response.json()["version"] == "1.9.0"
+    assert response.json()["version"] == "1.10.0"
     assert "javascriptRuntime" in response.json()
     assert response.json()["youtubePoTokenProvider"] == "bgutil-http"
     assert isinstance(response.json()["youtubePoTokenProviderReady"], bool)
@@ -794,7 +794,10 @@ def test_instagram_public_fallback_uses_anonymous_graphql_session(monkeypatch):
 
 def test_health_reports_gallery_and_public_fallback_capabilities():
     body = client.get("/health").json()
-    assert body["version"] == "1.9.0"
+    assert body["version"] == "1.10.0"
+    assert body["youtubeClientFallbacks"] == ["web_safari", "web_embedded", "tv"] or body["youtubeClientFallbacks"] == ["mweb", "web_safari", "web_embedded", "tv"]
+    assert "youtubeDiagnostics" in body
+    assert body["youtubeDiagnostics"]["tokenGenerationObserved"] in (True, False)
     assert "threads" in body["galleryPlatforms"]
     assert body["threadsPhotoResolver"] == "public-page-json"
     assert body["instagramPhotoResolver"] == "gallery-dl+logged-out-graphql+page-json"
@@ -1239,14 +1242,43 @@ def test_direct_audio_url_inferred_from_audio_extension_without_codec_fields():
     assert api._direct_media_urls(info, "soundcloud")["audio"] == "https://cdn.example/direct-track.mp3"
 
 
-def test_youtube_uses_mweb_only_when_bgutil_provider_is_ready(monkeypatch):
+def test_youtube_uses_mweb_with_bgutil_and_safe_diagnostics_when_ready(monkeypatch):
     monkeypatch.setattr(api, "_bgutil_provider_status", lambda: {
         "ready": True,
         "baseUrl": "http://127.0.0.1:4416",
     })
-    options = api._yt_common_options("youtube")
+    options = api._yt_common_options("youtube", "mweb")
     assert options["extractor_args"]["youtube"]["player_client"] == ["mweb"]
     assert options["extractor_args"]["youtubepot-bgutilhttp"]["base_url"] == ["http://127.0.0.1:4416"]
+    assert options["verbose"] is True
+    assert isinstance(options["logger"], api._YtDlpDiagnosticLogger)
+
+
+def test_youtube_fallback_clients_are_selected_from_provider_state(monkeypatch):
+    ready = api._youtube_client_candidates(True)
+    unavailable = api._youtube_client_candidates(False)
+    assert ready == ["mweb", "web_safari", "web_embedded", "tv"]
+    assert unavailable == ["web_safari", "web_embedded", "tv"]
+
+
+def test_youtube_safari_fallback_keeps_provider_available(monkeypatch):
+    monkeypatch.setattr(api, "_bgutil_provider_status", lambda: {
+        "ready": True,
+        "baseUrl": "http://127.0.0.1:4416",
+    })
+    options = api._yt_common_options("youtube", "web_safari")
+    assert options["extractor_args"]["youtube"]["player_client"] == ["web_safari"]
+    assert options["extractor_args"]["youtubepot-bgutilhttp"]["base_url"] == ["http://127.0.0.1:4416"]
+
+
+def test_youtube_embedded_fallback_does_not_request_bgutil_token(monkeypatch):
+    monkeypatch.setattr(api, "_bgutil_provider_status", lambda: {
+        "ready": True,
+        "baseUrl": "http://127.0.0.1:4416",
+    })
+    options = api._yt_common_options("youtube", "web_embedded")
+    assert options["extractor_args"]["youtube"]["player_client"] == ["web_embedded"]
+    assert "youtubepot-bgutilhttp" not in options["extractor_args"]
 
 
 def test_youtube_does_not_force_mweb_when_provider_is_unavailable(monkeypatch):
@@ -1255,7 +1287,126 @@ def test_youtube_does_not_force_mweb_when_provider_is_unavailable(monkeypatch):
         "baseUrl": "http://127.0.0.1:4416",
     })
     options = api._yt_common_options("youtube")
-    assert "extractor_args" not in options
+    assert options["extractor_args"]["youtube"]["player_client"] == ["web_safari"]
+    assert "youtubepot-bgutilhttp" not in options["extractor_args"]
+
+
+def test_youtube_diagnostic_logger_records_provider_and_token_without_raw_data(monkeypatch):
+    logger = api._YtDlpDiagnosticLogger("mweb")
+    logger.debug("[debug] [youtube] [pot] PO Token Providers: bgutil:http-2.0.2 (external)")
+    logger.debug("[youtube] [pot:bgutil:http] Generating a gvs PO Token for mweb client via bgutil HTTP server")
+    assert api.YOUTUBE_DIAGNOSTICS["providerAdvertised"] is True
+    assert api.YOUTUBE_DIAGNOSTICS["tokenGenerationObserved"] is True
+
+
+def test_youtube_retry_policy_only_retries_access_or_format_failures():
+    assert api._youtube_should_fallback(RuntimeError("Sign in to confirm you're not a bot"))
+    assert api._youtube_should_fallback(RuntimeError("HTTP Error 403: Forbidden"))
+    assert api._youtube_should_fallback(RuntimeError("Requested format is not available"))
+    assert not api._youtube_should_fallback(RuntimeError("Durasi melebihi batas"))
+
+
+def test_youtube_format_filter_rejects_drm_and_sabr_only():
+    assert not api._youtube_info_has_downloadable_formats({"formats": [
+        {"url": "https://media.example/a", "has_drm": True},
+        {"url": "https://media.example/b", "protocol": "sabr"},
+    ]})
+    assert api._youtube_info_has_downloadable_formats({"formats": [
+        {"url": "https://media.example/c", "protocol": "https", "has_drm": False},
+    ]})
+
+
+def test_extract_info_retries_youtube_with_web_safari_after_mweb_bot_check(monkeypatch):
+    monkeypatch.setattr(api, "_bgutil_provider_status", lambda: {
+        "ready": True,
+        "baseUrl": "http://127.0.0.1:4416",
+    })
+    calls = []
+
+    class FakeYDL:
+        def __init__(self, options):
+            self.options = options
+        def __enter__(self):
+            return self
+        def __exit__(self, *args):
+            return False
+        def extract_info(self, url, download=False):
+            client = self.options["extractor_args"]["youtube"]["player_client"][0]
+            calls.append(client)
+            if client == "mweb":
+                raise RuntimeError("Sign in to confirm you're not a bot")
+            return {"id": "demo", "title": "Demo", "formats": [
+                {"format_id": "18", "url": "https://media.example/demo.mp4", "ext": "mp4", "vcodec": "avc1", "acodec": "mp4a"}
+            ]}
+
+    monkeypatch.setattr(api, "YoutubeDL", FakeYDL)
+    info = api._extract_info("https://youtu.be/abcdefghijk")
+    assert calls == ["mweb", "web_safari"]
+    assert info["_petik_youtube_client"] == "web_safari"
+    assert api.YOUTUBE_DIAGNOSTICS["lastOutcome"] == "success"
+
+
+def test_extract_info_retries_when_client_returns_only_drm_or_sabr_formats(monkeypatch):
+    monkeypatch.setattr(api, "_bgutil_provider_status", lambda: {
+        "ready": True,
+        "baseUrl": "http://127.0.0.1:4416",
+    })
+    calls = []
+
+    class FakeYDL:
+        def __init__(self, options):
+            self.options = options
+        def __enter__(self):
+            return self
+        def __exit__(self, *args):
+            return False
+        def extract_info(self, url, download=False):
+            client = self.options["extractor_args"]["youtube"]["player_client"][0]
+            calls.append(client)
+            if client == "mweb":
+                return {"id": "demo", "title": "Demo", "formats": [
+                    {"format_id": "sabr", "url": "https://media.example/sabr", "protocol": "sabr"},
+                    {"format_id": "drm", "url": "https://media.example/drm", "has_drm": True},
+                ]}
+            return {"id": "demo", "title": "Demo", "formats": [
+                {"format_id": "18", "url": "https://media.example/demo.mp4", "ext": "mp4"}
+            ]}
+
+    monkeypatch.setattr(api, "YoutubeDL", FakeYDL)
+    info = api._extract_info("https://youtu.be/formatfallback123")
+    assert calls == ["mweb", "web_safari"]
+    assert info["_petik_youtube_client"] == "web_safari"
+
+
+def test_download_media_retries_youtube_with_next_client(monkeypatch, tmp_path):
+    monkeypatch.setattr(api, "_bgutil_provider_status", lambda: {
+        "ready": True,
+        "baseUrl": "http://127.0.0.1:4416",
+    })
+    calls = []
+
+    class FakeYDL:
+        def __init__(self, options):
+            self.options = options
+        def __enter__(self):
+            return self
+        def __exit__(self, *args):
+            return False
+        def extract_info(self, url, download=False):
+            client = self.options["extractor_args"]["youtube"]["player_client"][0]
+            calls.append(client)
+            if client == "mweb":
+                raise RuntimeError("Sign in to confirm you're not a bot")
+            output = Path(self.options["outtmpl"].replace("%(id)s.%(ext)s", "demo.mp4"))
+            output.write_bytes(b"demo-video")
+            return {"id": "demo", "title": "Demo"}
+
+    monkeypatch.setattr(api, "YoutubeDL", FakeYDL)
+    path, filename, info = api._download_media("https://youtu.be/zyxwvutsrqp", "video", "max")
+    assert calls == ["mweb", "web_safari"]
+    assert path.exists() and path.read_bytes() == b"demo-video"
+    assert filename == "Demo.mp4"
+    assert info["id"] == "demo"
 
 
 def test_bgutil_status_is_disabled_without_network_when_flag_is_off(monkeypatch):
@@ -1273,6 +1424,16 @@ def test_youtube_error_explains_po_token_and_ip_restrictions():
     payload = json.loads(response.body.decode("utf-8"))
     assert payload["error"]["code"] == "error.api.youtube.restricted"
     assert "IP server Petik" in payload["error"]["context"]["message"]
+
+
+
+
+def test_youtube_error_explains_embargoed_or_login_required_video():
+    import json
+    response = api._extract_error(RuntimeError("YouTube gagal pada client yang diuji (mweb:login_required). LOGIN_REQUIRED"), "youtube")
+    payload = json.loads(response.body.decode("utf-8"))
+    assert payload["error"]["code"] == "error.api.youtube.restricted"
+    assert "privat" in payload["error"]["context"]["message"].lower()
 
 
 def test_bgutil_provider_status_requires_matching_plugin_and_server(monkeypatch):
