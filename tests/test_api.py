@@ -29,8 +29,10 @@ def test_health_endpoint_and_version():
     response = client.get("/health")
     assert response.status_code == 200
     assert response.json()["status"] == "healthy"
-    assert response.json()["version"] == "1.8.0"
+    assert response.json()["version"] == "1.9.0"
     assert "javascriptRuntime" in response.json()
+    assert response.json()["youtubePoTokenProvider"] == "bgutil-http"
+    assert isinstance(response.json()["youtubePoTokenProviderReady"], bool)
     assert response.json()["mixedMediaAvailable"] is True
     assert response.json()["maxGalleryVideoMB"] >= 1
 
@@ -792,7 +794,7 @@ def test_instagram_public_fallback_uses_anonymous_graphql_session(monkeypatch):
 
 def test_health_reports_gallery_and_public_fallback_capabilities():
     body = client.get("/health").json()
-    assert body["version"] == "1.8.0"
+    assert body["version"] == "1.9.0"
     assert "threads" in body["galleryPlatforms"]
     assert body["threadsPhotoResolver"] == "public-page-json"
     assert body["instagramPhotoResolver"] == "gallery-dl+logged-out-graphql+page-json"
@@ -1235,3 +1237,72 @@ def test_direct_video_url_not_returned_for_video_only_dash_or_hls_formats():
 def test_direct_audio_url_inferred_from_audio_extension_without_codec_fields():
     info = {"url": "https://cdn.example/direct-track.mp3", "ext": "mp3"}
     assert api._direct_media_urls(info, "soundcloud")["audio"] == "https://cdn.example/direct-track.mp3"
+
+
+def test_youtube_uses_mweb_only_when_bgutil_provider_is_ready(monkeypatch):
+    monkeypatch.setattr(api, "_bgutil_provider_status", lambda: {
+        "ready": True,
+        "baseUrl": "http://127.0.0.1:4416",
+    })
+    options = api._yt_common_options("youtube")
+    assert options["extractor_args"]["youtube"]["player_client"] == ["mweb"]
+    assert options["extractor_args"]["youtubepot-bgutilhttp"]["base_url"] == ["http://127.0.0.1:4416"]
+
+
+def test_youtube_does_not_force_mweb_when_provider_is_unavailable(monkeypatch):
+    monkeypatch.setattr(api, "_bgutil_provider_status", lambda: {
+        "ready": False,
+        "baseUrl": "http://127.0.0.1:4416",
+    })
+    options = api._yt_common_options("youtube")
+    assert "extractor_args" not in options
+
+
+def test_bgutil_status_is_disabled_without_network_when_flag_is_off(monkeypatch):
+    monkeypatch.setenv("BGUTIL_POT_PROVIDER_ENABLED", "0")
+    monkeypatch.setattr(api.urllib.request, "urlopen", lambda *a, **k: (_ for _ in ()).throw(AssertionError("network should not be used")))
+    status = api._bgutil_provider_status()
+    assert status["enabled"] is False
+    assert status["ready"] is False
+    assert status["serverAvailable"] is False
+
+
+def test_youtube_error_explains_po_token_and_ip_restrictions():
+    import json
+    response = api._extract_error(RuntimeError("Sign in to confirm you're not a bot"), "youtube")
+    payload = json.loads(response.body.decode("utf-8"))
+    assert payload["error"]["code"] == "error.api.youtube.restricted"
+    assert "IP server Petik" in payload["error"]["context"]["message"]
+
+
+def test_bgutil_provider_status_requires_matching_plugin_and_server(monkeypatch):
+    import importlib.metadata
+    import io
+
+    monkeypatch.setenv("BGUTIL_POT_PROVIDER_ENABLED", "1")
+    monkeypatch.setattr(importlib.metadata, "version", lambda _name: "2.0.2")
+    monkeypatch.setattr(
+        api.urllib.request,
+        "urlopen",
+        lambda *a, **k: io.BytesIO(b'{"version":"2.0.2","server_uptime":12}'),
+    )
+    status = api._bgutil_provider_status()
+    assert status["ready"] is True
+    assert status["pluginVersion"] == "2.0.2"
+    assert status["serverVersion"] == "2.0.2"
+
+
+def test_bgutil_provider_status_rejects_version_mismatch(monkeypatch):
+    import importlib.metadata
+    import io
+
+    monkeypatch.setenv("BGUTIL_POT_PROVIDER_ENABLED", "1")
+    monkeypatch.setattr(importlib.metadata, "version", lambda _name: "2.0.2")
+    monkeypatch.setattr(
+        api.urllib.request,
+        "urlopen",
+        lambda *a, **k: io.BytesIO(b'{"version":"2.0.1","server_uptime":12}'),
+    )
+    status = api._bgutil_provider_status()
+    assert status["serverAvailable"] is True
+    assert status["ready"] is False
