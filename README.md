@@ -1,6 +1,6 @@
 # Petik Universal Extractor API
 
-Backend Petik v1.6.3 berbasis FastAPI, yt-dlp, gallery-dl, curl-cffi (fallback Instagram), Deno/EJS, HTTPX, dan FFmpeg. API mendukung dua pola:
+Backend Petik v1.7.0 berbasis FastAPI, yt-dlp, gallery-dl, curl-cffi (fallback Instagram), Deno/EJS, HTTPX, dan FFmpeg. API mendukung dua pola:
 
 - Native Petik: `POST /api/inspect` memeriksa metadata, format video/audio, dan galeri foto; `POST /api/download` memproses video/audio.
 - Galeri foto: `POST /api/gallery/download` mengunduh indeks foto terpilih sebagai file individual atau satu ZIP.
@@ -13,7 +13,7 @@ Backend Petik v1.6.3 berbasis FastAPI, yt-dlp, gallery-dl, curl-cffi (fallback I
 3. Pastikan `Dockerfile`, `app.py`, `requirements.txt`, dan `render.yaml` berada langsung di root.
 4. Di Render, buka Blueprint `petik-universal-api`, lalu jalankan Manual Sync / Apply jika diminta.
 5. Tunggu deploy berstatus **Live**.
-6. Tes `https://NAMA-LAYANAN.onrender.com/health`; versi yang baru harus menampilkan `1.6.3`, `galleryDlAvailable: true`, serta `galleryDlVersion` yang terdeteksi.
+6. Tes `https://NAMA-LAYANAN.onrender.com/health`; versi yang baru harus menampilkan `1.7.0`, `galleryDlAvailable: true`, serta `galleryDlVersion` yang terdeteksi.
 7. Tes URL root `/`; daftar `cobalt.services` harus memuat layanan yang ditawarkan.
 
 ## Platform dan batas dukungan
@@ -85,3 +85,12 @@ Folder `tests/` berisi 61 tes offline untuk validasi platform, endpoint inspect 
 - yt-dlp tidak lagi dikunci ke satu versi, dan diperbarui otomatis tiap container hidup (matikan dengan `YTDLP_AUTO_UPDATE=0`). `/health` menampilkan `ytdlpVersion`.
 - Unduhan bersamaan default 2 dan batas 40 permintaan per 5 menit. Kalau Render Free kehabisan memori (out of memory di log), kembalikan `MAX_CONCURRENT_DOWNLOADS` ke 1.
 - Pratinjau punya slot dan batas sendiri.
+
+
+## Perubahan v1.7.0 (direct media URLs)
+
+- Menambahkan `directUrls.video` dan `directUrls.audio` di respons `/api/inspect`.
+- URL direct dipilih dari progressive media yang benar-benar dapat dibuka sebagai berkas media; stream video-only/audio-only tidak dipasarkan sebagai video lengkap.
+- Direct URL tetap diberikan terpisah dari proses `/api/download`, sehingga frontend dapat menampilkannya meskipun proses unduhan Petik gagal.
+- Validasi direct URL menolak skema selain HTTP(S), kredensial URL, host localhost/internal, dan alamat IP non-global.
+- Pemilihan audio direct hanya menggunakan stream audio-only yang dikenali.

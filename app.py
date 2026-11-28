@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import ipaddress
 import re
 import json
 import html as html_lib
@@ -32,7 +33,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 from yt_dlp import YoutubeDL
 
-APP_VERSION = "1.6.3"
+APP_VERSION = "1.7.0"
 MAX_GALLERY_ITEMS = max(1, min(30, int(os.getenv("MAX_GALLERY_ITEMS", "20"))))
 MAX_GALLERY_SOURCE_ITEMS = MAX_GALLERY_ITEMS * 2  # Mixed carousels can contain video entries between photos.
 MAX_GALLERY_FILE_BYTES = int(os.getenv("MAX_GALLERY_FILE_MB", "20")) * 1024 * 1024
@@ -314,11 +315,23 @@ def _available_options(info: dict, platform: str) -> tuple[list[dict], list[dict
 
 
 def _safe_preview_url(value) -> str | None:
-    if not isinstance(value, str):
+    """Accept only public HTTP(S) media URLs suitable for browser direct links."""
+    if not isinstance(value, str) or len(value) > 8192:
         return None
     try:
-        parsed = urlparse(value)
-        return value if parsed.scheme in {"http", "https"} and parsed.hostname else None
+        parsed = urlparse(value.strip())
+        if parsed.scheme not in {"http", "https"} or not parsed.hostname or parsed.username or parsed.password:
+            return None
+        host = parsed.hostname.rstrip(".").lower()
+        if host == "localhost" or host.endswith((".localhost", ".local", ".internal", ".test")):
+            return None
+        try:
+            address = ipaddress.ip_address(host)
+        except ValueError:
+            address = None
+        if address is not None and not address.is_global:
+            return None
+        return value.strip()
     except Exception:
         return None
 
@@ -361,6 +374,40 @@ def _preview_url(info: dict, platform: str) -> str | None:
             and ext not in {"mp3", "m4a", "aac", "wav", "flac", "ogg", "opus", "m3u8", "mpd"}:
         return root_url
     return None
+
+
+def _direct_media_urls(info: dict | None, platform: str) -> dict[str, str | None]:
+    """Return independently usable progressive media URLs, even if Petik's save pipeline later fails."""
+    if not isinstance(info, dict):
+        return {"video": None, "audio": None}
+
+    video_url = _preview_url(info, platform)
+    audio_candidates: list[tuple[int, str]] = []
+    audio_extensions = {"mp3", "m4a", "aac", "wav", "flac", "ogg", "opus", "weba", "webm"}
+    for fmt in _media_formats(info):
+        direct = _safe_preview_url(fmt.get("url"))
+        if not direct:
+            continue
+        ext = str(fmt.get("ext") or "").lower()
+        protocol = str(fmt.get("protocol") or "").lower()
+        if ext in {"m3u8", "mpd"} or "m3u8" in protocol or "dash" in protocol:
+            continue
+        acodec, vcodec = fmt.get("acodec"), fmt.get("vcodec")
+        audio_only = _is_none_codec(vcodec) and _codec_present(acodec)
+        if not audio_only and vcodec is None and ext in audio_extensions:
+            audio_only = True
+        if audio_only and (ext in audio_extensions or not ext):
+            rank = 0 if ext in {"mp3", "m4a"} else 1
+            audio_candidates.append((rank, direct))
+
+    if not audio_candidates:
+        root_url = _safe_preview_url(info.get("url"))
+        ext = str(info.get("ext") or "").lower()
+        if root_url and ext in audio_extensions and (info.get("vcodec") is None or _is_none_codec(info.get("vcodec"))):
+            audio_candidates.append((0 if ext in {"mp3", "m4a"} else 1, root_url))
+
+    audio_url = sorted(audio_candidates, key=lambda item: item[0])[0][1] if audio_candidates else None
+    return {"video": video_url, "audio": audio_url}
 
 
 def _safe_thumbnail(info: dict) -> str | None:
@@ -1337,6 +1384,7 @@ def _inspect_payload(url: str, platform: str) -> dict:
         "duration": (info or {}).get("duration"),
         "thumbnail": _safe_thumbnail(info or {}) or (photo_items[0]["thumbnail"] if photo_items else None),
         "previewUrl": _preview_url(info, platform) if info else None,
+        "directUrls": _direct_media_urls(info, platform),
         "videoOptions": videos,
         "audioOptions": audios,
         "photoItems": photo_items,
