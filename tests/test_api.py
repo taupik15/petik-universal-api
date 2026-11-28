@@ -48,7 +48,7 @@ def test_health_endpoint_and_version():
     response = client.get("/health")
     assert response.status_code == 200
     assert response.json()["status"] == "healthy"
-    assert response.json()["version"] == "1.17.1"
+    assert response.json()["version"] == "1.17.2"
     assert "javascriptRuntime" in response.json()
     assert response.json()["youtubePoTokenProvider"] == "bgutil-http"
     assert isinstance(response.json()["youtubePoTokenProviderReady"], bool)
@@ -818,7 +818,7 @@ def test_instagram_public_fallback_uses_anonymous_graphql_session(monkeypatch):
 
 def test_health_reports_gallery_and_public_fallback_capabilities():
     body = client.get("/health").json()
-    assert body["version"] == "1.17.1"
+    assert body["version"] == "1.17.2"
     assert body["youtubeClientFallbacks"] in (
         ["tv_samsung", "visionos", "web", "web_embedded"],
         ["tv_samsung", "visionos", "web", "mweb", "web_embedded"],
@@ -1533,7 +1533,7 @@ def test_bgutil_provider_status_rejects_version_mismatch(monkeypatch):
 
 def test_health_exposes_v111_youtube_diagnostics_without_sensitive_fields():
     payload = client.get("/health").json()
-    assert payload["version"] == "1.17.1"
+    assert payload["version"] == "1.17.2"
     assert "youtubePoTokenTelemetryAvailable" in payload
     assert payload["youtubeForceIPv4"] is True
     assert payload["youtubeWpc"]["runtimeEnabled"] is False
