@@ -28,6 +28,21 @@ RUN git clone --depth 1 --single-branch --branch "${BGUTIL_PROVIDER_VERSION}" \
     && cd /opt/bgutil-ytdlp-pot-provider/server \
     && deno install --allow-scripts=npm:canvas --frozen
 
+# Optional free egress for YouTube: Cloudflare WARP exposed as a local SOCKS5
+# proxy (wgcf registers a WARP identity, wireproxy runs it in userspace, so no
+# NET_ADMIN/privileged mode is needed on Render). Only used when
+# YOUTUBE_WARP_ENABLED=1.
+ARG WGCF_VERSION=2.3.1
+ARG WIREPROXY_VERSION=1.1.3
+RUN ARCH="$(dpkg --print-architecture)" \
+    && curl -fsSL -o /usr/local/bin/wgcf \
+       "https://github.com/ViRb3/wgcf/releases/download/v${WGCF_VERSION}/wgcf_${WGCF_VERSION}_linux_${ARCH}" \
+    && chmod 755 /usr/local/bin/wgcf \
+    && curl -fsSL "https://github.com/windtf/wireproxy/releases/download/v${WIREPROXY_VERSION}/wireproxy_linux_${ARCH}.tar.gz" \
+       | tar -xz -C /usr/local/bin wireproxy \
+    && chmod 755 /usr/local/bin/wireproxy \
+    && wgcf --help >/dev/null && wireproxy -v
+
 WORKDIR /app
 COPY requirements.txt ./requirements.txt
 RUN pip install --no-cache-dir -r requirements.txt

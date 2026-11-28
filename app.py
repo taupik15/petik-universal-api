@@ -38,7 +38,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 from yt_dlp import YoutubeDL
 
-APP_VERSION = "1.15.0"
+APP_VERSION = "1.16.0"
 MAX_GALLERY_ITEMS = max(1, min(30, int(os.getenv("MAX_GALLERY_ITEMS", "20"))))
 MAX_GALLERY_SOURCE_ITEMS = MAX_GALLERY_ITEMS * 2  # Mixed carousels can contain video entries between photos.
 MAX_GALLERY_FILE_BYTES = int(os.getenv("MAX_GALLERY_FILE_MB", "20")) * 1024 * 1024
@@ -155,6 +155,69 @@ YOUTUBE_RETRY_OPTIONS = {
     "file_access_retries": 0,
     "concurrent_fragment_downloads": 1,
 }
+
+YOUTUBE_PROXY_SCHEMES = {"http", "https", "socks4", "socks5", "socks5h"}
+
+
+def _youtube_proxy() -> str | None:
+    """Optional egress proxy for YouTube only (e.g. Cloudflare WARP via wireproxy).
+
+    YouTube rate-limits shared datacenter IPs such as Render Free. Routing only
+    YouTube through another egress IP leaves every other extractor untouched.
+    Googlevideo URLs are bound to the IP that requested them, so previews and
+    downloads for YouTube must use the same proxy as extraction.
+    """
+    value = os.getenv("YOUTUBE_PROXY", "").strip()
+    if not value:
+        return None
+    try:
+        parsed = urlparse(value)
+    except ValueError:
+        return None
+    if parsed.scheme.lower() not in YOUTUBE_PROXY_SCHEMES or not parsed.hostname:
+        return None
+    return value
+
+
+def _youtube_proxy_kind() -> str | None:
+    proxy = _youtube_proxy()
+    if not proxy:
+        return None
+    host = (urlparse(proxy).hostname or "").lower()
+    return "warp" if host in {"127.0.0.1", "localhost"} and os.getenv("YOUTUBE_WARP_ACTIVE") == "1" else "custom"
+
+
+class _HttpxUpstream:
+    """Minimal urllib-like response wrapper so /api/preview can stream through a proxy."""
+
+    def __init__(self, url: str, headers: dict, proxy: str, timeout: float = 30.0):
+        self._client = httpx.Client(proxy=proxy, timeout=httpx.Timeout(timeout, connect=15.0), follow_redirects=True)
+        try:
+            request = self._client.build_request("GET", url, headers=headers)
+            self._response = self._client.send(request, stream=True)
+        except Exception:
+            self._client.close()
+            raise
+        self.status = self._response.status_code
+        self.headers = self._response.headers
+        self._iter = self._response.iter_raw(256 * 1024)
+        self._buffer = b""
+
+    def read(self, size: int = 262144) -> bytes:
+        if self._buffer:
+            chunk, self._buffer = self._buffer[:size], self._buffer[size:]
+            return chunk
+        try:
+            return next(self._iter)
+        except StopIteration:
+            return b""
+
+    def close(self) -> None:
+        try:
+            self._response.close()
+        finally:
+            self._client.close()
+
 YOUTUBE_RATE_LOCK = threading.Lock()
 YOUTUBE_NETWORK_PROBE_LOCK = threading.Lock()
 YOUTUBE_INFO_CACHE: dict[str, tuple[dict, float]] = {}
@@ -399,7 +462,7 @@ def _bgutil_provider_status() -> dict:
         try:
             request = urllib.request.Request(
                 f"{base_url}/ping",
-                headers={"User-Agent": "Petik-Health/1.15.0"},
+                headers={"User-Agent": "Petik-Health/1.16.0"},
             )
             with urllib.request.urlopen(request, timeout=1.2) as response:
                 payload = json.loads(response.read(4096).decode("utf-8", errors="replace"))
@@ -412,7 +475,7 @@ def _bgutil_provider_status() -> dict:
         try:
             request = urllib.request.Request(
                 f"{telemetry_url}/stats",
-                headers={"User-Agent": "Petik-Health/1.15.0"},
+                headers={"User-Agent": "Petik-Health/1.16.0"},
             )
             with urllib.request.urlopen(request, timeout=0.8) as response:
                 candidate = json.loads(response.read(4096).decode("utf-8", errors="replace"))
@@ -1154,7 +1217,10 @@ def _yt_common_options(platform: str | None = None, youtube_client: str | None =
         elif provider.get("ready") and client in YOUTUBE_CLIENTS_WITH_PROVIDER:
             extractor_args.setdefault("youtube", {})
             extractor_args["youtubepot-bgutilhttp"] = {"base_url": [provider.get("clientBaseUrl") or provider["baseUrl"]]}
-        if os.getenv("YOUTUBE_FORCE_IPV4", "1").strip() == "1":
+        proxy = _youtube_proxy()
+        if proxy:
+            options["proxy"] = proxy
+        elif os.getenv("YOUTUBE_FORCE_IPV4", "1").strip() == "1":
             options["source_address"] = "0.0.0.0"
         cookie_file = _youtube_cookies_file()
         if cookie_file:
@@ -3123,6 +3189,7 @@ def health():
             "recommendedForFreePlan": False,
         },
         "youtubeCookiesConfigured": _youtube_cookie_configured(),
+        "youtubeProxy": {"configured": bool(_youtube_proxy()), "kind": _youtube_proxy_kind(), "scheme": (urlparse(_youtube_proxy()).scheme if _youtube_proxy() else None)},
         "youtubeRateControl": _youtube_rate_control_snapshot(),
         "youtubeRequestPolicy": {
             "retries": YOUTUBE_RETRY_OPTIONS["retries"],
@@ -3209,11 +3276,15 @@ def preview_media(request: Request, url: str):
         range_header = request.headers.get("range")
         if range_header:
             headers["Range"] = range_header
-        req = urllib.request.Request(media_url, headers=headers, method="GET")
-        try:
-            upstream = urllib.request.urlopen(req, timeout=30)
-        except urllib.error.HTTPError as exc:
-            upstream = exc
+        yt_proxy = _youtube_proxy() if _platform == "youtube" else None
+        if yt_proxy:
+            upstream = _HttpxUpstream(media_url, headers, yt_proxy)
+        else:
+            req = urllib.request.Request(media_url, headers=headers, method="GET")
+            try:
+                upstream = urllib.request.urlopen(req, timeout=30)
+            except urllib.error.HTTPError as exc:
+                upstream = exc
         status = getattr(upstream, "status", 200)
         content_type = upstream.headers.get("Content-Type", "video/mp4")
         response_headers = {
@@ -3272,7 +3343,7 @@ def youtube_network_diagnostics(request: Request):
         try:
             req = urllib.request.Request(
                 target,
-                headers={"User-Agent": "Mozilla/5.0 Petik-Network-Diagnostic/1.15.0", "Accept": "*/*"},
+                headers={"User-Agent": "Mozilla/5.0 Petik-Network-Diagnostic/1.16.0", "Accept": "*/*"},
                 method="GET",
             )
             with urllib.request.urlopen(req, timeout=8) as response:

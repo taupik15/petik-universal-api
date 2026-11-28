@@ -14,6 +14,53 @@ BGUTIL_UPSTREAM="${BGUTIL_POT_PROVIDER_URL:-http://${BGUTIL_HOST}:${BGUTIL_PORT}
 cd "$APP_DIR"
 BGUTIL_READY=0
 
+# --- Optional Cloudflare WARP egress for YouTube (YOUTUBE_WARP_ENABLED=1) ---
+# Render Free shares datacenter IPs that YouTube answers with HTTP 429. When
+# enabled, a userspace WireGuard tunnel exposes SOCKS5 on 127.0.0.1 and the API
+# routes only YouTube traffic through it. Any failure here falls back to direct.
+WARP_PORT="${WARP_SOCKS_PORT:-40000}"
+if [ "${YOUTUBE_WARP_ENABLED:-0}" = "1" ] && [ -z "${YOUTUBE_PROXY:-}" ] \
+   && command -v wgcf >/dev/null 2>&1 && command -v wireproxy >/dev/null 2>&1; then
+  echo "[Petik] Preparing Cloudflare WARP tunnel for YouTube"
+  WARP_DIR=/tmp/warp
+  mkdir -p "$WARP_DIR" && cd "$WARP_DIR" || true
+  WARP_OK=0
+  if [ -n "${WGCF_ACCOUNT_TOML_B64:-}" ]; then
+    printf '%s' "$WGCF_ACCOUNT_TOML_B64" | base64 -d > wgcf-account.toml 2>/dev/null || rm -f wgcf-account.toml
+  fi
+  n=0
+  while [ "$n" -lt 3 ] && [ ! -s wgcf-account.toml ]; do
+    wgcf register --accept-tos >/tmp/petik-wgcf.log 2>&1 || sleep 3
+    n=$((n + 1))
+  done
+  if [ -s wgcf-account.toml ] && wgcf generate >>/tmp/petik-wgcf.log 2>&1 && [ -s wgcf-profile.conf ]; then
+    {
+      cat wgcf-profile.conf
+      printf '\n[Socks5]\nBindAddress = 127.0.0.1:%s\n' "$WARP_PORT"
+    } > wireproxy.conf
+    wireproxy -c wireproxy.conf >/tmp/petik-wireproxy.log 2>&1 &
+    i=0
+    while [ "$i" -lt 15 ]; do
+      if curl -fsS --max-time 6 --socks5-hostname "127.0.0.1:${WARP_PORT}" \
+           https://www.cloudflare.com/cdn-cgi/trace 2>/dev/null | grep -Eq '^warp=(on|plus)'; then
+        WARP_OK=1
+        break
+      fi
+      i=$((i + 1))
+      sleep 1
+    done
+  fi
+  cd "$APP_DIR" || true
+  if [ "$WARP_OK" = "1" ]; then
+    export YOUTUBE_PROXY="socks5h://127.0.0.1:${WARP_PORT}"
+    export YOUTUBE_WARP_ACTIVE=1
+    echo "[Petik] WARP tunnel is up; YouTube traffic will use ${YOUTUBE_PROXY}"
+  else
+    echo "[Petik] WARNING: WARP tunnel failed; YouTube will use the direct Render IP"
+    tail -n 15 /tmp/petik-wgcf.log /tmp/petik-wireproxy.log 2>/dev/null || true
+  fi
+fi
+
 if [ "$BGUTIL_ENABLED" = "1" ] && command -v deno >/dev/null 2>&1 && [ -f "$BGUTIL_DIR/src/main.ts" ] && [ -d "$BGUTIL_DIR/node_modules" ]; then
   echo "[Petik] Starting private BgUtils PO Token provider on ${BGUTIL_HOST}:${BGUTIL_PORT}"
   (
