@@ -48,7 +48,7 @@ def test_health_endpoint_and_version():
     response = client.get("/health")
     assert response.status_code == 200
     assert response.json()["status"] == "healthy"
-    assert response.json()["version"] == "1.17.2"
+    assert response.json()["version"] == "1.18.0"
     assert "javascriptRuntime" in response.json()
     assert response.json()["youtubePoTokenProvider"] == "bgutil-http"
     assert isinstance(response.json()["youtubePoTokenProviderReady"], bool)
@@ -818,7 +818,7 @@ def test_instagram_public_fallback_uses_anonymous_graphql_session(monkeypatch):
 
 def test_health_reports_gallery_and_public_fallback_capabilities():
     body = client.get("/health").json()
-    assert body["version"] == "1.17.2"
+    assert body["version"] == "1.18.0"
     assert body["youtubeClientFallbacks"] in (
         ["tv_samsung", "visionos", "web", "web_embedded"],
         ["tv_samsung", "visionos", "web", "mweb", "web_embedded"],
@@ -1533,7 +1533,7 @@ def test_bgutil_provider_status_rejects_version_mismatch(monkeypatch):
 
 def test_health_exposes_v111_youtube_diagnostics_without_sensitive_fields():
     payload = client.get("/health").json()
-    assert payload["version"] == "1.17.2"
+    assert payload["version"] == "1.18.0"
     assert "youtubePoTokenTelemetryAvailable" in payload
     assert payload["youtubeForceIPv4"] is True
     assert payload["youtubeWpc"]["runtimeEnabled"] is False
@@ -2391,3 +2391,22 @@ def test_youtube_download_reuses_inspected_info_without_reextracting(monkeypatch
     path, filename, _ = api._download_media_impl(url, "video", "720", reuse_info=info)
     assert calls == ["process"]
     assert path.exists()
+
+
+def test_progress_endpoint_reports_stage_and_idle():
+    url = "https://www.youtube.com/watch?v=abcdefghijk"
+    api.DOWNLOAD_PROGRESS.clear()
+    idle = client.get("/api/progress", params={"url": url, "mode": "video"})
+    assert idle.json()["stage"] == "idle"
+    api._set_download_progress(url, "video", "downloading", 42.04)
+    live = client.get("/api/progress", params={"url": url, "mode": "video"}).json()
+    assert live["stage"] == "downloading" and live["percent"] == 42.0 and live["label"]
+    other = client.get("/api/progress", params={"url": url, "mode": "audio"}).json()
+    assert other["stage"] == "idle"
+
+
+def test_expired_file_returns_html_for_browsers_and_json_for_api():
+    html = client.get("/api/file/nope", headers={"accept": "text/html"})
+    assert html.status_code == 404 and "Berkas tidak tersedia" in html.text
+    data = client.get("/api/file/nope", headers={"accept": "application/json"})
+    assert data.status_code == 404 and data.json()["success"] is False
