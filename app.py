@@ -35,10 +35,10 @@ except ImportError:
 
 from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
+from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, StreamingResponse
 from yt_dlp import YoutubeDL
 
-APP_VERSION = "1.17.2"
+APP_VERSION = "1.18.0"
 MAX_GALLERY_ITEMS = max(1, min(30, int(os.getenv("MAX_GALLERY_ITEMS", "20"))))
 MAX_GALLERY_SOURCE_ITEMS = MAX_GALLERY_ITEMS * 2  # Mixed carousels can contain video entries between photos.
 MAX_GALLERY_FILE_BYTES = int(os.getenv("MAX_GALLERY_FILE_MB", "20")) * 1024 * 1024
@@ -643,7 +643,7 @@ def _bgutil_provider_status() -> dict:
         try:
             request = urllib.request.Request(
                 f"{base_url}/ping",
-                headers={"User-Agent": "Petik-Health/1.17.2"},
+                headers={"User-Agent": "Petik-Health/1.18.0"},
             )
             with urllib.request.urlopen(request, timeout=1.2) as response:
                 payload = json.loads(response.read(4096).decode("utf-8", errors="replace"))
@@ -656,7 +656,7 @@ def _bgutil_provider_status() -> dict:
         try:
             request = urllib.request.Request(
                 f"{telemetry_url}/stats",
-                headers={"User-Agent": "Petik-Health/1.17.2"},
+                headers={"User-Agent": "Petik-Health/1.18.0"},
             )
             with urllib.request.urlopen(request, timeout=0.8) as response:
                 candidate = json.loads(response.read(4096).decode("utf-8", errors="replace"))
@@ -3056,6 +3056,65 @@ def _download_gallery_files(url: str, indices: list[int]) -> tuple[Path, list[Pa
         raise
 
 
+
+DOWNLOAD_PROGRESS: dict[str, dict] = {}
+DOWNLOAD_PROGRESS_LABELS = {
+    "queued": "Menunggu antrean server",
+    "preparing": "Menyiapkan sumber media",
+    "downloading": "Mengunduh dari sumber",
+    "merging": "Menggabungkan video dan audio",
+    "finalizing": "Merapikan berkas",
+    "ready": "Siap diunduh",
+}
+
+
+def _progress_key(url: str, mode: str) -> str:
+    return f"{mode}|{url}"
+
+
+def _set_download_progress(url: str, mode: str, stage: str, percent: float | None = None) -> None:
+    now = time.time()
+    with state_lock:
+        for key, value in list(DOWNLOAD_PROGRESS.items()):
+            if now - value.get("updatedAt", 0) > 300:
+                DOWNLOAD_PROGRESS.pop(key, None)
+        entry = DOWNLOAD_PROGRESS.setdefault(_progress_key(url, mode), {})
+        entry["stage"] = stage
+        entry["label"] = DOWNLOAD_PROGRESS_LABELS.get(stage, stage)
+        if percent is not None:
+            entry["percent"] = max(0.0, min(100.0, round(float(percent), 1)))
+        elif stage != "downloading":
+            entry.pop("percent", None)
+        entry["updatedAt"] = now
+
+
+def _download_progress_hooks(url: str, mode: str) -> dict:
+    """yt-dlp hooks that report coarse, non-sensitive stages (no URLs or tokens)."""
+    def progress_hook(data: dict) -> None:
+        try:
+            status = data.get("status")
+            if status == "downloading":
+                total = data.get("total_bytes") or data.get("total_bytes_estimate")
+                done = data.get("downloaded_bytes") or 0
+                percent = (done / total * 100.0) if total else None
+                _set_download_progress(url, mode, "downloading", percent)
+            elif status == "finished":
+                _set_download_progress(url, mode, "merging" if mode == "video" else "finalizing")
+        except Exception:
+            pass
+
+    def postprocessor_hook(data: dict) -> None:
+        try:
+            if data.get("status") == "started":
+                _set_download_progress(url, mode, "merging" if mode == "video" else "finalizing")
+            elif data.get("status") == "finished":
+                _set_download_progress(url, mode, "finalizing")
+        except Exception:
+            pass
+
+    return {"progress_hooks": [progress_hook], "postprocessor_hooks": [postprocessor_hook]}
+
+
 def _download_media_impl(url: str, mode: str, quality: str, reuse_info: dict | None = None) -> tuple[Path, str, dict]:
     quality = str(quality or "max").strip().lower()
     if quality not in {"max", "best"}:
@@ -3116,6 +3175,7 @@ def _download_media_impl(url: str, mode: str, quality: str, reuse_info: dict | N
             fmt_for_attempt = _youtube_hls_format_selector(quality)
         else:
             fmt_for_attempt = fmt
+        options.update(_download_progress_hooks(url, mode))
         options.update({
             "format": fmt_for_attempt,
             "outtmpl": outtmpl,
@@ -3316,9 +3376,11 @@ def _normalise_request(payload: dict):
 
 
 def _run_download(url: str, platform: str, mode: str, quality: str, request: Request):
+    _set_download_progress(url, mode, "preparing")
     try:
         path, filename, info = _download_media(url, mode, quality)
         token = _store_file(path, filename)
+        _set_download_progress(url, mode, "ready", 100.0)
         return {
             "status": "tunnel",
             "url": f"{_base_url(request)}/api/file/{token}",
@@ -3579,7 +3641,7 @@ def youtube_network_diagnostics(request: Request):
         try:
             req = urllib.request.Request(
                 target,
-                headers={"User-Agent": "Mozilla/5.0 Petik-Network-Diagnostic/1.17.2", "Accept": "*/*"},
+                headers={"User-Agent": "Mozilla/5.0 Petik-Network-Diagnostic/1.18.0", "Accept": "*/*"},
                 method="GET",
             )
             with urllib.request.urlopen(req, timeout=8) as response:
@@ -3742,7 +3804,7 @@ def download_media(payload: dict, request: Request):
         mode = "audio" if payload.get("mode") == "audio" else "video"
         if mode == "audio" and platform == "soundcloud":
             mode = "audio"
-        quality = str(payload.get("quality") or ("best" if mode == "audio" else "max"))
+        quality = str(payload.get("quality") or ("best" if mode == "audio" else "720"))
         return _run_download(url, platform, mode, quality, request)
     finally:
         download_slots.release()
@@ -3765,18 +3827,51 @@ def cobalt_compatible_extract(payload: dict, request: Request):
         download_slots.release()
 
 
+@app.get("/api/progress")
+def download_progress(url: str, mode: str = "video"):
+    """Coarse stage of an in-flight download for this URL (polled by the web app)."""
+    mode = "audio" if mode == "audio" else "video"
+    try:
+        normalised = _normalise_and_validate(url)[0]
+    except Exception:
+        return JSONResponse({"stage": "idle"}, headers={"Cache-Control": "no-store"})
+    with state_lock:
+        entry = dict(DOWNLOAD_PROGRESS.get(_progress_key(normalised, mode)) or {})
+    if not entry or time.time() - entry.get("updatedAt", 0) > 240:
+        return JSONResponse({"stage": "idle"}, headers={"Cache-Control": "no-store"})
+    return JSONResponse(
+        {"stage": entry.get("stage", "idle"), "label": entry.get("label"), "percent": entry.get("percent")},
+        headers={"Cache-Control": "no-store"},
+    )
+
+
+def _expired_file_response(request: Request, message: str, status_code: int):
+    # A browser tapping the Unduh link should see a readable page, not raw JSON.
+    if "text/html" in (request.headers.get("accept") or ""):
+        page = (
+            "<!doctype html><html lang=id><meta charset=utf-8>"
+            "<meta name=viewport content='width=device-width,initial-scale=1'>"
+            "<title>Petik</title><body style=\"font-family:system-ui,sans-serif;background:#f5f1ea;"
+            "color:#3b2a1d;display:grid;place-items:center;min-height:100vh;margin:0;padding:24px;text-align:center\">"
+            f"<div><h2>Berkas tidak tersedia</h2><p>{message}</p>"
+            "<p>Kembali ke Petik, tekan Simpan lagi, lalu unduh sebelum link kedaluwarsa.</p></div></body></html>"
+        )
+        return HTMLResponse(page, status_code=status_code, headers={"Cache-Control": "no-store"})
+    return JSONResponse({"success": False, "error": message}, status_code=status_code)
+
+
 @app.get("/api/file/{token}")
-def download_file(token: str):
+def download_file(token: str, request: Request):
     with state_lock:
         item = active_files.get(token)
     if not item:
-        return JSONResponse({"success": False, "error": "Berkas sudah kedaluwarsa atau tautan tidak valid."}, status_code=404)
+        return _expired_file_response(request, "Berkas sudah kedaluwarsa atau tautan tidak valid.", 404)
     path, filename, expiry = item
     if expiry <= time.time() or not path.is_file():
         with state_lock:
             active_files.pop(token, None)
         shutil.rmtree(path.parent, ignore_errors=True)
-        return JSONResponse({"success": False, "error": "Berkas sudah kedaluwarsa."}, status_code=410)
+        return _expired_file_response(request, "Berkas sudah kedaluwarsa.", 410)
     suffix = path.suffix.lower()
     media_type = "audio/mpeg" if suffix == ".mp3" else "video/mp4" if suffix in {".mp4", ".m4v"} else "application/zip" if suffix == ".zip" else "image/jpeg" if suffix in {".jpg", ".jpeg"} else "image/png" if suffix == ".png" else "application/octet-stream"
     return FileResponse(
