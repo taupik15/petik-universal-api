@@ -29,7 +29,7 @@ def test_health_endpoint_and_version():
     response = client.get("/health")
     assert response.status_code == 200
     assert response.json()["status"] == "healthy"
-    assert response.json()["version"] == "1.12.0"
+    assert response.json()["version"] == "1.13.0"
     assert "javascriptRuntime" in response.json()
     assert response.json()["youtubePoTokenProvider"] == "bgutil-http"
     assert isinstance(response.json()["youtubePoTokenProviderReady"], bool)
@@ -794,7 +794,7 @@ def test_instagram_public_fallback_uses_anonymous_graphql_session(monkeypatch):
 
 def test_health_reports_gallery_and_public_fallback_capabilities():
     body = client.get("/health").json()
-    assert body["version"] == "1.12.0"
+    assert body["version"] == "1.13.0"
     assert body["youtubeClientFallbacks"] in (["web_safari", "web_safari_hls", "web_embedded", "tv"], ["mweb", "web_safari", "web_safari_hls", "web_embedded", "tv"])
     assert "youtubeDiagnostics" in body
     assert body["youtubeDiagnostics"]["tokenGenerationObserved"] in (True, False)
@@ -1473,7 +1473,7 @@ def test_bgutil_provider_status_rejects_version_mismatch(monkeypatch):
 
 def test_health_exposes_v111_youtube_diagnostics_without_sensitive_fields():
     payload = client.get("/health").json()
-    assert payload["version"] == "1.12.0"
+    assert payload["version"] == "1.13.0"
     assert "youtubePoTokenTelemetryAvailable" in payload
     assert payload["youtubeForceIPv4"] is True
     assert payload["youtubeWpc"]["runtimeEnabled"] is False
@@ -1712,7 +1712,7 @@ def test_youtube_root_hint_can_identify_pre_token_stage():
         "providerRequestsThisAttempt": 0,
         "providerAdvertised": True,
     })
-    assert hint == "bot_check_before_po_token_stage_innertube_player_api"
+    assert hint == "innertube_player_api_bot_check_before_format_delivery_possible_session_or_egress_reputation"
 
 
 def test_telemetry_metrics_keep_bounded_metadata_events_only():
@@ -1813,3 +1813,207 @@ def test_youtube_common_options_attach_cookiefile_only_when_configured(monkeypat
 def test_android_vr_is_not_in_active_fallbacks():
     assert "android_vr" not in api.YOUTUBE_CLIENT_FALLBACKS
     assert "android_vr" not in api._youtube_client_candidates(provider_ready=True)
+
+
+# v1.13 provider-profile selection, first-cause diagnostics, and HTTP classification.
+
+def test_wpc_profile_selects_wpc_provider_without_bgutil_base_url(monkeypatch):
+    monkeypatch.setenv("YOUTUBE_POT_PROVIDER_MODE", "wpc")
+    monkeypatch.setenv("YOUTUBE_WPC_ENABLED", "1")
+    monkeypatch.setattr(api, "_youtube_provider_status", lambda: {
+        "ready": True, "baseUrl": "http://127.0.0.1:4416",
+    })
+    monkeypatch.setattr(api, "_wpc_status", lambda: {
+        "runtimeEnabled": True, "browserPath": "/usr/bin/chromium",
+    })
+    options = api._yt_common_options("youtube", "mweb")
+    assert options["extractor_args"]["youtube"]["player_client"] == ["mweb"]
+    assert options["extractor_args"]["youtubepot-wpc"]["browser_path"] == ["/usr/bin/chromium"]
+    assert "youtubepot-bgutilhttp" not in options["extractor_args"]
+
+
+def test_bgutil_profile_remains_default_and_wpc_is_not_forced(monkeypatch):
+    monkeypatch.setenv("YOUTUBE_POT_PROVIDER_MODE", "bgutil")
+    monkeypatch.setattr(api, "_youtube_provider_status", lambda: {
+        "ready": True, "baseUrl": "http://127.0.0.1:4416",
+    })
+    monkeypatch.setattr(api, "_wpc_status", lambda: {
+        "runtimeEnabled": True, "browserPath": "/usr/bin/chromium",
+    })
+    options = api._yt_common_options("youtube", "mweb")
+    assert options["extractor_args"]["youtubepot-bgutilhttp"]["base_url"] == ["http://127.0.0.1:4416"]
+    assert "youtubepot-wpc" not in options["extractor_args"]
+
+
+def test_bot_check_first_failure_stage_is_not_overwritten_by_wrapper_error():
+    logger = api._YtDlpDiagnosticLogger("mweb")
+    logger.debug("[youtube] Downloading mweb player API JSON")
+    logger.error("Sign in to confirm you're not a bot")
+    logger.debug("[youtube] Selecting formats")
+    logger.error("[youtube] ERROR: No video formats found (extractor error)")
+    state = api._youtube_diagnostics_snapshot()
+    assert state["lastErrorCode"] == "bot_check"
+    assert state["lastErrorStage"] == "innertube_player_api"
+    assert state["errorEvents"][-1]["errorCode"] == "no_downloadable_formats"
+    assert state["errorEvents"][-1]["stage"] == "innertube_player_api"
+
+
+def test_youtube_http_status_codes_are_classified_without_raw_error_storage():
+    assert api._youtube_http_status("HTTP Error 429: Too Many Requests") == 429
+    assert api._youtube_error_code("HTTP Error 429: Too Many Requests") == "http_429"
+    assert api._youtube_error_code("HTTP Error 503: Service Unavailable") == "http_5xx"
+    assert api._youtube_error_code("HTTP Error 403: Forbidden") == "http_403"
+
+
+def test_cookie_cleanup_removes_only_ephemeral_cookie_jar(monkeypatch, tmp_path):
+    cookie_path = tmp_path / "cookies.txt"
+    cookie_path.write_text("secret-cookie-content")
+    monkeypatch.setattr(api, "YOUTUBE_COOKIE_PATH", cookie_path)
+    api._cleanup_youtube_cookie_file()
+    assert not cookie_path.exists()
+
+
+# v1.13 avoids repeating Safari's Player API request as an HLS-only retry.
+def test_skip_hls_retry_when_safari_player_request_was_blocked():
+    assert api._youtube_should_skip_hls_retry("web_safari", "bot_check") is True
+    assert api._youtube_should_skip_hls_retry("web_safari", "http_429") is True
+    assert api._youtube_should_skip_hls_retry("web_safari", "no_downloadable_formats") is False
+    assert api._youtube_should_skip_hls_retry("mweb", "bot_check") is False
+
+
+def test_wpc_ready_enables_mweb_even_without_bgutil(monkeypatch):
+    monkeypatch.setenv("YOUTUBE_POT_PROVIDER_MODE", "wpc")
+    monkeypatch.setattr(api, "_wpc_status", lambda: {"runtimeEnabled": True})
+    clients = api._youtube_client_candidates(False, wpc_ready=True)
+    assert clients[0] == "mweb"
+
+
+def test_error_events_are_correlation_tagged_and_do_not_store_raw_message():
+    api._begin_youtube_diagnostics_attempt({"telemetryAvailable": False, "telemetry": {}}, "attempting")
+    logger = api._YtDlpDiagnosticLogger("mweb")
+    logger.debug("[youtube] Downloading mweb player API JSON https://private.example/?token=secret")
+    logger.error("Sign in to confirm you're not a bot")
+    state = api._youtube_diagnostics_snapshot()
+    assert state["attemptId"]
+    assert state["errorEvents"][-1]["attemptId"] == state["attemptId"]
+    assert state["stageEvents"][-1]["attemptId"] == state["attemptId"]
+    payload = __import__("json").dumps(state)
+    assert "private.example" not in payload
+    assert "secret" not in payload
+
+
+def test_wpc_runtime_is_available_but_not_enabled_without_explicit_flag(monkeypatch):
+    import importlib.metadata
+    monkeypatch.delenv("YOUTUBE_WPC_ENABLED", raising=False)
+    monkeypatch.setattr(api, "_package_available", lambda _name: True)
+    monkeypatch.setattr(importlib.metadata, "version", lambda _name: "1.1.2")
+    monkeypatch.setattr(api.shutil, "which", lambda _name: "/usr/bin/chromium")
+    state = api._wpc_status()
+    assert state["runtimeAvailable"] is True
+    assert state["runtimeEnabled"] is False
+    assert state["configuredAndReady"] is False
+
+
+def test_wpc_runtime_requires_requested_flag_plugin_version_and_browser(monkeypatch):
+    import importlib.metadata
+    monkeypatch.setenv("YOUTUBE_WPC_ENABLED", "1")
+    monkeypatch.setattr(api, "_package_available", lambda _name: True)
+    monkeypatch.setattr(importlib.metadata, "version", lambda _name: "1.1.2")
+    monkeypatch.setattr(api.shutil, "which", lambda _name: "/usr/bin/chromium")
+    state = api._wpc_status()
+    assert state["runtimeAvailable"] is True
+    assert state["runtimeEnabled"] is True
+    assert state["configuredAndReady"] is True
+
+
+def test_wpc_runtime_stays_disabled_when_browser_missing(monkeypatch):
+    import importlib.metadata
+    monkeypatch.setenv("YOUTUBE_WPC_ENABLED", "1")
+    monkeypatch.setattr(api, "_package_available", lambda _name: True)
+    monkeypatch.setattr(importlib.metadata, "version", lambda _name: "1.1.2")
+    monkeypatch.setattr(api.shutil, "which", lambda _name: None)
+    state = api._wpc_status()
+    assert state["runtimeAvailable"] is False
+    assert state["runtimeEnabled"] is False
+
+
+def test_finish_youtube_diagnostics_preserves_player_bot_check_root_cause():
+    api._update_youtube_diagnostics(
+        lastOutcome="attempting", lastErrorCode="bot_check",
+        lastErrorStage="innertube_player_api", lastErrorEvent="youtube_bot_check",
+    )
+    api._finish_youtube_diagnostics("failed", "extractor_error")
+    state = api._youtube_diagnostics_snapshot()
+    assert state["lastOutcome"] == "failed"
+    assert state["lastErrorCode"] == "bot_check"
+    assert state["lastErrorStage"] == "innertube_player_api"
+    assert state["lastErrorEvent"] == "youtube_bot_check"
+
+
+def test_finish_youtube_diagnostics_keeps_more_specific_http_error():
+    api._update_youtube_diagnostics(lastErrorCode=None, lastErrorEvent=None, lastErrorStage=None)
+    api._finish_youtube_diagnostics("failed", "http_429")
+    state = api._youtube_diagnostics_snapshot()
+    assert state["lastErrorCode"] == "http_429"
+    assert state["lastErrorEvent"] == "http_429"
+
+
+def test_youtube_diagnostics_captures_http_status_and_safe_error_event():
+    api._begin_youtube_diagnostics_attempt({"telemetryAvailable": False, "telemetry": {}}, "attempting")
+    logger = api._YtDlpDiagnosticLogger("mweb")
+    logger.debug("[youtube] Downloading mweb player API JSON")
+    logger.error("HTTP Error 429: Too Many Requests for https://private.example/?secret=abc")
+    state = api._youtube_diagnostics_snapshot()
+    assert state["lastErrorCode"] == "http_429"
+    assert state["lastErrorStage"] == "http_429"
+    assert state["httpStatus"] == 429
+    serialized = __import__("json").dumps(state)
+    assert "private.example" not in serialized
+    assert "secret=abc" not in serialized
+
+
+def test_health_reports_effective_provider_and_bgutil_separately(monkeypatch):
+    monkeypatch.setenv("YOUTUBE_POT_PROVIDER_MODE", "bgutil")
+    monkeypatch.setattr(api, "_bgutil_provider_status", lambda: {
+        "enabled": True, "ready": True, "serverAvailable": True,
+        "pluginVersion": "2.0.2", "serverVersion": "2.0.2",
+        "serverUptimeSeconds": 12, "expectedVersion": "2.0.2",
+        "baseUrl": "http://127.0.0.1:4416", "clientBaseUrl": "http://127.0.0.1:4417",
+        "telemetryAvailable": True, "telemetry": {},
+    })
+    payload = client.get("/health").json()
+    assert payload["youtubePoTokenProvider"] == "bgutil-http"
+    assert payload["youtubePoTokenProviderReady"] is True
+    assert payload["youtubeBgutilProviderReady"] is True
+
+
+def test_health_reports_unavailable_when_no_provider_is_ready(monkeypatch):
+    monkeypatch.setenv("YOUTUBE_POT_PROVIDER_MODE", "wpc")
+    monkeypatch.setattr(api, "_bgutil_provider_status", lambda: {
+        "enabled": False, "ready": False, "serverAvailable": False,
+        "pluginVersion": None, "serverVersion": None, "serverUptimeSeconds": None,
+        "expectedVersion": "2.0.2", "baseUrl": "http://127.0.0.1:4416",
+        "clientBaseUrl": "http://127.0.0.1:4416", "telemetryAvailable": False, "telemetry": {},
+    })
+    monkeypatch.setattr(api, "_wpc_status", lambda: {
+        "requested": True, "pluginInstalled": False, "runtimeAvailable": False,
+        "runtimeEnabled": False, "browserAvailable": False,
+    })
+    payload = client.get("/health").json()
+    assert payload["youtubePoTokenProvider"] == "unavailable"
+    assert payload["youtubePoTokenProviderEnabled"] is False
+    assert payload["youtubePoTokenProviderReady"] is False
+    assert payload["youtubePoTokenClient"] is None
+
+
+def test_youtube_private_age_and_member_restriction_get_specific_message():
+    for message in (
+        "age_restricted: sign in required", "This video is members only",
+        "This video is not available",
+    ):
+        response = api._extract_error(RuntimeError(message), "youtube")
+        assert response.status_code == 502
+        assert response.body
+        body = __import__("json").loads(response.body)
+        assert body["error"]["code"] == "error.api.youtube.restricted"
+        assert "login" in body["error"]["context"]["message"].lower() or "dibatasi" in body["error"]["context"]["message"].lower()
