@@ -38,7 +38,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 from yt_dlp import YoutubeDL
 
-APP_VERSION = "1.17.0"
+APP_VERSION = "1.17.1"
 MAX_GALLERY_ITEMS = max(1, min(30, int(os.getenv("MAX_GALLERY_ITEMS", "20"))))
 MAX_GALLERY_SOURCE_ITEMS = MAX_GALLERY_ITEMS * 2  # Mixed carousels can contain video entries between photos.
 MAX_GALLERY_FILE_BYTES = int(os.getenv("MAX_GALLERY_FILE_MB", "20")) * 1024 * 1024
@@ -166,6 +166,32 @@ YOUTUBE_PROXY_BURN_SECONDS = max(10, int(os.getenv("YOUTUBE_PROXY_BURN_SECONDS",
 YOUTUBE_ROTATION_MAX_ATTEMPTS = max(1, int(os.getenv("YOUTUBE_ROTATION_MAX_ATTEMPTS", "4") or 4))
 YOUTUBE_LOCAL = threading.local()
 youtube_preview_proxy: dict[str, str] = {}
+YOUTUBE_DOWNLOAD_INFO_TTL_SECONDS = max(0, int(os.getenv("YOUTUBE_DOWNLOAD_INFO_TTL_SECONDS", "900") or 0))
+YOUTUBE_DOWNLOAD_INFO: dict[str, tuple[dict, float]] = {}
+
+
+def _remember_youtube_download_info(url: str, info: dict) -> None:
+    """Keep the inspected info so Simpan does not re-extract (a second YouTube hit)."""
+    if YOUTUBE_DOWNLOAD_INFO_TTL_SECONDS <= 0 or not isinstance(info, dict):
+        return
+    now = time.monotonic()
+    with state_lock:
+        for key, value in list(YOUTUBE_DOWNLOAD_INFO.items()):
+            if value[1] <= now:
+                YOUTUBE_DOWNLOAD_INFO.pop(key, None)
+        YOUTUBE_DOWNLOAD_INFO[url] = (copy.deepcopy(info), now + YOUTUBE_DOWNLOAD_INFO_TTL_SECONDS)
+        while len(YOUTUBE_DOWNLOAD_INFO) > 12:
+            YOUTUBE_DOWNLOAD_INFO.pop(next(iter(YOUTUBE_DOWNLOAD_INFO)))
+
+
+def _take_youtube_download_info(url: str) -> dict | None:
+    now = time.monotonic()
+    with state_lock:
+        cached = YOUTUBE_DOWNLOAD_INFO.get(url)
+    if not cached or cached[1] <= now:
+        return None
+    return copy.deepcopy(cached[0])
+
 
 
 def _valid_youtube_proxy(value: str) -> str | None:
@@ -264,7 +290,7 @@ def _youtube_is_blocked_error(exc: BaseException) -> bool:
     return code in {"http_429", "bot_check"} or "http error 429" in text or "429" in text and "youtube" in text
 
 
-def _with_youtube_rotation(operation):
+def _with_youtube_rotation(operation, prefer_proxy: str | None = None):
     """Run a YouTube operation; on 429/anti-bot, burn this proxy and retry on another.
 
     Without a proxy pool this is a plain call. Each retry uses a different WARP
@@ -277,7 +303,12 @@ def _with_youtube_rotation(operation):
     attempts = min(len(pool), YOUTUBE_ROTATION_MAX_ATTEMPTS)
     last_error: BaseException | None = None
     for attempt in range(attempts):
-        proxy = _pick_youtube_proxy()
+        proxy = None
+        if attempt == 0 and prefer_proxy and prefer_proxy in pool:
+            with YOUTUBE_PROXY_LOCK:
+                if YOUTUBE_PROXY_BURNED.get(prefer_proxy, 0.0) <= time.monotonic():
+                    proxy = prefer_proxy
+        proxy = proxy or _pick_youtube_proxy()
         YOUTUBE_LOCAL.proxy = proxy
         try:
             return operation()
@@ -579,7 +610,7 @@ def _bgutil_provider_status() -> dict:
         try:
             request = urllib.request.Request(
                 f"{base_url}/ping",
-                headers={"User-Agent": "Petik-Health/1.17.0"},
+                headers={"User-Agent": "Petik-Health/1.17.1"},
             )
             with urllib.request.urlopen(request, timeout=1.2) as response:
                 payload = json.loads(response.read(4096).decode("utf-8", errors="replace"))
@@ -592,7 +623,7 @@ def _bgutil_provider_status() -> dict:
         try:
             request = urllib.request.Request(
                 f"{telemetry_url}/stats",
-                headers={"User-Agent": "Petik-Health/1.17.0"},
+                headers={"User-Agent": "Petik-Health/1.17.1"},
             )
             with urllib.request.urlopen(request, timeout=0.8) as response:
                 candidate = json.loads(response.read(4096).decode("utf-8", errors="replace"))
@@ -1396,6 +1427,7 @@ def _extract_info(url: str) -> dict:
                     info = dict(info)
                     info["_petik_proxy"] = used["proxy"]
                 _cache_youtube_info(url, info)
+                _remember_youtube_download_info(url, info)
             return info
     finally:
         _cleanup_youtube_cookie_file()
@@ -2989,7 +3021,7 @@ def _download_gallery_files(url: str, indices: list[int]) -> tuple[Path, list[Pa
         raise
 
 
-def _download_media_impl(url: str, mode: str, quality: str) -> tuple[Path, str, dict]:
+def _download_media_impl(url: str, mode: str, quality: str, reuse_info: dict | None = None) -> tuple[Path, str, dict]:
     quality = str(quality or "max").strip().lower()
     if quality not in {"max", "best"}:
         try:
@@ -3024,6 +3056,10 @@ def _download_media_impl(url: str, mode: str, quality: str) -> tuple[Path, str, 
         clients = _youtube_client_candidates(bool(provider.get("ready")), preferred, wpc_ready)
         if mode == "audio":
             clients = [item for item in clients if item != "web_safari_hls"]
+        if reuse_info:
+            # Download straight from the inspected info (no second watch-page hit);
+            # a failure here falls through to a fresh extraction below.
+            clients = ["__reuse__"] + clients
         _begin_youtube_diagnostics_attempt(provider, "attempting-download")
 
     last_error = None
@@ -3032,6 +3068,10 @@ def _download_media_impl(url: str, mode: str, quality: str) -> tuple[Path, str, 
     for index, client in enumerate(clients):
         if client == "web_safari_hls" and _youtube_should_skip_hls_retry(previous_client, previous_error_code):
             continue
+        reuse_attempt = client == "__reuse__"
+        if reuse_attempt:
+            client = (reuse_info or {}).get("_petik_youtube_client") or next(
+                (item for item in clients if item != "__reuse__"), "mweb")
         job_dir = Path(tempfile.mkdtemp(prefix="job-", dir=TEMP_ROOT))
         outtmpl = str(job_dir / "%(id)s.%(ext)s")
         options = _yt_common_options(platform, client) if platform == "youtube" else _yt_common_options(platform)
@@ -3062,7 +3102,10 @@ def _download_media_impl(url: str, mode: str, quality: str) -> tuple[Path, str, 
                 _record_youtube_attempt(str(client), "attempting-download")
                 _update_youtube_diagnostics(lastStrategy=str(client))
             with YoutubeDL(options) as ydl:
-                info = ydl.extract_info(url, download=True)
+                if reuse_attempt:
+                    info = ydl.process_ie_result(copy.deepcopy(reuse_info), download=True)
+                else:
+                    info = ydl.extract_info(url, download=True)
                 if not info:
                     raise RuntimeError("Platform tidak mengembalikan media.")
                 if info.get("_type") == "playlist":
@@ -3105,6 +3148,8 @@ def _download_media_impl(url: str, mode: str, quality: str) -> tuple[Path, str, 
                 last_error = RuntimeError(f"YouTube HTTP Error 429: permintaan dari server Petik dibatasi sementara. Detail extractor: {str(exc)[:180]}")
             previous_client, previous_error_code = str(client), code
             _record_youtube_attempt(str(client), "download-failed", code, stage=stage)
+            if reuse_attempt and not is_rate_limited:
+                continue  # reused info failed (expired URL etc.): extract fresh next
             if is_rate_limited or index >= len(clients) - 1 or not _youtube_should_fallback(exc):
                 break
             _youtube_fallback_pause()
@@ -3124,7 +3169,16 @@ def _download_media(url: str, mode: str, quality: str) -> tuple[Path, str, dict]
         with YOUTUBE_ATTEMPT_LOCK:
             followup = _consume_youtube_inspect_cache(url)
             _youtube_request_gate(allow_recent_inspect_followup=followup)
-            return _with_youtube_rotation(lambda: _download_media_impl(url, mode, quality))
+            reuse = _take_youtube_download_info(url)
+            holder = {"info": reuse}
+
+            def _run_download():
+                first = holder.pop("info", None)
+                if first:
+                    return _download_media_impl(url, mode, quality, reuse_info=first)
+                return _download_media_impl(url, mode, quality)
+
+            return _with_youtube_rotation(_run_download, prefer_proxy=(reuse or {}).get("_petik_proxy"))
     finally:
         _cleanup_youtube_cookie_file()
 
@@ -3488,7 +3542,7 @@ def youtube_network_diagnostics(request: Request):
         try:
             req = urllib.request.Request(
                 target,
-                headers={"User-Agent": "Mozilla/5.0 Petik-Network-Diagnostic/1.17.0", "Accept": "*/*"},
+                headers={"User-Agent": "Mozilla/5.0 Petik-Network-Diagnostic/1.17.1", "Accept": "*/*"},
                 method="GET",
             )
             with urllib.request.urlopen(req, timeout=8) as response:
