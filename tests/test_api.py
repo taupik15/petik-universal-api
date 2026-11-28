@@ -29,7 +29,7 @@ def test_health_endpoint_and_version():
     response = client.get("/health")
     assert response.status_code == 200
     assert response.json()["status"] == "healthy"
-    assert response.json()["version"] == "1.6.3"
+    assert response.json()["version"] == "1.7.0"
     assert "javascriptRuntime" in response.json()
 
 
@@ -671,7 +671,7 @@ def test_instagram_public_fallback_uses_anonymous_graphql_session(monkeypatch):
 
 def test_health_reports_gallery_and_public_fallback_capabilities():
     body = client.get("/health").json()
-    assert body["version"] == "1.6.3"
+    assert body["version"] == "1.7.0"
     assert "threads" in body["galleryPlatforms"]
     assert body["threadsPhotoResolver"] == "public-page-json"
     assert body["instagramPhotoResolver"] == "gallery-dl+logged-out-graphql+page-json"
@@ -972,3 +972,41 @@ def test_facebook_unsupported_url_gets_public_access_message():
     result = api._extract_error(RuntimeError("Unsupported URL"), "facebook")
     assert result.status_code == 502
     assert b"Facebook tidak mengembalikan data media publik" in result.body
+
+
+def test_inspect_returns_direct_video_and_audio_urls_independent_of_save(monkeypatch):
+    no_rate_limit(monkeypatch)
+    monkeypatch.setattr(api, "_extract_info", lambda _url: {
+        "id": "direct-demo", "title": "Direct demo", "formats": [
+            {"format_id": "18", "ext": "mp4", "height": 360, "vcodec": "avc1", "acodec": "mp4a", "url": "https://cdn.example/video-360.mp4"},
+            {"format_id": "140", "ext": "m4a", "vcodec": "none", "acodec": "mp4a", "url": "https://cdn.example/audio.m4a"},
+        ],
+    })
+    response = client.post("/api/inspect", json={"url": "https://vimeo.com/123456"})
+    assert response.status_code == 200
+    direct = response.json()["directUrls"]
+    assert direct["video"] == "https://cdn.example/video-360.mp4"
+    assert direct["audio"] == "https://cdn.example/audio.m4a"
+
+
+def test_direct_media_url_validation_rejects_local_and_credentials():
+    assert api._safe_preview_url("https://cdn.example/video.mp4") == "https://cdn.example/video.mp4"
+    for value in (
+        "javascript:alert(1)", "ftp://cdn.example/video.mp4", "http://127.0.0.1/private.mp4",
+        "http://192.168.1.2/file.mp4", "http://localhost/video.mp4",
+        "https://user:pass@cdn.example/video.mp4", "http://169.254.169.254/latest/meta-data",
+    ):
+        assert api._safe_preview_url(value) is None
+
+
+def test_direct_video_url_not_returned_for_video_only_dash_or_hls_formats():
+    info = {"formats": [
+        {"url": "https://cdn.example/video-only.mp4", "ext": "mp4", "vcodec": "avc1", "acodec": "none", "height": 1080},
+        {"url": "https://cdn.example/manifest.m3u8", "ext": "m3u8", "vcodec": "avc1", "acodec": "none", "protocol": "m3u8_native"},
+    ]}
+    assert api._direct_media_urls(info, "vimeo")["video"] is None
+
+
+def test_direct_audio_url_inferred_from_audio_extension_without_codec_fields():
+    info = {"url": "https://cdn.example/direct-track.mp3", "ext": "mp3"}
+    assert api._direct_media_urls(info, "soundcloud")["audio"] == "https://cdn.example/direct-track.mp3"
