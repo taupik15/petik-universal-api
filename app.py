@@ -32,7 +32,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 from yt_dlp import YoutubeDL
 
-APP_VERSION = "1.6.2"
+APP_VERSION = "1.6.3"
 MAX_GALLERY_ITEMS = max(1, min(30, int(os.getenv("MAX_GALLERY_ITEMS", "20"))))
 MAX_GALLERY_SOURCE_ITEMS = MAX_GALLERY_ITEMS * 2  # Mixed carousels can contain video entries between photos.
 MAX_GALLERY_FILE_BYTES = int(os.getenv("MAX_GALLERY_FILE_MB", "20")) * 1024 * 1024
@@ -753,33 +753,165 @@ def _instagram_public_gallery(url: str) -> list[dict]:
             pass
 
 
-def _facebook_photo_items_from_html(page_html: str) -> list[dict]:
-    """Collect public Facebook CDN image URLs from OG metadata and page JSON."""
+def _facebook_target_ids(value: str) -> set[str]:
+    """Return post/photo identifiers explicitly present in a Facebook URL."""
+    try:
+        parsed = urlparse(value)
+    except Exception:
+        return set()
+    query = parse_qs(parsed.query, keep_blank_values=False)
+    identifiers: set[str] = set()
+    for key in ("fbid", "story_fbid", "post_id", "video_id", "media_id", "photo_id", "v"):
+        for item in query.get(key, []):
+            item = str(item).strip()
+            if item and len(item) <= 160:
+                identifiers.add(item)
+    parts = [part for part in parsed.path.split("/") if part]
+    for index, part in enumerate(parts[:-1]):
+        if part.lower() in {"posts", "videos", "photos", "permalink", "reel", "reels"}:
+            candidate = parts[index + 1].split("?", 1)[0]
+            if candidate and len(candidate) <= 160:
+                identifiers.add(candidate)
+    return identifiers
+
+
+def _facebook_photo_url_from_node(node: dict) -> str | None:
+    """Read only the image URL belonging to a structured Facebook Photo node."""
+    image = node.get("image")
+    candidates = []
+    if isinstance(image, dict):
+        candidates.extend([image.get("uri"), image.get("url"), image.get("src")])
+    elif isinstance(image, str):
+        candidates.append(image)
+    for key in ("photo_image", "thumbnail", "preferred_thumbnail"):
+        value = node.get(key)
+        if isinstance(value, dict):
+            candidates.extend([value.get("uri"), value.get("url"), value.get("src")])
+        elif isinstance(value, str):
+            candidates.append(value)
+    for value in candidates:
+        if isinstance(value, str) and _safe_social_media_url(value) and _image_extension_from_url(value):
+            return value
+    return None
+
+
+def _facebook_collect_target_attachment_photos(target: dict) -> list[str]:
+    """Walk only the attachment subtree of a URL-matched post/photo object."""
+    relation_keys = {
+        "attachments", "all_subattachments", "nodes", "edges", "media", "attachment",
+        "style_type_renderer", "styles", "target", "target_group", "comet_sections",
+        "content", "story", "attached_story", "image", "photo",
+    }
+    photos: list[str] = []
+    seen: set[str] = set()
+    stack: list[object] = [target]
+    visited = 0
+    while stack and visited < 100_000 and len(photos) < MAX_GALLERY_ITEMS:
+        value = stack.pop()
+        visited += 1
+        if isinstance(value, dict):
+            typename = str(value.get("__typename") or "")
+            is_photo = typename == "Photo" or value.get("__isMedia") == "Photo"
+            if is_photo:
+                image_url = _facebook_photo_url_from_node(value)
+                if image_url:
+                    canonical = image_url.split("?", 1)[0]
+                    if canonical not in seen:
+                        seen.add(canonical)
+                        photos.append(image_url)
+                continue
+            for key in relation_keys:
+                child = value.get(key)
+                if isinstance(child, (dict, list)):
+                    stack.append(child)
+        elif isinstance(value, list):
+            stack.extend(value)
+    return list(reversed(photos))
+
+
+def _facebook_photo_items_from_html(page_html: str, source_url: str | None = None) -> list[dict]:
+    """Extract only post-scoped Facebook photos; never scrape arbitrary page CDN URLs.
+
+    Open Graph images are authoritative for the requested page. Additional album
+    images are accepted only from a structured Photo attachment subtree whose
+    owning post/photo identifier matches the supplied URL or its canonical og:url.
+    Broad URL harvesting is intentionally forbidden because Facebook pages also
+    embed recommendations, profile pictures, reaction assets, and unrelated cards.
+    """
     if not isinstance(page_html, str) or not page_html:
         return []
     html_text = html_lib.unescape(page_html)
     html_text = (html_text.replace(r"\/", "/").replace(r"\u0026", "&")
                  .replace(r"\u003d", "=").replace(r"\u003A", ":").replace(r"\u003a", ":"))
-    candidates: list[str] = []
 
-    # Prefer Open Graph images, which normally identify the specific shared post/photo.
+    target_ids = _facebook_target_ids(source_url or "")
+    candidates: list[str] = []
+    canonical_urls: list[str] = []
+    meta_entries: list[tuple[str, str]] = []
+
     for tag in re.findall(r"<meta\b[^>]*>", html_text, re.I):
         prop = re.search(r"\b(?:property|name)\s*=\s*([\"'])(.*?)\1", tag, re.I)
         content = re.search(r"\bcontent\s*=\s*([\"'])(.*?)\1", tag, re.I)
-        if prop and content and prop.group(2).lower() in {"og:image", "og:image:url", "twitter:image"}:
-            candidates.append(html_lib.unescape(content.group(2)))
+        if not (prop and content):
+            continue
+        meta_name = prop.group(2).lower()
+        meta_value = html_lib.unescape(content.group(2)).replace("&amp;", "&")
+        meta_entries.append((meta_name, meta_value))
+        if meta_name in {"og:url", "twitter:url"}:
+            canonical_urls.append(meta_value)
 
-    # Public Facebook embeds may place additional carousel images in page JSON.
-    for match in re.findall(r"https?://[^\"'<>\s\\]+", html_text):
-        value = match.rstrip("),.;]")
-        if _safe_social_media_url(value):
-            candidates.append(value)
+    source_parsed = urlparse(source_url or "")
+    source_query = parse_qs(source_parsed.query)
+    is_video_page = (
+        source_parsed.path.lower().startswith(("/watch", "/video.php"))
+        or "/videos/" in source_parsed.path.lower()
+        or bool(source_query.get("v") or source_query.get("video_id"))
+        or any(name in {"og:video", "og:video:url", "og:video:secure_url", "twitter:player"}
+               for name, _value in meta_entries)
+        or any(name == "og:type" and value.lower().startswith("video") for name, value in meta_entries)
+    )
+    for meta_name, meta_value in meta_entries:
+        if meta_name in {"og:image", "og:image:url", "twitter:image"} and not is_video_page:
+            candidates.append(meta_value)
+
+    for canonical_url in canonical_urls:
+        target_ids.update(_facebook_target_ids(canonical_url))
+
+    # Search only JSON script payloads, then bind photo nodes to a post/photo object
+    # that carries an identifier found in the requested URL. Do not scrape all URLs.
+    script_pattern = re.compile(
+        r"<script\b(?=[^>]*(?:\btype\s*=\s*[\"']application/json[\"']|\bdata-sjs\b))[^>]*>(.*?)</script>",
+        re.I | re.S,
+    )
+    id_keys = ("id", "post_id", "postID", "story_id", "story_fbid", "legacy_story_id", "top_level_post_id", "fbid")
+    for script in script_pattern.finditer(html_text):
+        raw = script.group(1).strip()
+        if raw.startswith("for (;;);"):
+            raw = raw[len("for (;;);"):]
+        try:
+            root = json.loads(raw)
+        except Exception:
+            continue
+        stack = [root]
+        visited = 0
+        while stack and visited < 200_000:
+            value = stack.pop()
+            visited += 1
+            if isinstance(value, dict):
+                values = {str(value.get(key)).strip() for key in id_keys if value.get(key) is not None}
+                if target_ids and values.intersection(target_ids):
+                    candidates.extend(_facebook_collect_target_attachment_photos(value))
+                # Broad traversal is used only to locate the target's ID-bearing
+                # node; actual media collection remains restricted to that node's
+                # attachment subtree above.
+                stack.extend(child for child in value.values() if isinstance(child, (dict, list)))
+            elif isinstance(value, list):
+                stack.extend(value)
 
     photos: list[dict] = []
     seen: set[str] = set()
-    source_index = 0
     for value in candidates:
-        value = value.replace("&amp;", "&")
+        value = str(value).replace("&amp;", "&").strip()
         if not _safe_social_media_url(value):
             continue
         suffix = _image_extension_from_url(value)
@@ -790,19 +922,17 @@ def _facebook_photo_items_from_html(page_html: str) -> list[dict]:
         if dedupe in seen:
             continue
         seen.add(dedupe)
-        source_index += 1
         filename = Path(unquote(parsed.path)).name
         if not Path(filename).suffix:
-            filename = f"foto-{source_index:03d}{suffix}"
+            filename = f"foto-{len(photos) + 1:03d}{suffix}"
         photos.append({
-            "id": source_index, "url": value, "thumbnail": value,
+            "id": len(photos) + 1, "url": value, "thumbnail": value,
             "extension": suffix.lstrip("."), "filename": filename[:160],
-            "label": f"Foto {source_index}", "kind": "image",
+            "label": f"Foto {len(photos) + 1}", "kind": "image",
         })
         if len(photos) >= MAX_GALLERY_ITEMS:
             break
     return photos
-
 
 def _facebook_public_gallery(url: str) -> list[dict]:
     """Best-effort logged-out Facebook post/photo page parser; no account cookies."""
@@ -825,7 +955,7 @@ def _facebook_public_gallery(url: str) -> list[dict]:
         if "login/?" in final_url.lower() or "login" in page_html[:5000].lower() and "og:image" not in page_html[:5000].lower():
             print("[facebook-public-gallery] Facebook returned a login wall")
             return []
-        photos = _facebook_photo_items_from_html(page_html)
+        photos = _facebook_photo_items_from_html(page_html, url)
         if not photos:
             print("[facebook-public-gallery] no public CDN image URLs found")
         return photos
@@ -1465,7 +1595,7 @@ def health():
         "galleryPlatforms": sorted(GALLERY_PLATFORMS | {"threads"}),
         "threadsPhotoResolver": "public-page-json",
         "instagramPhotoResolver": "gallery-dl+logged-out-graphql+page-json",
-        "facebookPhotoResolver": "gallery-dl+logged-out-page-html",
+        "facebookPhotoResolver": "gallery-dl+og-image+post-scoped-json",
         "socialPublicFallbackAvailable": HAS_CURL_CFFI,
         "instagramPublicFallbackAvailable": HAS_CURL_CFFI,
         "maxGalleryItems": MAX_GALLERY_ITEMS,

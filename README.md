@@ -1,6 +1,6 @@
 # Petik Universal Extractor API
 
-Backend Petik v1.6.2 berbasis FastAPI, yt-dlp, gallery-dl, curl-cffi (fallback Instagram), Deno/EJS, HTTPX, dan FFmpeg. API mendukung dua pola:
+Backend Petik v1.6.3 berbasis FastAPI, yt-dlp, gallery-dl, curl-cffi (fallback Instagram), Deno/EJS, HTTPX, dan FFmpeg. API mendukung dua pola:
 
 - Native Petik: `POST /api/inspect` memeriksa metadata, format video/audio, dan galeri foto; `POST /api/download` memproses video/audio.
 - Galeri foto: `POST /api/gallery/download` mengunduh indeks foto terpilih sebagai file individual atau satu ZIP.
@@ -13,7 +13,7 @@ Backend Petik v1.6.2 berbasis FastAPI, yt-dlp, gallery-dl, curl-cffi (fallback I
 3. Pastikan `Dockerfile`, `app.py`, `requirements.txt`, dan `render.yaml` berada langsung di root.
 4. Di Render, buka Blueprint `petik-universal-api`, lalu jalankan Manual Sync / Apply jika diminta.
 5. Tunggu deploy berstatus **Live**.
-6. Tes `https://NAMA-LAYANAN.onrender.com/health`; versi yang baru harus menampilkan `1.6.2`, `galleryDlAvailable: true`, serta `galleryDlVersion` yang terdeteksi.
+6. Tes `https://NAMA-LAYANAN.onrender.com/health`; versi yang baru harus menampilkan `1.6.3`, `galleryDlAvailable: true`, serta `galleryDlVersion` yang terdeteksi.
 7. Tes URL root `/`; daftar `cobalt.services` harus memuat layanan yang ditawarkan.
 
 ## Platform dan batas dukungan
@@ -27,7 +27,7 @@ Batasan khusus:
 - Telegram hanya mendukung postingan channel/grup publik, misalnya `t.me/nama_channel/123`. Tautan privat, invite, chat pribadi, konten protected, dan `t.me/c/...` tidak didukung.
 - Threads: galeri foto/carousel memakai resolver halaman publik tanpa login. Resolver mengambil JSON yang dirender pada halaman post dan memilih post berdasarkan shortcode. Ini rapuh terhadap perubahan HTML/JSON Meta; jika payload tidak lagi tampil untuk pengunjung publik, ekstraksi akan gagal dengan aman. Foto dan video tetap dipisahkan.
 - Instagram: galeri foto mencoba gallery-dl, lalu resolver logged-out GraphQL terbaru dan JSON halaman publik menggunakan curl-cffi. Tidak memakai akun, username/password, atau cookie sesi pengguna. Resolver ini tetap best-effort: Meta dapat mengganti query internal, menampilkan login wall, memberi rate limit, atau membatasi IP server.
-- Facebook: galeri foto mencoba gallery-dl, lalu resolver HTML publik yang membaca metadata Open Graph dan URL CDN gambar yang tertanam di halaman. Ini paling sesuai untuk foto yang ditampilkan langsung oleh halaman publik; album/carousel tidak dijamin terambil lengkap bila Facebook tidak menyertakan semua URL di HTML.
+- Facebook: galeri foto mencoba gallery-dl terlebih dahulu. Fallback HTML publik hanya menerima gambar dari metadata Open Graph dan node `Photo` dalam subtree lampiran yang ID posting/fotonya cocok dengan URL sumber atau URL kanonis `og:url`. Pemindaian semua URL CDN di HTML sengaja dihapus karena halaman Facebook juga memuat rekomendasi, avatar, ikon, dan gambar posting lain. Album/carousel tambahan hanya diterima dari data lampiran target atau hasil gallery-dl; jika struktur itu tidak tersedia pada halaman publik, Petik memilih tidak menampilkan gambar tambahan daripada mencampurkan gambar asing.
 - X/Twitter, Pinterest, dan Reddit: galeri tetap menggunakan gallery-dl. Extractor upstream dapat meminta login, cookie, atau OAuth pada sebagian konten/versi platform. Petik tidak mengirim cookie akun pengguna; jika sumber menolak akses tanpa login, unduhan memang tidak akan berhasil.
 - Tidak ada API komersial, Apify, token API pihak ketiga, atau login akun media sosial yang ditambahkan. Story Instagram/Facebook bukan bagian dari galeri post dan tidak dijanjikan tersedia.
 - Dailymotion dan LinkedIn sekarang dikenali saat validasi tautan dan diserahkan ke yt-dlp; ini bukan jaminan semua jenis post LinkedIn/Dailymotion berhasil.
@@ -48,8 +48,17 @@ Batasan khusus:
 
 ## Tes
 
-Folder `tests/` berisi 56 tes offline untuk validasi platform, endpoint inspect dan URL preview progresif, deteksi direct-media URL, parser CDN dengan ekstensi query, parser galeri Threads/Instagram, keamanan host CDN dan redirect, indeks carousel campuran, endpoint download, kompatibilitas Cobalt, tunnel file, format MP3, filter durasi, dan kualitas video. Tes tiruan tidak membuktikan keberhasilan unduhan langsung dari situs sumber.
+Folder `tests/` berisi 61 tes offline untuk validasi platform, endpoint inspect dan URL preview progresif, deteksi direct-media URL, parser CDN dengan ekstensi query, parser galeri Threads/Instagram, keamanan host CDN dan redirect, indeks carousel campuran, endpoint download, kompatibilitas Cobalt, tunnel file, format MP3, filter durasi, dan kualitas video. Tes tiruan tidak membuktikan keberhasilan unduhan langsung dari situs sumber.
 
+
+## Perubahan v1.6.3 (Facebook post-scoped gallery)
+
+- Menghapus pemindaian URL CDN dari seluruh HTML Facebook yang sebelumnya dapat memasukkan rekomendasi, foto profil, ikon, thumbnail konten lain, atau gambar dekoratif.
+- Fallback Facebook sekarang mengutamakan metadata Open Graph untuk gambar posting aktif dan hanya membaca node `Photo` tambahan dari subtree lampiran yang terikat ke ID posting/foto dari URL sumber atau `og:url` kanonis.
+- Pengumpulan media JSON dibatasi ke relasi lampiran yang relevan dan allowlist host Meta; data JSON tanpa ID target tidak boleh memperluas galeri.
+- `gallery-dl` tetap menjadi extractor awal untuk album/foto; resolver HTML yang lebih ketat menjadi fallback agar album yang tidak tersedia secara anonim tidak diganti dengan gambar acak dari halaman.
+- Menambahkan filter agar thumbnail video Facebook tidak salah dianggap sebagai galeri foto.
+- Menambah tes regresi untuk satu foto, album dengan beberapa lampiran target, gambar rekomendasi yang tidak boleh ikut, JSON tanpa ID target, share URL yang memperoleh ID dari `og:url`, dan thumbnail video.
 
 ## Perubahan v1.6.2 (perbaikan Instagram dan Facebook publik)
 
@@ -57,7 +66,7 @@ Folder `tests/` berisi 56 tes offline untuk validasi platform, endpoint inspect 
 - Memperbaiki konfigurasi TLS impersonation `curl-cffi`: fingerprint browser diberikan saat membuat `Session(impersonate="chrome")`, bukan dengan mengisi atribut sesi sesudahnya.
 - Menambahkan fallback Instagram dari JSON halaman publik ketika respons GraphQL tidak menyediakan objek media.
 - Memperluas parser Instagram untuk `carousel_media`, `image_versions2`, `display_resources`, serta media video di sela-sela foto; poster video tidak dianggap foto.
-- Menambahkan fallback Facebook publik berbasis metadata Open Graph dan URL CDN gambar yang tertanam di HTML halaman, tanpa login atau cookie akun.
+- Menambahkan fallback Facebook publik berbasis metadata Open Graph dan parsing halaman tanpa login atau cookie akun. Pada v1.6.3, parsing fallback ini diperketat agar hanya menerima media terkait postingan target.
 - Menambahkan unduhan langsung dari CDN Instagram/Facebook yang sudah lolos allowlist HTTPS, validasi redirect, MIME/magic bytes, dan batas ukuran. `gallery-dl` tetap menjadi jalur awal dan fallback unduhan.
 - Menambahkan status resolver di `/health` dan pesan lebih jelas ketika Instagram hanya mengembalikan error karena tidak ada stream video dan tidak ada data foto publik yang berhasil dibaca.
 - Mempertahankan resolver Threads yang sudah ada serta fitur video/audio dan galeri frontend.
