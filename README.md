@@ -1,4 +1,4 @@
-# Petik Universal API v1.16.0 — YouTube via WARP/proxy (lihat PETIK-v1.16-LANGKAH.md)
+# Petik Universal API v1.17.0 — rotasi pool WARP untuk YouTube (lihat PETIK-v1.17-LANGKAH.md)
 
 Petik adalah backend publik berbasis FastAPI, yt-dlp, gallery-dl, Deno/EJS, BgUtils PO Token Provider, HTTPX, curl-cffi, dan FFmpeg. Rilis ini berfokus pada penghentian retry YouTube yang tersembunyi setelah HTTP 429. Resolver sosial, galeri campuran foto + video, kompatibilitas API, dan konfigurasi BgUtils v1.14 dipertahankan.
 

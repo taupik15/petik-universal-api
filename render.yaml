@@ -44,6 +44,10 @@ services:
         value: "45"
       - key: YOUTUBE_WARP_ENABLED
         value: "1"
+      - key: WARP_POOL_SIZE
+        value: "3"
+      - key: YOUTUBE_PROXY_BURN_SECONDS
+        value: "120"
       - key: YOUTUBE_WPC_ENABLED
         value: "0"
       - key: YOUTUBE_POT_PROVIDER_MODE

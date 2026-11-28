@@ -38,7 +38,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 from yt_dlp import YoutubeDL
 
-APP_VERSION = "1.16.0"
+APP_VERSION = "1.17.0"
 MAX_GALLERY_ITEMS = max(1, min(30, int(os.getenv("MAX_GALLERY_ITEMS", "20"))))
 MAX_GALLERY_SOURCE_ITEMS = MAX_GALLERY_ITEMS * 2  # Mixed carousels can contain video entries between photos.
 MAX_GALLERY_FILE_BYTES = int(os.getenv("MAX_GALLERY_FILE_MB", "20")) * 1024 * 1024
@@ -159,15 +159,17 @@ YOUTUBE_RETRY_OPTIONS = {
 YOUTUBE_PROXY_SCHEMES = {"http", "https", "socks4", "socks5", "socks5h"}
 
 
-def _youtube_proxy() -> str | None:
-    """Optional egress proxy for YouTube only (e.g. Cloudflare WARP via wireproxy).
+YOUTUBE_PROXY_LOCK = threading.Lock()
+YOUTUBE_PROXY_BURNED: dict[str, float] = {}
+YOUTUBE_PROXY_USE_COUNT: dict[str, int] = {}
+YOUTUBE_PROXY_BURN_SECONDS = max(10, int(os.getenv("YOUTUBE_PROXY_BURN_SECONDS", "120") or 120))
+YOUTUBE_ROTATION_MAX_ATTEMPTS = max(1, int(os.getenv("YOUTUBE_ROTATION_MAX_ATTEMPTS", "4") or 4))
+YOUTUBE_LOCAL = threading.local()
+youtube_preview_proxy: dict[str, str] = {}
 
-    YouTube rate-limits shared datacenter IPs such as Render Free. Routing only
-    YouTube through another egress IP leaves every other extractor untouched.
-    Googlevideo URLs are bound to the IP that requested them, so previews and
-    downloads for YouTube must use the same proxy as extraction.
-    """
-    value = os.getenv("YOUTUBE_PROXY", "").strip()
+
+def _valid_youtube_proxy(value: str) -> str | None:
+    value = (value or "").strip()
     if not value:
         return None
     try:
@@ -179,12 +181,127 @@ def _youtube_proxy() -> str | None:
     return value
 
 
-def _youtube_proxy_kind() -> str | None:
-    proxy = _youtube_proxy()
-    if not proxy:
+def _youtube_proxy_pool() -> list[str]:
+    """All configured YouTube egress proxies, in stable order.
+
+    Sources: YOUTUBE_PROXY and YOUTUBE_PROXY_POOL (comma separated) plus an
+    optional file (YOUTUBE_PROXY_POOL_FILE, one URL per line) that start.sh
+    fills as extra WARP tunnels come up in the background.
+    """
+    values: list[str] = []
+    for env_name in ("YOUTUBE_PROXY", "YOUTUBE_PROXY_POOL"):
+        values.extend(os.getenv(env_name, "").split(","))
+    pool_file = os.getenv("YOUTUBE_PROXY_POOL_FILE", "").strip()
+    if pool_file:
+        try:
+            values.extend(Path(pool_file).read_text(encoding="utf-8").split())
+        except OSError:
+            pass
+    pool: list[str] = []
+    for item in values:
+        proxy = _valid_youtube_proxy(item)
+        if proxy and proxy not in pool:
+            pool.append(proxy)
+    return pool
+
+
+def _pick_youtube_proxy() -> str | None:
+    """Choose the least-used healthy proxy; if all are burned, the one recovering first."""
+    pool = _youtube_proxy_pool()
+    if not pool:
         return None
-    host = (urlparse(proxy).hostname or "").lower()
-    return "warp" if host in {"127.0.0.1", "localhost"} and os.getenv("YOUTUBE_WARP_ACTIVE") == "1" else "custom"
+    now = time.monotonic()
+    with YOUTUBE_PROXY_LOCK:
+        healthy = [item for item in pool if YOUTUBE_PROXY_BURNED.get(item, 0.0) <= now]
+        if healthy:
+            choice = min(healthy, key=lambda item: YOUTUBE_PROXY_USE_COUNT.get(item, 0))
+        else:
+            choice = min(pool, key=lambda item: YOUTUBE_PROXY_BURNED.get(item, 0.0))
+        YOUTUBE_PROXY_USE_COUNT[choice] = YOUTUBE_PROXY_USE_COUNT.get(choice, 0) + 1
+    return choice
+
+
+def _youtube_proxy() -> str | None:
+    """Proxy bound to this operation (so extraction, download and preview share one IP)."""
+    bound = getattr(YOUTUBE_LOCAL, "proxy", None)
+    if bound:
+        return bound
+    pool = _youtube_proxy_pool()
+    if not pool:
+        return None
+    now = time.monotonic()
+    with YOUTUBE_PROXY_LOCK:
+        healthy = [item for item in pool if YOUTUBE_PROXY_BURNED.get(item, 0.0) <= now]
+    return (healthy or pool)[0]
+
+
+def _burn_youtube_proxy(proxy: str | None) -> None:
+    if not proxy:
+        return
+    with YOUTUBE_PROXY_LOCK:
+        YOUTUBE_PROXY_BURNED[proxy] = time.monotonic() + YOUTUBE_PROXY_BURN_SECONDS
+
+
+def _youtube_proxy_health() -> dict:
+    pool = _youtube_proxy_pool()
+    now = time.monotonic()
+    with YOUTUBE_PROXY_LOCK:
+        burned = [max(0, int(round(YOUTUBE_PROXY_BURNED.get(item, 0.0) - now))) for item in pool]
+    healthy = sum(1 for value in burned if value <= 0)
+    return {"poolSize": len(pool), "healthy": healthy, "burnedRemainingSeconds": [v for v in burned if v > 0]}
+
+
+def _youtube_has_healthy_proxy(exclude: str | None = None) -> bool:
+    pool = [item for item in _youtube_proxy_pool() if item != exclude]
+    now = time.monotonic()
+    with YOUTUBE_PROXY_LOCK:
+        return any(YOUTUBE_PROXY_BURNED.get(item, 0.0) <= now for item in pool)
+
+
+def _youtube_is_blocked_error(exc: BaseException) -> bool:
+    code = _youtube_error_code(str(exc))
+    text = str(exc).lower()
+    return code in {"http_429", "bot_check"} or "http error 429" in text or "429" in text and "youtube" in text
+
+
+def _with_youtube_rotation(operation):
+    """Run a YouTube operation; on 429/anti-bot, burn this proxy and retry on another.
+
+    Without a proxy pool this is a plain call. Each retry uses a different WARP
+    tunnel (different Cloudflare identity), so switching videos no longer waits
+    for a long global cooldown while another tunnel is still healthy.
+    """
+    pool = _youtube_proxy_pool()
+    if not pool:
+        return operation()
+    attempts = min(len(pool), YOUTUBE_ROTATION_MAX_ATTEMPTS)
+    last_error: BaseException | None = None
+    for attempt in range(attempts):
+        proxy = _pick_youtube_proxy()
+        YOUTUBE_LOCAL.proxy = proxy
+        try:
+            return operation()
+        except Exception as exc:
+            last_error = exc
+            if not _youtube_is_blocked_error(exc):
+                raise
+            _burn_youtube_proxy(proxy)
+            if attempt >= attempts - 1 or not _youtube_has_healthy_proxy():
+                raise
+            time.sleep(1.0)
+        finally:
+            YOUTUBE_LOCAL.proxy = None
+    if last_error:
+        raise last_error
+    return operation()
+
+
+def _youtube_proxy_kind() -> str | None:
+    pool = _youtube_proxy_pool()
+    if not pool:
+        return None
+    local = all((urlparse(item).hostname or "").lower() in {"127.0.0.1", "localhost"} for item in pool)
+    return "warp" if local and os.getenv("YOUTUBE_WARP_ACTIVE") == "1" else "custom"
 
 
 class _HttpxUpstream:
@@ -462,7 +579,7 @@ def _bgutil_provider_status() -> dict:
         try:
             request = urllib.request.Request(
                 f"{base_url}/ping",
-                headers={"User-Agent": "Petik-Health/1.16.0"},
+                headers={"User-Agent": "Petik-Health/1.17.0"},
             )
             with urllib.request.urlopen(request, timeout=1.2) as response:
                 payload = json.loads(response.read(4096).decode("utf-8", errors="replace"))
@@ -475,7 +592,7 @@ def _bgutil_provider_status() -> dict:
         try:
             request = urllib.request.Request(
                 f"{telemetry_url}/stats",
-                headers={"User-Agent": "Petik-Health/1.16.0"},
+                headers={"User-Agent": "Petik-Health/1.17.0"},
             )
             with urllib.request.urlopen(request, timeout=0.8) as response:
                 candidate = json.loads(response.read(4096).decode("utf-8", errors="replace"))
@@ -607,6 +724,20 @@ def _youtube_rate_control_snapshot() -> dict:
 def _activate_youtube_cooldown(client: str | None, stage: str | None) -> None:
     global youtube_cooldown_until_monotonic, youtube_429_count
     now = time.monotonic()
+    bound = getattr(YOUTUBE_LOCAL, "proxy", None)
+    if bound and len(_youtube_proxy_pool()) > 1:
+        _burn_youtube_proxy(bound)
+        if _youtube_has_healthy_proxy(exclude=bound):
+            # Another tunnel is healthy: rotate instead of freezing all of YouTube.
+            with YOUTUBE_RATE_LOCK:
+                youtube_429_count += 1
+            _update_youtube_diagnostics(
+                http429Observed=True, lastHttp429Client=client, lastHttp429Stage=stage,
+                lastHttp429At=time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+                lastErrorCode="http_429", lastErrorEvent="http_429",
+                lastErrorStage=stage or "http_429", httpStatus=429,
+            )
+            return
     with YOUTUBE_RATE_LOCK:
         youtube_cooldown_until_monotonic = max(
             youtube_cooldown_until_monotonic, now + YOUTUBE_RATE_LIMIT_COOLDOWN_SECONDS
@@ -1253,8 +1384,17 @@ def _extract_info(url: str) -> dict:
                 _update_youtube_diagnostics(infoCacheHit=True, lastOutcome="cache-hit", lastStage="inspect_cache")
                 return cached
             _youtube_request_gate()
-            info = _extract_info_impl(url)
+            used = {}
+
+            def _run():
+                used["proxy"] = _youtube_proxy()
+                return _extract_info_impl(url)
+
+            info = _with_youtube_rotation(_run)
             if isinstance(info, dict):
+                if used.get("proxy"):
+                    info = dict(info)
+                    info["_petik_proxy"] = used["proxy"]
                 _cache_youtube_info(url, info)
             return info
     finally:
@@ -2984,7 +3124,7 @@ def _download_media(url: str, mode: str, quality: str) -> tuple[Path, str, dict]
         with YOUTUBE_ATTEMPT_LOCK:
             followup = _consume_youtube_inspect_cache(url)
             _youtube_request_gate(allow_recent_inspect_followup=followup)
-            return _download_media_impl(url, mode, quality)
+            return _with_youtube_rotation(lambda: _download_media_impl(url, mode, quality))
     finally:
         _cleanup_youtube_cookie_file()
 
@@ -3189,7 +3329,7 @@ def health():
             "recommendedForFreePlan": False,
         },
         "youtubeCookiesConfigured": _youtube_cookie_configured(),
-        "youtubeProxy": {"configured": bool(_youtube_proxy()), "kind": _youtube_proxy_kind(), "scheme": (urlparse(_youtube_proxy()).scheme if _youtube_proxy() else None)},
+        "youtubeProxy": {"configured": bool(_youtube_proxy_pool()), "kind": _youtube_proxy_kind(), **_youtube_proxy_health()},
         "youtubeRateControl": _youtube_rate_control_snapshot(),
         "youtubeRequestPolicy": {
             "retries": YOUTUBE_RETRY_OPTIONS["retries"],
@@ -3245,6 +3385,11 @@ def _preview_source(url: str) -> tuple[str, dict]:
             return cached[0], cached[1]
     info = _extract_info(url)
     media_url = _preview_url(info, _normalise_and_validate(url)[1])
+    if info.get("_petik_proxy"):
+        with state_lock:
+            youtube_preview_proxy[url] = info["_petik_proxy"]
+            if len(youtube_preview_proxy) > 256:
+                youtube_preview_proxy.pop(next(iter(youtube_preview_proxy)), None)
     if not media_url:
         raise RuntimeError("Sumber tidak menyediakan stream video langsung untuk pratinjau.")
     headers = {str(k): str(v) for k, v in (info.get("http_headers") or {}).items()}
@@ -3276,7 +3421,7 @@ def preview_media(request: Request, url: str):
         range_header = request.headers.get("range")
         if range_header:
             headers["Range"] = range_header
-        yt_proxy = _youtube_proxy() if _platform == "youtube" else None
+        yt_proxy = (youtube_preview_proxy.get(source_url) or _youtube_proxy()) if _platform == "youtube" else None
         if yt_proxy:
             upstream = _HttpxUpstream(media_url, headers, yt_proxy)
         else:
@@ -3343,7 +3488,7 @@ def youtube_network_diagnostics(request: Request):
         try:
             req = urllib.request.Request(
                 target,
-                headers={"User-Agent": "Mozilla/5.0 Petik-Network-Diagnostic/1.16.0", "Accept": "*/*"},
+                headers={"User-Agent": "Mozilla/5.0 Petik-Network-Diagnostic/1.17.0", "Accept": "*/*"},
                 method="GET",
             )
             with urllib.request.urlopen(req, timeout=8) as response:

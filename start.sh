@@ -14,51 +14,75 @@ BGUTIL_UPSTREAM="${BGUTIL_POT_PROVIDER_URL:-http://${BGUTIL_HOST}:${BGUTIL_PORT}
 cd "$APP_DIR"
 BGUTIL_READY=0
 
-# --- Optional Cloudflare WARP egress for YouTube (YOUTUBE_WARP_ENABLED=1) ---
-# Render Free shares datacenter IPs that YouTube answers with HTTP 429. When
-# enabled, a userspace WireGuard tunnel exposes SOCKS5 on 127.0.0.1 and the API
-# routes only YouTube traffic through it. Any failure here falls back to direct.
-WARP_PORT="${WARP_SOCKS_PORT:-40000}"
-if [ "${YOUTUBE_WARP_ENABLED:-0}" = "1" ] && [ -z "${YOUTUBE_PROXY:-}" ] \
-   && command -v wgcf >/dev/null 2>&1 && command -v wireproxy >/dev/null 2>&1; then
-  echo "[Petik] Preparing Cloudflare WARP tunnel for YouTube"
-  WARP_DIR=/tmp/warp
-  mkdir -p "$WARP_DIR" && cd "$WARP_DIR" || true
-  WARP_OK=0
-  if [ -n "${WGCF_ACCOUNT_TOML_B64:-}" ]; then
+# --- Optional Cloudflare WARP pool for YouTube (YOUTUBE_WARP_ENABLED=1) ---
+# Render Free shares datacenter IPs that YouTube answers with HTTP 429. This
+# starts WARP_POOL_SIZE userspace WireGuard tunnels (each its own free WARP
+# identity) exposed as SOCKS5 on 127.0.0.1. The API rotates between them and
+# retries on another tunnel when YouTube blocks one, instead of freezing all
+# YouTube traffic for minutes. Any failure falls back to the direct Render IP.
+WARP_BASE_PORT="${WARP_SOCKS_PORT:-40000}"
+WARP_POOL_SIZE="${WARP_POOL_SIZE:-3}"
+WARP_ROOT=/tmp/warp
+WARP_POOL_FILE="$WARP_ROOT/pool.txt"
+
+warp_start_tunnel() {
+  # $1 = slot number (0-based). Prints nothing; returns 0 when the tunnel is verified.
+  slot="$1"
+  port=$((WARP_BASE_PORT + slot))
+  dir="$WARP_ROOT/$slot"
+  mkdir -p "$dir" && cd "$dir" || return 1
+  if [ "$slot" = "0" ] && [ -n "${WGCF_ACCOUNT_TOML_B64:-}" ]; then
     printf '%s' "$WGCF_ACCOUNT_TOML_B64" | base64 -d > wgcf-account.toml 2>/dev/null || rm -f wgcf-account.toml
   fi
   n=0
-  while [ "$n" -lt 3 ] && [ ! -s wgcf-account.toml ]; do
-    wgcf register --accept-tos >/tmp/petik-wgcf.log 2>&1 || sleep 3
+  while [ "$n" -lt 4 ] && [ ! -s wgcf-account.toml ]; do
+    wgcf register --accept-tos >>"/tmp/petik-wgcf-$slot.log" 2>&1 || sleep $((3 + n * 2))
     n=$((n + 1))
   done
-  if [ -s wgcf-account.toml ] && wgcf generate >>/tmp/petik-wgcf.log 2>&1 && [ -s wgcf-profile.conf ]; then
-    {
-      cat wgcf-profile.conf
-      printf '\n[Socks5]\nBindAddress = 127.0.0.1:%s\n' "$WARP_PORT"
-    } > wireproxy.conf
-    wireproxy -c wireproxy.conf >/tmp/petik-wireproxy.log 2>&1 &
-    i=0
-    while [ "$i" -lt 15 ]; do
-      if curl -fsS --max-time 6 --socks5-hostname "127.0.0.1:${WARP_PORT}" \
-           https://www.cloudflare.com/cdn-cgi/trace 2>/dev/null | grep -Eq '^warp=(on|plus)'; then
-        WARP_OK=1
-        break
-      fi
-      i=$((i + 1))
-      sleep 1
-    done
-  fi
-  cd "$APP_DIR" || true
-  if [ "$WARP_OK" = "1" ]; then
-    export YOUTUBE_PROXY="socks5h://127.0.0.1:${WARP_PORT}"
+  [ -s wgcf-account.toml ] || return 1
+  wgcf generate >>"/tmp/petik-wgcf-$slot.log" 2>&1 || return 1
+  [ -s wgcf-profile.conf ] || return 1
+  {
+    cat wgcf-profile.conf
+    printf '\n[Socks5]\nBindAddress = 127.0.0.1:%s\n' "$port"
+  } > wireproxy.conf
+  wireproxy -c wireproxy.conf >"/tmp/petik-wireproxy-$slot.log" 2>&1 &
+  i=0
+  while [ "$i" -lt 15 ]; do
+    trace="$(curl -fsS --max-time 6 --socks5-hostname "127.0.0.1:${port}" https://www.cloudflare.com/cdn-cgi/trace 2>/dev/null || true)"
+    if printf '%s' "$trace" | grep -Eq '^warp=(on|plus)'; then
+      echo "[Petik] WARP tunnel $slot ready on port $port (egress $(printf '%s' "$trace" | sed -n 's/^ip=//p' | head -n 1))"
+      echo "socks5h://127.0.0.1:${port}" >> "$WARP_POOL_FILE"
+      return 0
+    fi
+    i=$((i + 1))
+    sleep 1
+  done
+  return 1
+}
+
+if [ "${YOUTUBE_WARP_ENABLED:-0}" = "1" ] && [ -z "${YOUTUBE_PROXY:-}" ] \
+   && command -v wgcf >/dev/null 2>&1 && command -v wireproxy >/dev/null 2>&1; then
+  echo "[Petik] Preparing Cloudflare WARP pool (${WARP_POOL_SIZE} tunnels) for YouTube"
+  rm -rf "$WARP_ROOT"; mkdir -p "$WARP_ROOT"; : > "$WARP_POOL_FILE"
+  export YOUTUBE_PROXY_POOL_FILE="$WARP_POOL_FILE"
+  # First tunnel is synchronous so the API starts with at least one route.
+  if ( warp_start_tunnel 0 ); then
     export YOUTUBE_WARP_ACTIVE=1
-    echo "[Petik] WARP tunnel is up; YouTube traffic will use ${YOUTUBE_PROXY}"
   else
-    echo "[Petik] WARNING: WARP tunnel failed; YouTube will use the direct Render IP"
-    tail -n 15 /tmp/petik-wgcf.log /tmp/petik-wireproxy.log 2>/dev/null || true
+    echo "[Petik] WARNING: first WARP tunnel failed; YouTube will use the direct Render IP"
+    tail -n 10 /tmp/petik-wgcf-0.log /tmp/petik-wireproxy-0.log 2>/dev/null || true
   fi
+  # Extra tunnels start in the background and join the pool when verified.
+  (
+    s=1
+    while [ "$s" -lt "$WARP_POOL_SIZE" ]; do
+      sleep 4
+      ( warp_start_tunnel "$s" ) || echo "[Petik] WARNING: WARP tunnel $s failed (pool continues without it)"
+      s=$((s + 1))
+    done
+  ) &
+  cd "$APP_DIR" || true
 fi
 
 if [ "$BGUTIL_ENABLED" = "1" ] && command -v deno >/dev/null 2>&1 && [ -f "$BGUTIL_DIR/src/main.ts" ] && [ -d "$BGUTIL_DIR/node_modules" ]; then
