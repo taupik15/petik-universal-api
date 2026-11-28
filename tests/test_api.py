@@ -29,8 +29,10 @@ def test_health_endpoint_and_version():
     response = client.get("/health")
     assert response.status_code == 200
     assert response.json()["status"] == "healthy"
-    assert response.json()["version"] == "1.7.0"
+    assert response.json()["version"] == "1.8.0"
     assert "javascriptRuntime" in response.json()
+    assert response.json()["mixedMediaAvailable"] is True
+    assert response.json()["maxGalleryVideoMB"] >= 1
 
 
 def test_root_advertises_all_expected_platforms():
@@ -372,6 +374,14 @@ def sample_photo_items():
     ]
 
 
+
+
+def mixed_photo_manifest():
+    return [
+        {"id": 1, "sourceIndex": 1, "type": "photo", "kind": "image", "url": "https://scontent.cdninstagram.com/photo-1.jpg", "thumbnail": "https://scontent.cdninstagram.com/photo-1.jpg", "extension": "jpg"},
+        {"id": 2, "sourceIndex": 2, "type": "photo", "kind": "image", "url": "https://scontent.cdninstagram.com/photo-2.webp", "thumbnail": "https://scontent.cdninstagram.com/photo-2.webp", "extension": "webp"},
+    ]
+
 def test_gallery_url_parser_filters_non_images_and_duplicates():
     output = "\n".join([
         "https://cdn.example/a.jpg?token=one",
@@ -390,7 +400,7 @@ def test_inspect_returns_photo_gallery_when_video_extractor_fails(monkeypatch):
     def unavailable(_url):
         raise RuntimeError("Unsupported URL")
     monkeypatch.setattr(api, "_extract_info", unavailable)
-    monkeypatch.setattr(api, "_gallery_list_images", lambda _url, _platform: sample_photo_items())
+    monkeypatch.setattr(api, "_gallery_list_media", lambda _url, _platform: mixed_photo_manifest())
     response = client.post("/api/inspect", json={"url": "https://www.instagram.com/p/ABC123/"})
     assert response.status_code == 200
     body = response.json()
@@ -408,7 +418,7 @@ def test_inspect_combines_video_and_photo_gallery(monkeypatch):
             {"format_id": "18", "height": 360, "vcodec": "avc1", "acodec": "mp4a", "ext": "mp4", "url": "https://cdn.example/video.mp4"}
         ]
     })
-    monkeypatch.setattr(api, "_gallery_list_images", lambda _url, _platform: sample_photo_items())
+    monkeypatch.setattr(api, "_gallery_list_media", lambda _url, _platform: mixed_photo_manifest())
     response = client.post("/api/inspect", json={"url": "https://www.instagram.com/p/ABC123/"})
     assert response.status_code == 200
     body = response.json()
@@ -426,20 +436,100 @@ def test_gallery_download_zip_endpoint(monkeypatch, tmp_path):
         first.write_bytes(b"first-photo")
         second.write_bytes(b"second-photo")
         return folder, [first, second]
+    manifest = [
+        {"id": 1, "sourceIndex": 1, "type": "photo", "url": "https://i.redd.it/one.jpg"},
+        {"id": 2, "sourceIndex": 2, "type": "photo", "url": "https://i.redd.it/two.webp"},
+    ]
+    monkeypatch.setattr(api, "_gallery_list_media", lambda _url, _platform: manifest)
     monkeypatch.setattr(api, "_download_gallery_files", fake_gallery)
     response = client.post("/api/gallery/download", json={
-        "url": "https://www.instagram.com/p/ABC123/", "indices": [1, 2], "zip": True
+        "url": "https://www.reddit.com/r/videos/comments/abc/title/", "indices": [1, 2], "zip": True
     })
     assert response.status_code == 200
     body = response.json()
     assert body["status"] == "tunnel"
-    assert body["filename"] == "petik-foto.zip"
+    assert body["filename"] == "petik-media.zip"
     file_response = client.get(body["url"])
     assert file_response.status_code == 200
     assert file_response.headers["content-type"] == "application/zip"
     import io, zipfile
     with zipfile.ZipFile(io.BytesIO(file_response.content)) as archive:
         assert archive.namelist() == ["foto-001.jpg", "foto-002.webp"]
+
+def test_mixed_media_zip_uses_source_indices_and_contains_photo_and_video(monkeypatch, tmp_path):
+    no_rate_limit(monkeypatch)
+    manifest = [
+        {"id": 1, "sourceIndex": 1, "type": "photo", "url": "https://i.redd.it/one.jpg"},
+        {"id": 2, "sourceIndex": 3, "type": "video", "url": "https://v.redd.it/two.mp4"},
+        {"id": 3, "sourceIndex": 4, "type": "photo", "url": "https://i.redd.it/three.webp"},
+    ]
+    captured = {}
+    def fake_download(_url, indices):
+        captured["indices"] = indices
+        folder = tmp_path / "mixed-gallery-job"
+        folder.mkdir()
+        video = folder / "003.mp4"
+        photo = folder / "004.webp"
+        video.write_bytes(b"video-fixture")
+        photo.write_bytes(b"photo-fixture")
+        return folder, [video, photo]
+    monkeypatch.setattr(api, "_gallery_list_media", lambda _url, _platform: manifest)
+    monkeypatch.setattr(api, "_download_gallery_files", fake_download)
+    response = client.post("/api/gallery/download", json={
+        "url": "https://www.reddit.com/r/videos/comments/abc/title/", "indices": [2, 3], "zip": True
+    })
+    assert response.status_code == 200
+    assert captured["indices"] == [3, 4]
+    body = response.json()
+    assert body["count"] == 2
+    file_response = client.get(body["url"])
+    import io, zipfile
+    with zipfile.ZipFile(io.BytesIO(file_response.content)) as archive:
+        assert archive.namelist() == ["video-001.mp4", "foto-002.webp"]
+
+
+def test_gallery_download_failures_match_missing_source_numbers(tmp_path):
+    items = [
+        {"id": 1, "sourceIndex": 1, "type": "photo"},
+        {"id": 2, "sourceIndex": 3, "type": "video"},
+        {"id": 3, "sourceIndex": 4, "type": "photo"},
+    ]
+    downloaded = tmp_path / "001.jpg"
+    downloaded.write_bytes(b"photo")
+    failures = api._gallery_download_failures(items, [1, 2, 3], [1, 3, 4], [downloaded])
+    assert failures == [
+        {"id": 2, "type": "video", "message": "Extractor tidak mengembalikan berkas untuk item ini."},
+        {"id": 3, "type": "photo", "message": "Extractor tidak mengembalikan berkas untuk item ini."},
+    ]
+
+
+def test_generic_gallery_endpoint_reports_partial_extractor_result(monkeypatch, tmp_path):
+    no_rate_limit(monkeypatch)
+    manifest = [
+        {"id": 1, "sourceIndex": 1, "type": "photo", "url": "https://i.redd.it/one.jpg"},
+        {"id": 2, "sourceIndex": 3, "type": "video", "url": "https://v.redd.it/two.mp4"},
+    ]
+    monkeypatch.setattr(api, "_gallery_list_media", lambda _url, _platform: manifest)
+
+    def fake_download(_url, indices):
+        assert indices == [1, 3]
+        folder = tmp_path / "partial-gallery-job"
+        folder.mkdir()
+        photo = folder / "001.jpg"
+        photo.write_bytes(b"photo")
+        return folder, [photo]
+
+    monkeypatch.setattr(api, "_download_gallery_files", fake_download)
+    response = client.post("/api/gallery/download", json={
+        "url": "https://www.reddit.com/r/videos/comments/abc/title/", "indices": [1, 2], "zip": False
+    })
+    assert response.status_code == 200
+    body = response.json()
+    assert body["count"] == 1
+    assert body["failedCount"] == 1
+    assert body["failures"][0]["id"] == 2
+    assert body["failures"][0]["type"] == "video"
+
 
 def test_gallery_download_individual_files_endpoint(monkeypatch, tmp_path):
     no_rate_limit(monkeypatch)
@@ -450,9 +540,14 @@ def test_gallery_download_individual_files_endpoint(monkeypatch, tmp_path):
         first.write_bytes(b"first-photo")
         second.write_bytes(b"second-photo")
         return folder, [first, second]
+    manifest = [
+        {"id": 1, "sourceIndex": 1, "type": "photo", "url": "https://i.redd.it/one.jpg"},
+        {"id": 2, "sourceIndex": 2, "type": "photo", "url": "https://i.redd.it/two.webp"},
+    ]
+    monkeypatch.setattr(api, "_gallery_list_media", lambda _url, _platform: manifest)
     monkeypatch.setattr(api, "_download_gallery_files", fake_gallery)
     response = client.post("/api/gallery/download", json={
-        "url": "https://www.facebook.com/photo/?fbid=123", "indices": [1, 2], "zip": False
+        "url": "https://www.reddit.com/r/videos/comments/abc/title/", "indices": [1, 2], "zip": False
     })
     assert response.status_code == 200
     body = response.json()
@@ -501,7 +596,7 @@ def test_inspect_does_not_mislabel_direct_jpg_as_video(monkeypatch):
         "id": "photo", "title": "A photo", "ext": "jpg",
         "url": "https://cdn.example/photo.jpg"
     })
-    monkeypatch.setattr(api, "_gallery_list_images", lambda _url, _platform: sample_photo_items())
+    monkeypatch.setattr(api, "_gallery_list_media", lambda _url, _platform: mixed_photo_manifest())
     response = client.post("/api/inspect", json={"url": "https://www.instagram.com/p/ABC123/"})
     assert response.status_code == 200
     body = response.json()
@@ -567,6 +662,16 @@ def test_threads_photo_parser_returns_only_real_images_and_best_variant():
     assert [item["id"] for item in items] == [1, 2]
 
 
+def test_threads_mixed_parser_preserves_photo_video_order_and_direct_urls():
+    items = api._threads_media_items("https://www.threads.com/share/SHARE123", _threads_fixture_html())
+    assert [item["type"] for item in items] == ["photo", "video", "photo"]
+    assert [item["id"] for item in items] == [1, 2, 3]
+    assert items[1]["url"] == "https://video.cdninstagram.com/clip.mp4"
+    assert items[1]["thumbnail"] == "https://scontent.cdninstagram.com/poster.jpg"
+    assert items[1]["directUrl"] == items[1]["url"]
+    assert [item["mediaIndex"] for item in api._media_photo_alias(items)] == [1, 3]
+
+
 def test_threads_gallery_requires_safe_cdn_hosts():
     assert api._safe_threads_media_url("https://scontent.cdninstagram.com/photo.jpg")
     assert api._safe_threads_media_url("https://video.fna.fbcdn.net/photo.jpg")
@@ -586,25 +691,36 @@ def test_threads_inspect_returns_photo_items_without_ytdlp(monkeypatch):
     body = response.json()
     assert body["service"] == "threads"
     assert len(body["photoItems"]) == 2
+    assert [item["type"] for item in body["mediaItems"]] == ["photo", "video", "photo"]
+    assert body["mediaCounts"] == {"total": 3, "photos": 2, "videos": 1}
     assert body["galleryAvailable"] is True
 
 
 def test_threads_gallery_download_routes_to_public_page_resolver(monkeypatch, tmp_path):
     no_rate_limit(monkeypatch)
-    def fake_download(_url, indices):
-        assert indices == [1]
+    mixed = [
+        {"id": 1, "sourceIndex": 1, "type": "photo", "url": "https://scontent.cdninstagram.com/a.jpg", "extension": "jpg"},
+        {"id": 2, "sourceIndex": 2, "type": "video", "url": "https://video.cdninstagram.com/b.mp4", "extension": "mp4"},
+    ]
+    def fake_download(_url, platform, items, indices):
+        assert platform == "threads"
+        assert [item["type"] for item in items] == ["photo", "video"]
+        assert indices == [1, 2]
         folder = tmp_path / "threads-gallery-job"
         folder.mkdir()
-        file = folder / "foto-001.jpg"
-        file.write_bytes(b"thread-photo")
-        return folder, [file]
-    monkeypatch.setattr(api, "_download_threads_gallery_files", fake_download)
+        photo, video = folder / "foto-001.jpg", folder / "video-002.mp4"
+        photo.write_bytes(b"thread-photo")
+        video.write_bytes(b"\x00\x00\x00\x18ftypisom-thread-video")
+        return folder, [photo, video], []
+    monkeypatch.setattr(api, "_threads_list_media", lambda _url: mixed)
+    monkeypatch.setattr(api, "_download_meta_media_items", fake_download)
     response = client.post("/api/gallery/download", json={
-        "url": "https://www.threads.com/share/SHARE123", "indices": [1], "zip": False
+        "url": "https://www.threads.com/share/SHARE123", "indices": [1, 2], "zip": False
     })
     assert response.status_code == 200
     assert response.json()["service"] == "threads"
-    assert response.json()["count"] == 1
+    assert response.json()["count"] == 2
+    assert [item["filename"].split(".")[-1] for item in response.json()["files"]] == ["jpg", "mp4"]
 
 
 def test_dailymotion_and_linkedin_are_recognised():
@@ -614,7 +730,7 @@ def test_dailymotion_and_linkedin_are_recognised():
 
 
 
-def test_instagram_public_graphql_normalizes_photo_carousel_and_skips_video():
+def test_instagram_public_graphql_normalizes_mixed_photo_video_carousel():
     payload = {
         "edge_sidecar_to_children": {"edges": [
             {"node": {"is_video": False, "display_url": "https://scontent.cdninstagram.com/a.jpg"}},
@@ -622,12 +738,17 @@ def test_instagram_public_graphql_normalizes_photo_carousel_and_skips_video():
             {"node": {"is_video": False, "display_url": "https://scontent.cdninstagram.com/c.jpg"}},
         ]}
     }
-    items = api._instagram_photo_items(payload)
+    items = api._instagram_media_items(payload)
+    assert [item["type"] for item in items] == ["photo", "video", "photo"]
     assert [item["url"] for item in items] == [
         "https://scontent.cdninstagram.com/a.jpg",
+        "https://video.cdninstagram.com/b.mp4",
         "https://scontent.cdninstagram.com/c.jpg",
     ]
-    assert [item["id"] for item in items] == [1, 3]
+    assert [item["id"] for item in items] == [1, 2, 3]
+    photos = api._instagram_photo_items(payload)
+    assert [item["id"] for item in photos] == [1, 2]
+    assert [item["mediaIndex"] for item in photos] == [1, 3]
 
 
 def test_instagram_public_fallback_uses_anonymous_graphql_session(monkeypatch):
@@ -671,7 +792,7 @@ def test_instagram_public_fallback_uses_anonymous_graphql_session(monkeypatch):
 
 def test_health_reports_gallery_and_public_fallback_capabilities():
     body = client.get("/health").json()
-    assert body["version"] == "1.7.0"
+    assert body["version"] == "1.8.0"
     assert "threads" in body["galleryPlatforms"]
     assert body["threadsPhotoResolver"] == "public-page-json"
     assert body["instagramPhotoResolver"] == "gallery-dl+logged-out-graphql+page-json"
@@ -705,16 +826,71 @@ def test_threads_gallery_download_fetches_and_validates_image_bytes(monkeypatch,
     ))
     original_client = httpx.Client
     monkeypatch.setattr(api, "TEMP_ROOT", tmp_path)
-    monkeypatch.setattr(api, "_threads_list_images", lambda _url: [{
-        "id": 1, "url": "https://scontent.cdninstagram.com/test.jpg", "extension": "jpg"
+    monkeypatch.setattr(api, "_threads_list_media", lambda _url: [{
+        "id": 1, "sourceIndex": 1, "type": "photo", "kind": "image",
+        "url": "https://scontent.cdninstagram.com/test.jpg", "extension": "jpg"
     }])
     monkeypatch.setattr(api.httpx, "Client", lambda **kwargs: original_client(transport=transport, **kwargs))
-    folder, files = api._download_threads_gallery_files("https://www.threads.com/share/ABC", [1])
+    folder, files, failures = api._download_threads_gallery_files("https://www.threads.com/share/ABC", [1])
+    assert failures == []
     assert len(files) == 1
     assert files[0].read_bytes() == image_bytes
     assert files[0].suffix == ".jpg"
     import shutil as _shutil
     _shutil.rmtree(folder, ignore_errors=True)
+
+
+def test_mixed_meta_download_keeps_successes_when_one_item_fails(monkeypatch, tmp_path):
+    import httpx
+    image_bytes = b"\xff\xd8\xffgood-image"
+    video_bytes = b"\x00\x00\x00\x18ftypisom-good-video"
+    def handler(request):
+        if request.url.path.endswith("three.jpg"):
+            return httpx.Response(404, request=request)
+        if request.url.path.endswith(".jpg"):
+            return httpx.Response(200, headers={"Content-Type": "image/jpeg"}, content=image_bytes, request=request)
+        if request.url.path.endswith(".mp4"):
+            return httpx.Response(200, headers={"Content-Type": "video/mp4"}, content=video_bytes, request=request)
+        return httpx.Response(404, request=request)
+    transport = httpx.MockTransport(handler)
+    original_client = httpx.Client
+    monkeypatch.setattr(api, "TEMP_ROOT", tmp_path)
+    manifest = [
+        {"id": 1, "type": "photo", "url": "https://scontent.cdninstagram.com/one.jpg", "extension": "jpg"},
+        {"id": 2, "type": "video", "url": "https://video.cdninstagram.com/two.mp4", "extension": "mp4"},
+        {"id": 3, "type": "photo", "url": "https://scontent.cdninstagram.com/three.jpg", "extension": "jpg"},
+    ]
+    monkeypatch.setattr(api, "_threads_list_media", lambda _url: manifest)
+    monkeypatch.setattr(api.httpx, "Client", lambda **kwargs: original_client(transport=transport, **kwargs))
+    folder, files, failures = api._download_threads_gallery_files("https://www.threads.com/share/ABC", [1, 2, 3])
+    assert [path.suffix for path in files] == [".jpg", ".mp4"]
+    assert len(failures) == 1 and failures[0]["id"] == 3
+    import shutil as _shutil
+    _shutil.rmtree(folder, ignore_errors=True)
+
+
+def test_gallery_endpoint_reports_partial_media_failures(monkeypatch, tmp_path):
+    no_rate_limit(monkeypatch)
+    manifest = [
+        {"id": 1, "sourceIndex": 1, "type": "photo", "url": "https://scontent.cdninstagram.com/one.jpg"},
+        {"id": 2, "sourceIndex": 2, "type": "video", "url": "https://video.cdninstagram.com/two.mp4"},
+    ]
+    def fake_download(_url, _platform, _items, _indices):
+        folder = tmp_path / "partial-endpoint"
+        folder.mkdir()
+        file_path = folder / "foto-001.jpg"
+        file_path.write_bytes(b"\xff\xd8\xffpartial-ok")
+        return folder, [file_path], [{"id": 2, "type": "video", "message": "CDN timeout"}]
+    monkeypatch.setattr(api, "_instagram_public_media", lambda _url: manifest)
+    monkeypatch.setattr(api, "_download_social_gallery_items", fake_download)
+    monkeypatch.setattr(api, "_store_file", lambda *_args: "partial-token")
+    response = client.post("/api/gallery/download", json={
+        "url": "https://www.instagram.com/p/ABC123/", "indices": [1, 2], "zip": False
+    })
+    assert response.status_code == 200
+    body = response.json()
+    assert body["count"] == 1 and body["failedCount"] == 1
+    assert body["failures"][0]["id"] == 2
 
 
 def test_threads_stream_rejects_unsafe_initial_host_before_network_request():
@@ -749,18 +925,62 @@ def test_instagram_product_payload_parser_handles_carousel_and_video_mixture():
          "image_versions2": {"candidates": [{"url": "https://scontent.cdninstagram.com/poster.jpg", "width": 640, "height": 640}]}},
         {"image_versions2": {"candidates": [{"url": "https://scontent.cdninstagram.com/second.webp?fm=webp", "width": 900, "height": 1200}]}},
     ]}
-    items = api._instagram_photo_items(media)
+    items = api._instagram_media_items(media)
+    assert [item["type"] for item in items] == ["photo", "video", "photo"]
     assert [item["url"] for item in items] == [
         "https://scontent.cdninstagram.com/large.jpg?format=jpg",
+        "https://video.cdninstagram.com/clip.mp4",
         "https://scontent.cdninstagram.com/second.webp?fm=webp",
     ]
-    assert [item["id"] for item in items] == [1, 3]
+    photos = api._instagram_photo_items(media)
+    assert len(photos) == 2
+    assert [item["mediaIndex"] for item in photos] == [1, 3]
 
 
 def test_instagram_current_graphql_payload_unwraps_logged_out_media():
     product = {"image_versions2": {"candidates": [{"url": "https://scontent.cdninstagram.com/one.jpg", "width": 900, "height": 900}]}}
     root = {"data": {"xig_polaris_media": {"if_not_gated_logged_out": product}}}
     assert api._instagram_find_product_info(root) == product
+
+
+def test_non_gallery_platform_does_not_advertise_undownloadable_multi_media():
+    info = {
+        "_petik_entries": [
+            {"url": "https://cdn.example/video-1.mp4", "ext": "mp4"},
+            {"url": "https://cdn.example/video-2.mp4", "ext": "mp4"},
+        ]
+    }
+    assert api._gallery_media_for_post("https://www.tiktok.com/@user/video/123", "tiktok", info) == []
+
+
+def test_media_normalizer_rejects_non_public_direct_media_urls():
+    items = api._normalise_media_items([
+        {"id": 1, "sourceIndex": 1, "type": "photo", "url": "https://127.0.0.1/private.jpg"},
+        {"id": 2, "sourceIndex": 2, "type": "video", "url": "https://cdn.example/public.mp4"},
+    ])
+    assert [item["url"] for item in items] == ["https://cdn.example/public.mp4"]
+
+
+def test_gallery_dl_parser_detects_mixed_media_and_preserves_source_positions():
+    output = "\n".join([
+        "https://i.redd.it/first.jpg",
+        "https://v.redd.it/playlist.m3u8",
+        "https://v.redd.it/second.mp4",
+        "https://i.redd.it/third.webp",
+    ])
+    items = api._parse_gallery_media_urls(output)
+    assert [item["type"] for item in items] == ["photo", "video", "photo"]
+    assert [item["id"] for item in items] == [1, 2, 3]
+    assert [item["sourceIndex"] for item in items] == [1, 3, 4]
+
+
+def test_gallery_source_indices_translate_ui_selection_to_extractor_positions():
+    items = [
+        {"id": 1, "sourceIndex": 1},
+        {"id": 2, "sourceIndex": 3},
+        {"id": 3, "sourceIndex": 4},
+    ]
+    assert api._gallery_source_indices(items, [2, 3]) == [3, 4]
 
 
 def test_facebook_public_html_parser_ignores_unrelated_page_cdn_urls():
@@ -877,8 +1097,11 @@ def test_social_media_hosts_allow_only_meta_image_cdns():
 def test_inspect_falls_back_to_instagram_photo_resolver_after_no_video_error(monkeypatch):
     no_rate_limit(monkeypatch)
     monkeypatch.setattr(api, "_extract_info", lambda _url: (_ for _ in ()).throw(RuntimeError("There is no video in this post")))
-    monkeypatch.setattr(api, "_gallery_list_images", lambda _url, _platform: [])
-    monkeypatch.setattr(api, "_instagram_public_gallery", lambda _url: sample_photo_items())
+    monkeypatch.setattr(api, "_gallery_list_media", lambda _url, _platform: [])
+    monkeypatch.setattr(api, "_instagram_public_media", lambda _url: [
+        {**item, "type": "photo", "sourceIndex": index, "kind": "image"}
+        for index, item in enumerate(sample_photo_items(), 1)
+    ])
     response = client.post("/api/inspect", json={"url": "https://www.instagram.com/p/ABC123/"})
     assert response.status_code == 200
     assert response.json()["galleryAvailable"] is True
@@ -888,7 +1111,7 @@ def test_inspect_falls_back_to_instagram_photo_resolver_after_no_video_error(mon
 def test_inspect_falls_back_to_facebook_public_page_resolver(monkeypatch):
     no_rate_limit(monkeypatch)
     monkeypatch.setattr(api, "_extract_info", lambda _url: (_ for _ in ()).throw(RuntimeError("Unsupported URL")))
-    monkeypatch.setattr(api, "_gallery_list_images", lambda _url, _platform: [])
+    monkeypatch.setattr(api, "_gallery_list_media", lambda _url, _platform: [])
     monkeypatch.setattr(api, "_facebook_public_gallery", lambda _url: sample_photo_items())
     response = client.post("/api/inspect", json={"url": "https://www.facebook.com/photo/?fbid=123"})
     assert response.status_code == 200
@@ -913,9 +1136,10 @@ def test_social_gallery_download_fetches_meta_cdn_and_checks_image_bytes(monkeyp
     monkeypatch.setattr(api, "TEMP_ROOT", tmp_path)
     monkeypatch.setattr(api.httpx, "Client", lambda **kwargs: original_client(transport=transport, **kwargs))
     items = [{"id": 1, "url": "https://scontent.cdninstagram.com/test.jpg", "extension": "jpg"}]
-    folder, files = api._download_social_gallery_items(
+    folder, files, failures = api._download_social_gallery_items(
         "https://www.instagram.com/p/ABC123/", "instagram", items, [1]
     )
+    assert failures == []
     assert len(files) == 1
     assert files[0].read_bytes() == image_bytes
     assert files[0].suffix == ".jpg"
@@ -951,9 +1175,10 @@ def test_instagram_gallery_download_routes_through_public_cdn_items(monkeypatch,
         folder.mkdir(exist_ok=True)
         file_path = folder / "foto-001.jpg"
         file_path.write_bytes(b"\xff\xd8\xfftest")
-        return folder, [file_path]
-    monkeypatch.setattr(api, "_gallery_list_images", lambda _url, _platform: [{
-        "id": 1, "url": "https://scontent.cdninstagram.com/photo.jpg", "extension": "jpg"
+        return folder, [file_path], []
+    monkeypatch.setattr(api, "_instagram_public_media", lambda _url: [{
+        "id": 1, "sourceIndex": 1, "type": "photo", "kind": "image",
+        "url": "https://scontent.cdninstagram.com/photo.jpg", "extension": "jpg"
     }])
     monkeypatch.setattr(api, "_download_social_gallery_items", fake_download)
     monkeypatch.setattr(api, "_download_gallery_files", lambda *_args: (_ for _ in ()).throw(AssertionError("fallback not expected")))
