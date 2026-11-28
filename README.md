@@ -1,6 +1,6 @@
-# Petik Universal Extractor API v1.9.0
+# Petik Universal Extractor API v1.10.0
 
-Backend Petik berbasis FastAPI, yt-dlp, gallery-dl, curl-cffi untuk resolver publik Meta, Deno/EJS, BgUtils PO Token Provider, HTTPX, dan FFmpeg. Rilis ini menambahkan provider PO Token YouTube lokal untuk mencoba alur `mweb` yang direkomendasikan dokumentasi yt-dlp, tanpa layanan/API berbayar. Fitur galeri campuran foto + video dari v1.8.0 tetap dipertahankan.
+Backend Petik berbasis FastAPI, yt-dlp, gallery-dl, curl-cffi untuk resolver publik Meta, Deno/EJS, BgUtils PO Token Provider, HTTPX, dan FFmpeg. Rilis ini memperbaiki alur YouTube dengan percobaan client bertahap, diagnosa aman untuk alur PO Token, serta fallback saat client utama ditolak, tanpa layanan/API berbayar. Fitur galeri campuran foto + video dari v1.8.0 tetap dipertahankan.
 
 ## Fitur dan kontrak API
 
@@ -30,26 +30,28 @@ Contoh itu hanya menjelaskan bentuk respons; bukan URL media yang benar-benar di
 ## Deploy lewat Render
 
 1. Buka repository GitHub `petik-universal-api`.
-2. Ekstrak ZIP backend v1.9.0, lalu unggah semua isinya langsung ke root repository (jangan unggah file ZIP sebagai satu file).
+2. Ekstrak ZIP backend v1.10.0, lalu unggah semua isinya langsung ke root repository (jangan unggah file ZIP sebagai satu file).
 3. Pastikan `Dockerfile`, `app.py`, `start.sh`, `requirements.txt`, `render.yaml`, `README.md`, dan folder `tests/` berada di root.
 4. Commit perubahan dari GitHub.
 5. Di Render, buka Blueprint Petik lalu jalankan **Manual Sync / Apply**.
-6. Setelah layanan berstatus Live, buka endpoint `/health`. Versi yang diharapkan `1.9.0`, `mixedMediaAvailable: true`, dan `galleryDlAvailable: true` bila gallery-dl berhasil terpasang. Untuk YouTube, pastikan `youtubePoTokenProviderReady: true`, `youtubePoTokenPluginVersion: "2.0.2"`, dan `youtubePoTokenServerVersion: "2.0.2"`.
+6. Setelah layanan berstatus Live, buka endpoint `/health`. Versi yang diharapkan `1.10.0`, `mixedMediaAvailable: true`, dan `galleryDlAvailable: true` bila gallery-dl berhasil terpasang. Untuk YouTube, pastikan `youtubePoTokenProviderReady: true`, `youtubePoTokenPluginVersion: "2.0.2"`, dan `youtubePoTokenServerVersion: "2.0.2"`.
 7. Jika `youtubePoTokenProviderReady` bernilai `false`, lihat Render Logs. Backend tetap dapat melayani platform lain, tetapi Petik tidak akan memaksa klien YouTube `mweb` tanpa provider yang cocok.
 8. Buka `/` untuk memeriksa daftar platform dan layanan.
 
 
-## YouTube PO Token Provider (v1.9.0)
+## YouTube PO Token dan strategi fallback (v1.10.0)
 
 Rilis ini memakai **BgUtils PO Token Provider 2.0.2** dengan dua komponen yang versinya dipasangkan: plugin Python `bgutil-ytdlp-pot-provider==2.0.2` dan server HTTP BgUtils 2.0.2. Docker membangun server dari tag upstream `2.0.2`, memasang dependensi Deno, lalu `start.sh` menjalankan server pada `127.0.0.1:4416`. Server token tidak dibuka sebagai port publik dan tidak menambah layanan Render terpisah.
 
-Untuk permintaan YouTube, Petik hanya menetapkan `player_client=mweb` dan URL provider jika pemeriksaan `/ping` berhasil serta versi plugin/server sama-sama `2.0.2`. Jika provider belum siap, backend tidak memaksa `mweb`; platform lain tetap berjalan. `/health` melaporkan `youtubePoTokenProviderReady`, versi plugin, versi server, uptime provider, dan klien yang sedang diaktifkan. Status siap hanya memverifikasi ping dan kecocokan versi; ini bukan bukti bahwa setiap permintaan token atau unduhan YouTube akan berhasil.
+Untuk permintaan YouTube, Petik menjalankan client secara berurutan, bukan mengaktifkan banyak client sekaligus: `mweb` (jika BgUtils sehat dan versi plugin/server cocok), `web_safari`, `web_embedded`, lalu `tv`. Setiap client dicoba dalam sesi yt-dlp terpisah; percobaan berikutnya hanya dijalankan ketika error menunjukkan bot-check, PO Token, HTTP 403, atau format tidak tersedia. Hasil format DRM dan SABR-only tidak dipilih sebagai media unduhan. `web_embedded` hanya dapat bekerja pada video yang mengizinkan embedding; `tv` merupakan fallback terakhir karena formatnya dapat terbatas. Provider BgUtils dipasang pada `mweb` dan `web_safari` jika token diminta.
+
+Untuk membuktikan apakah provider benar-benar dipanggil, logger yt-dlp v1.10 mengamati baris registry `PO Token Providers` dan `Generating a ... PO Token`. `/health` menyediakan `youtubeDiagnostics` berisi client yang dicoba, hasil aman tiap percobaan, `providerAdvertised`, dan `tokenGenerationObserved`. Diagnostik tidak menyimpan URL sumber, cookies, visitor data, signed media URL, atau nilai PO Token. `youtubePoTokenProviderReady` tetap hanya memverifikasi ping dan kecocokan versi; indikator token generation merupakan bukti runtime yang lebih kuat, tetapi bukan jaminan ekstraksi atau unduhan akan berhasil.
 
 Deno juga dipakai untuk EJS challenge solver yt-dlp. Paket `yt-dlp[default]` menyediakan dependensi EJS, sedangkan runtime Deno harus memenuhi versi minimum pada panduan EJS yt-dlp yang digunakan saat rilis ini.
 
 **Batas penting:** PO Token bukan jaminan bypass. YouTube tetap dapat membatasi IP pusat data/Render, meminta verifikasi, mengubah challenge, atau mengembalikan format yang tidak dapat diunduh. BgUtils sendiri memperingatkan bahwa penyediaan token tidak menjamin lolos dari 403 atau bot checks. Konten privat, berbayar, atau yang memerlukan akun tidak otomatis menjadi dapat diakses. Petik tidak meminta password, cookies, atau token akun YouTube.
 
-BgUtils dan yt-dlp adalah proyek open-source; tidak ada API berbayar atau biaya provider tambahan pada implementasi ini. Namun penggunaan Render Free tetap tunduk pada kuota, bandwidth, waktu build, penghentian saat idle, dan batas resource Render. Render menyebut instance Free memiliki RAM 512 MB pada halaman pricing dan dapat spin down setelah 15 menit tidak menerima trafik.
+Provider alternatif `yt-dlp-getpot-wpc` juga dievaluasi. Dokumentasi upstream menyebutnya sebagai alternatif/fallback yang masih eksperimental dan memerlukan Chrome/Chromium untuk mencetak token melalui browser. Provider ini tidak dimasukkan ke image v1.10 agar tidak menambah browser headless dan beban runtime; BgUtils tetap menjadi provider utama. BgUtils dan yt-dlp adalah proyek open-source; tidak ada API berbayar atau biaya provider tambahan pada implementasi ini. Namun penggunaan Render Free tetap tunduk pada kuota, bandwidth, waktu build, penghentian saat idle, dan batas resource Render. Render menyebut instance Free memiliki RAM 512 MB pada halaman pricing dan dapat spin down setelah 15 menit tidak menerima trafik.
 
 ## Platform dan batas dukungan
 
@@ -95,7 +97,7 @@ Pengunduh CDN menulis potongan data langsung ke file sementara agar tidak menamp
 
 ## Tes dan batas verifikasi
 
-Folder `tests/` berisi 81 tes offline untuk parser Instagram/Threads campuran, deteksi URL gallery-dl, urutan `sourceIndex`, pemetaan ID unduhan, ZIP yang berisi foto dan video, unduhan CDN streaming, partial failure, validasi host/redirect, endpoint inspect/download, health, kompatibilitas Cobalt, preview, MP3, durasi, dan kualitas. Tes ini memvalidasi kontrak dan perilaku lokal; tes offline bukan bukti bahwa setiap tautan live dari tiap platform akan berhasil diekstrak.
+Folder `tests/` berisi 91 tes offline untuk parser Instagram/Threads campuran, deteksi URL gallery-dl, urutan `sourceIndex`, pemetaan ID unduhan, ZIP yang berisi foto dan video, unduhan CDN streaming, partial failure, validasi host/redirect, endpoint inspect/download, health, kompatibilitas Cobalt, preview, MP3, durasi, dan kualitas. Tes ini memvalidasi kontrak dan perilaku lokal; tes offline bukan bukti bahwa setiap tautan live dari tiap platform akan berhasil diekstrak.
 
 ## Urutan API di frontend Petik
 
@@ -104,6 +106,18 @@ Folder `tests/` berisi 81 tes offline untuk parser Instagram/Threads campuran, d
 3. API Cobalt eksternal sebagai cadangan video/audio yang sudah ada.
 
 ## Riwayat rilis
+
+### v1.10.0 — YouTube Client Fallback dan Diagnostik PO Token
+
+- Mengganti konfigurasi satu client `mweb` menjadi percobaan berurutan `mweb` → `web_safari` → `web_embedded` → `tv` (mweb hanya bila BgUtils siap).
+- Menggunakan sesi yt-dlp terpisah per client agar kegagalan satu client tidak membatalkan percobaan fallback.
+- Memprioritaskan client yang baru berhasil untuk URL yang sama selama 15 menit agar proses inspect lalu download konsisten.
+- Memeriksa ketersediaan format yang dapat diunduh dan menolak format yang ditandai DRM atau SABR-only.
+- Menambahkan logger yt-dlp yang hanya mencatat registry provider dan peristiwa pembuatan PO Token tanpa mencetak URL, cookie, atau token.
+- Menambahkan `youtubeDiagnostics` dan `youtubeClientFallbacks` ke `/health`.
+- Memperjelas pesan kegagalan bot-check/IP, PO Token, dan format yang tidak tersedia.
+- Mengevaluasi `yt-dlp-getpot-wpc`; tidak dipasang karena membutuhkan Chrome/Chromium dan menambah runtime browser pada deployment Free.
+- Mempertahankan BgUtils 2.0.2, Deno/EJS, resolver sosial, galeri mixed media, preview, Direct Link, dan MP3.
 
 ### v1.9.0 — YouTube PO Token Provider
 

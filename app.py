@@ -4,6 +4,7 @@ import os
 import ipaddress
 import re
 import json
+import logging
 import html as html_lib
 import shutil
 import secrets
@@ -33,7 +34,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 from yt_dlp import YoutubeDL
 
-APP_VERSION = "1.9.0"
+APP_VERSION = "1.10.0"
 MAX_GALLERY_ITEMS = max(1, min(30, int(os.getenv("MAX_GALLERY_ITEMS", "20"))))
 MAX_GALLERY_SOURCE_ITEMS = MAX_GALLERY_ITEMS * 2  # Mixed carousels can contain video entries between photos.
 MAX_GALLERY_FILE_BYTES = int(os.getenv("MAX_GALLERY_FILE_MB", "20")) * 1024 * 1024
@@ -106,6 +107,22 @@ active_files: dict[str, tuple[Path, str, float]] = {}
 rate_events: dict[str, deque[float]] = defaultdict(deque)
 state_lock = threading.Lock()
 preview_cache: dict[str, tuple[str, dict, float]] = {}
+
+# Only safe, non-sensitive YouTube diagnostics are retained in memory. Never
+# store source URLs, cookies, visitor data, PO Tokens, or signed media URLs.
+YOUTUBE_CLIENTS_WITH_PROVIDER = ("mweb", "web_safari")
+YOUTUBE_CLIENT_FALLBACKS = ("mweb", "web_safari", "web_embedded", "tv")
+YOUTUBE_DIAGNOSTICS_LOCK = threading.Lock()
+YOUTUBE_DIAGNOSTICS = {
+    "lastOutcome": "not-run",
+    "attemptedClients": [],
+    "clientOutcomes": [],
+    "providerAdvertised": None,
+    "tokenGenerationObserved": False,
+    "lastErrorCode": None,
+    "updatedAt": None,
+}
+youtube_client_cache: dict[str, tuple[str, float]] = {}
 
 
 def _base_url(request: Request) -> str:
@@ -246,7 +263,7 @@ def _bgutil_provider_status() -> dict:
         try:
             request = urllib.request.Request(
                 f"{base_url}/ping",
-                headers={"User-Agent": "Petik-Health/1.9.0"},
+                headers={"User-Agent": "Petik-Health/1.10.0"},
             )
             with urllib.request.urlopen(request, timeout=1.2) as response:
                 payload = json.loads(response.read(4096).decode("utf-8", errors="replace"))
@@ -271,7 +288,151 @@ def _bgutil_provider_status() -> dict:
     }
 
 
-def _yt_common_options(platform: str | None = None) -> dict:
+def _update_youtube_diagnostics(**updates) -> None:
+    with YOUTUBE_DIAGNOSTICS_LOCK:
+        YOUTUBE_DIAGNOSTICS.update(updates)
+        YOUTUBE_DIAGNOSTICS["updatedAt"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+
+
+def _youtube_error_code(message: str) -> str:
+    lowered = str(message or "").lower()
+    if "sign in to confirm" in lowered or "confirm you're not a bot" in lowered or "confirm you’re not a bot" in lowered:
+        return "bot_check"
+    if "po token" in lowered or "bgutil" in lowered or "botguard" in lowered:
+        return "po_token"
+    if "http error 403" in lowered or "403: forbidden" in lowered:
+        return "http_403"
+    if any(term in lowered for term in ("no formats", "no video formats", "requested format is not available", "no downloadable formats", "sabr")):
+        return "no_downloadable_formats"
+    if "login_required" in lowered or "sign in" in lowered or "login" in lowered:
+        return "login_required"
+    if "timed out" in lowered or "timeout" in lowered:
+        return "timeout"
+    return "extractor_error"
+
+
+def _youtube_diagnostics_snapshot() -> dict:
+    with YOUTUBE_DIAGNOSTICS_LOCK:
+        return {
+            **YOUTUBE_DIAGNOSTICS,
+            "attemptedClients": list(YOUTUBE_DIAGNOSTICS.get("attemptedClients") or []),
+            "clientOutcomes": [dict(item) for item in (YOUTUBE_DIAGNOSTICS.get("clientOutcomes") or [])],
+        }
+
+
+def _record_youtube_attempt(client: str, outcome: str, error_code: str | None = None) -> None:
+    with YOUTUBE_DIAGNOSTICS_LOCK:
+        attempted = list(YOUTUBE_DIAGNOSTICS.get("attemptedClients") or [])
+        if client not in attempted:
+            attempted.append(client)
+        outcomes = list(YOUTUBE_DIAGNOSTICS.get("clientOutcomes") or [])
+        outcomes.append({"client": client, "outcome": outcome, "errorCode": error_code})
+        YOUTUBE_DIAGNOSTICS.update({
+            "attemptedClients": attempted,
+            "clientOutcomes": outcomes[-8:],
+            "lastOutcome": outcome,
+            "lastErrorCode": error_code,
+            "updatedAt": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+        })
+
+
+class _YtDlpDiagnosticLogger:
+    """Capture provider-flow evidence without writing URLs or token values to logs."""
+    def __init__(self, client: str):
+        self.client = client
+        self.logger = logging.getLogger("uvicorn.error")
+
+    def debug(self, message):
+        value = str(message or "")
+        lowered = value.lower()
+        if "po token providers:" in lowered:
+            provider_names = []
+            for name in ("bgutil:http", "bgutil:script-node", "bgutil:script-deno", "wpc"):
+                if name in lowered:
+                    provider_names.append(name)
+            _update_youtube_diagnostics(providerAdvertised=bool(provider_names))
+            self.logger.info("[Petik YouTube] provider_registry=%s client=%s", ",".join(provider_names) or "none", self.client)
+        if "generating a" in lowered and "po token" in lowered:
+            _update_youtube_diagnostics(tokenGenerationObserved=True)
+            context = "gvs" if "gvs" in lowered else "player" if "player" in lowered else "other"
+            self.logger.info("[Petik YouTube] token_generation_requested=true context=%s client=%s", context, self.client)
+        elif "po token" in lowered and any(term in lowered for term in ("generated", "generation failed", "failed to generate")):
+            _update_youtube_diagnostics(tokenGenerationObserved=True)
+            self.logger.info("[Petik YouTube] token_provider_event=true client=%s", self.client)
+
+    def warning(self, message):
+        value = str(message or "").lower()
+        if any(term in value for term in ("po token", "bot", "403", "login_required", "no formats")):
+            self.logger.warning("[Petik YouTube] yt_dlp_warning=%s client=%s", _youtube_error_code(value), self.client)
+
+    def error(self, message):
+        value = str(message or "")
+        self.logger.error("[Petik YouTube] yt_dlp_error=%s client=%s", _youtube_error_code(value), self.client)
+
+
+def _youtube_provider_status() -> dict:
+    return _bgutil_provider_status()
+
+
+def _youtube_client_candidates(provider_ready: bool, preferred: str | None = None) -> list[str]:
+    candidates = list(YOUTUBE_CLIENT_FALLBACKS)
+    if not provider_ready:
+        # mweb is the documented primary only when a PO Token provider is ready.
+        candidates.remove("mweb")
+    if preferred in candidates:
+        candidates.remove(preferred)
+        candidates.insert(0, preferred)
+    return candidates
+
+
+def _get_cached_youtube_client(url: str) -> str | None:
+    with state_lock:
+        cached = youtube_client_cache.get(url)
+        if not cached:
+            return None
+        if cached[1] <= time.time():
+            youtube_client_cache.pop(url, None)
+            return None
+        return cached[0]
+
+
+def _cache_youtube_client(url: str, client: str) -> None:
+    now = time.time()
+    with state_lock:
+        for key, value in list(youtube_client_cache.items()):
+            if value[1] <= now:
+                youtube_client_cache.pop(key, None)
+        youtube_client_cache[url] = (client, now + 900)
+        while len(youtube_client_cache) > 128:
+            youtube_client_cache.pop(next(iter(youtube_client_cache)))
+
+
+def _youtube_should_fallback(exc: Exception | str) -> bool:
+    lowered = str(exc or "").lower()
+    return any(term in lowered for term in (
+        "sign in to confirm", "confirm you're not a bot", "confirm you’re not a bot",
+        "login_required", "po token", "bgutil", "botguard", "http error 403",
+        "403: forbidden", "no formats", "no video formats",
+        "requested format is not available", "no downloadable formats", "no playable formats", "sabr",
+        "tidak mengembalikan format", "format yang dapat diunduh", "berkas media tidak terbentuk",
+        "not embeddable", "embedding disabled", "video unavailable", "this video is not available",
+    ))
+
+
+def _youtube_info_has_downloadable_formats(info: dict) -> bool:
+    formats = _media_formats(info)
+    for item in formats:
+        if not isinstance(item, dict) or item.get("has_drm"):
+            continue
+        protocol = str(item.get("protocol") or "").lower()
+        if any(term in protocol for term in ("mhtml", "sabr")):
+            continue
+        if item.get("url") or item.get("manifest_url"):
+            return True
+    return False
+
+
+def _yt_common_options(platform: str | None = None, youtube_client: str | None = None) -> dict:
     options = {
         "noplaylist": True,
         "quiet": True,
@@ -287,32 +448,78 @@ def _yt_common_options(platform: str | None = None) -> dict:
     if deno_path:
         options["js_runtimes"] = {"deno": {"path": deno_path}}
 
-    # The current yt-dlp PO Token guide recommends mweb with a GVS token.
-    # Do not force that client unless the local provider and plugin versions match.
     if platform == "youtube":
-        provider = _bgutil_provider_status()
-        if provider["ready"]:
-            options["extractor_args"] = {
-                "youtube": {"player_client": ["mweb"]},
-                "youtubepot-bgutilhttp": {"base_url": [provider["baseUrl"]]},
-            }
+        provider = _youtube_provider_status()
+        client = youtube_client or ("mweb" if provider.get("ready") else "web_safari")
+        extractor_args = {"youtube": {"player_client": [client]}}
+        if provider.get("ready") and client in YOUTUBE_CLIENTS_WITH_PROVIDER:
+            extractor_args["youtubepot-bgutilhttp"] = {"base_url": [provider["baseUrl"]]}
+        options.update({
+            "extractor_args": extractor_args,
+            "logger": _YtDlpDiagnosticLogger(client),
+            "verbose": True,
+            # Warnings are routed through the filtered logger above; raw yt-dlp
+            # messages are never copied to Render logs.
+            "no_warnings": False,
+        })
     return options
 
 
 def _extract_info(url: str) -> dict:
     platform = _normalise_and_validate(url)[1]
-    options = _yt_common_options(platform)
-    options.update({"skip_download": True, "extract_flat": False})
-    with YoutubeDL(options) as ydl:
-        info = ydl.extract_info(url, download=False)
-    if not info:
-        raise RuntimeError("Platform tidak mengembalikan informasi media.")
+    if platform != "youtube":
+        options = _yt_common_options(platform)
+        options.update({"skip_download": True, "extract_flat": False})
+        with YoutubeDL(options) as ydl:
+            info = ydl.extract_info(url, download=False)
+        if not info:
+            raise RuntimeError("Platform tidak mengembalikan informasi media.")
+    else:
+        provider = _youtube_provider_status()
+        preferred = _get_cached_youtube_client(url)
+        clients = _youtube_client_candidates(bool(provider.get("ready")), preferred)
+        _update_youtube_diagnostics(
+            lastOutcome="attempting", attemptedClients=[], clientOutcomes=[],
+            providerAdvertised=None, tokenGenerationObserved=False, lastErrorCode=None,
+        )
+        failures = []
+        info = None
+        selected_client = None
+        last_exception = None
+        for index, client in enumerate(clients):
+            _record_youtube_attempt(client, "attempting")
+            options = _yt_common_options("youtube", client)
+            options.update({"skip_download": True, "extract_flat": False})
+            try:
+                with YoutubeDL(options) as ydl:
+                    candidate = ydl.extract_info(url, download=False)
+                if not candidate:
+                    raise RuntimeError("YouTube tidak mengembalikan informasi media.")
+                if not _youtube_info_has_downloadable_formats(candidate):
+                    raise RuntimeError(f"YouTube client {client} tidak mengembalikan format yang dapat diunduh.")
+                info = candidate
+                selected_client = client
+                _record_youtube_attempt(client, "success")
+                _cache_youtube_client(url, client)
+                break
+            except Exception as exc:
+                last_exception = exc
+                code = _youtube_error_code(exc)
+                failures.append(f"{client}:{code}")
+                _record_youtube_attempt(client, "failed", code)
+                if index >= len(clients) - 1 or not _youtube_should_fallback(exc):
+                    break
+        if info is None:
+            detail = str(last_exception)[:240] if last_exception else "YouTube tidak mengembalikan media yang dapat diunduh."
+            _update_youtube_diagnostics(lastOutcome="failed", lastErrorCode=(failures[-1].split(":", 1)[-1] if failures else "unknown"))
+            raise RuntimeError(f"YouTube gagal pada client yang diuji ({', '.join(failures)}). {detail}")
+        info = dict(info)
+        info["_petik_youtube_client"] = selected_client
+
     if info.get("_type") in {"playlist", "multi_video"}:
         entries = [entry for entry in (info.get("entries") or []) if isinstance(entry, dict)]
         if not entries:
             raise RuntimeError("Postingan tidak memiliki media yang bisa diproses.")
-        # Keep the first item as the primary video/audio target for the existing
-        # quality picker, but preserve the ordered entries for the mixed gallery.
         info = dict(entries[0])
         info["_petik_entries"] = entries[:MAX_GALLERY_SOURCE_ITEMS]
     duration = info.get("duration")
@@ -1820,8 +2027,6 @@ def _download_gallery_files(url: str, indices: list[int]) -> tuple[Path, list[Pa
 
 
 def _download_media(url: str, mode: str, quality: str) -> tuple[Path, str, dict]:
-    job_dir = Path(tempfile.mkdtemp(prefix="job-", dir=TEMP_ROOT))
-    outtmpl = str(job_dir / "%(id)s.%(ext)s")
     quality = str(quality or "max").strip().lower()
     if quality not in {"max", "best"}:
         try:
@@ -1832,16 +2037,9 @@ def _download_media(url: str, mode: str, quality: str) -> tuple[Path, str, dict]
             quality = "max"
     if mode == "audio":
         fmt = "bestaudio/best"
-        postprocessors = [{
-            "key": "FFmpegExtractAudio",
-            "preferredcodec": "mp3",
-            "preferredquality": "0",
-        }]
+        postprocessors = [{"key": "FFmpegExtractAudio", "preferredcodec": "mp3", "preferredquality": "0"}]
     else:
-        if quality in {"max", "best"}:
-            fmt = "bestvideo+bestaudio/best"
-        else:
-            fmt = f"bestvideo[height<={quality}]+bestaudio/best[height<={quality}]"
+        fmt = "bestvideo+bestaudio/best" if quality in {"max", "best"} else f"bestvideo[height<={quality}]+bestaudio/best[height<={quality}]"
         postprocessors = []
 
     def duration_filter(info: dict, *, incomplete: bool) -> str | None:
@@ -1851,57 +2049,83 @@ def _download_media(url: str, mode: str, quality: str) -> tuple[Path, str, dict]
         return None
 
     platform = _normalise_and_validate(url)[1]
-    options = _yt_common_options(platform)
-    options.update({
-        "format": fmt,
-        "outtmpl": outtmpl,
-        "match_filter": duration_filter,
-        "max_filesize": MAX_FILE_BYTES,
-        "merge_output_format": "mp4",
-        "postprocessors": postprocessors,
-        "restrictfilenames": True,
-        "windowsfilenames": True,
-        "overwrites": True,
-        "noprogress": True,
-        "concurrent_fragment_downloads": 3,
-        "fragment_retries": 2,
-    })
+    clients = [None]
+    if platform == "youtube":
+        provider = _youtube_provider_status()
+        preferred = _get_cached_youtube_client(url)
+        clients = _youtube_client_candidates(bool(provider.get("ready")), preferred)
+        _update_youtube_diagnostics(
+            lastOutcome="attempting-download", attemptedClients=[], clientOutcomes=[],
+            providerAdvertised=None, tokenGenerationObserved=False, lastErrorCode=None,
+        )
 
-    try:
-        with YoutubeDL(options) as ydl:
-            info = ydl.extract_info(url, download=True)
-            if not info:
-                raise RuntimeError("Platform tidak mengembalikan media.")
-            if info.get("_type") == "playlist":
-                entries = [item for item in (info.get("entries") or []) if item]
-                if not entries:
-                    raise RuntimeError("Postingan tidak memiliki media yang bisa diunduh.")
-                info = entries[0]
-    except Exception:
-        shutil.rmtree(job_dir, ignore_errors=True)
-        raise
+    last_error = None
+    for index, client in enumerate(clients):
+        job_dir = Path(tempfile.mkdtemp(prefix="job-", dir=TEMP_ROOT))
+        outtmpl = str(job_dir / "%(id)s.%(ext)s")
+        options = _yt_common_options(platform, client) if platform == "youtube" else _yt_common_options(platform)
+        options.update({
+            "format": fmt,
+            "outtmpl": outtmpl,
+            "match_filter": duration_filter,
+            "max_filesize": MAX_FILE_BYTES,
+            "merge_output_format": "mp4",
+            "postprocessors": postprocessors,
+            "restrictfilenames": True,
+            "windowsfilenames": True,
+            "overwrites": True,
+            "noprogress": True,
+            "concurrent_fragment_downloads": 3,
+            "fragment_retries": 2,
+        })
+        try:
+            if platform == "youtube":
+                _record_youtube_attempt(str(client), "attempting-download")
+            with YoutubeDL(options) as ydl:
+                info = ydl.extract_info(url, download=True)
+                if not info:
+                    raise RuntimeError("Platform tidak mengembalikan media.")
+                if info.get("_type") == "playlist":
+                    entries = [item for item in (info.get("entries") or []) if item]
+                    if not entries:
+                        raise RuntimeError("Postingan tidak memiliki media yang bisa diunduh.")
+                    info = entries[0]
 
-    candidates = [
-        path for path in job_dir.rglob("*")
-        if path.is_file() and path.suffix.lower() not in {
-            ".jpg", ".jpeg", ".webp", ".json", ".description", ".vtt", ".srt", ".part"
-        }
-    ]
-    if not candidates:
-        shutil.rmtree(job_dir, ignore_errors=True)
-        raise RuntimeError("Extractor membaca tautan, tetapi berkas media tidak terbentuk.")
-    file_path = max(candidates, key=lambda path: path.stat().st_size)
-    size = file_path.stat().st_size
-    if size <= 0 or size > MAX_FILE_BYTES:
-        shutil.rmtree(job_dir, ignore_errors=True)
-        raise RuntimeError(f"Ukuran berkas di luar batas Petik (maksimal {MAX_FILE_BYTES // (1024 * 1024)} MB).")
-    if mode == "audio" and file_path.suffix.lower() != ".mp3":
-        shutil.rmtree(job_dir, ignore_errors=True)
-        raise RuntimeError("Konversi audio MP3 tidak selesai. Coba lagi atau pilih video.")
-    if mode == "video" and file_path.suffix.lower() not in {".mp4", ".m4v", ".mov", ".webm", ".mkv"}:
-        shutil.rmtree(job_dir, ignore_errors=True)
-        raise RuntimeError("Format video hasil ekstraksi tidak didukung.")
-    return file_path, _safe_filename(info, "mp3" if mode == "audio" else file_path.suffix.lstrip(".")), info
+            candidates = [
+                path for path in job_dir.rglob("*")
+                if path.is_file() and path.suffix.lower() not in {
+                    ".jpg", ".jpeg", ".webp", ".json", ".description", ".vtt", ".srt", ".part"
+                }
+            ]
+            if not candidates:
+                raise RuntimeError("Extractor membaca tautan, tetapi berkas media tidak terbentuk.")
+            file_path = max(candidates, key=lambda path: path.stat().st_size)
+            size = file_path.stat().st_size
+            if size <= 0 or size > MAX_FILE_BYTES:
+                raise RuntimeError(f"Ukuran berkas di luar batas Petik (maksimal {MAX_FILE_BYTES // (1024 * 1024)} MB).")
+            if mode == "audio" and file_path.suffix.lower() != ".mp3":
+                raise RuntimeError("Konversi audio MP3 tidak selesai. Coba lagi atau pilih video.")
+            if mode == "video" and file_path.suffix.lower() not in {".mp4", ".m4v", ".mov", ".webm", ".mkv"}:
+                raise RuntimeError("Format video hasil ekstraksi tidak didukung.")
+            if platform == "youtube":
+                _record_youtube_attempt(str(client), "download-success")
+                _cache_youtube_client(url, str(client))
+            return file_path, _safe_filename(info, "mp3" if mode == "audio" else file_path.suffix.lstrip(".")), info
+        except Exception as exc:
+            last_error = exc
+            shutil.rmtree(job_dir, ignore_errors=True)
+            if platform != "youtube":
+                raise
+            code = _youtube_error_code(exc)
+            _record_youtube_attempt(str(client), "download-failed", code)
+            if index >= len(clients) - 1 or not _youtube_should_fallback(exc):
+                break
+
+    if platform == "youtube":
+        _update_youtube_diagnostics(lastOutcome="download-failed", lastErrorCode=_youtube_error_code(last_error))
+    if last_error:
+        raise last_error
+    raise RuntimeError("Unduhan tidak berhasil.")
 
 
 def _store_file(path: Path, filename: str) -> str:
@@ -1930,11 +2154,19 @@ def _extract_error(exc: Exception, platform: str):
         code = "error.api.gallery.unavailable"
         message = "Facebook tidak mengembalikan data media publik yang bisa dibaca Petik. Periksa apakah tautan dapat dibuka tanpa login; beberapa postingan atau album membatasi akses anonim dari server."
     elif platform == "youtube" and any(term in lowered for term in (
-        "sign in to confirm you're not a bot", "confirm you're not a bot", "po token",
-        "bgutil", "botguard", "http error 403", "403: forbidden",
+        "sign in to confirm you're not a bot", "confirm you're not a bot", "confirm you’re not a bot",
+        "po token", "bgutil", "botguard", "http error 403", "403: forbidden",
+        "youtube gagal pada client yang diuji", "no downloadable formats",
     )):
         code = "error.api.youtube.restricted"
-        message = "YouTube masih membatasi akses dari IP server Petik atau proses PO Token gagal. Provider sudah disiapkan, tetapi token tidak menjamin semua pembatasan IP dapat dilewati. Coba lagi nanti atau gunakan tautan video publik lain."
+        if "sign in to confirm" in lowered or "confirm you're not a bot" in lowered or "confirm you’re not a bot" in lowered:
+            message = "YouTube menolak permintaan anonim dari IP server Petik dengan pemeriksaan anti-bot. Petik sudah mencoba beberapa jalur client publik. PO Token tidak selalu dapat mengatasi blokir IP pusat data; fitur tanpa login tidak dapat dijamin untuk video ini."
+        elif "po token" in lowered or "bgutil" in lowered or "botguard" in lowered:
+            message = "Proses PO Token YouTube belum berhasil. Periksa diagnostik provider pada endpoint /health dan log Render untuk melihat apakah permintaan token benar-benar dijalankan."
+        elif any(term in lowered for term in ("login_required", "age_restricted", "private", "members only", "video unavailable", "this video is not available")):
+            message = "Video YouTube ini kemungkinan privat, dibatasi usia/wilayah, khusus anggota, atau memerlukan login. Petik tidak menggunakan cookie atau login akun secara otomatis."
+        else:
+            message = "Client YouTube yang tersedia tidak memberikan format media yang dapat diunduh. Video mungkin dibatasi atau YouTube hanya memberikan format streaming yang tidak kompatibel."
     elif "unsupported url" in lowered or "not supported" in lowered or "belum didukung" in lowered:
         code = "error.api.link.unsupported"
         message = "Jenis tautan ini belum didukung oleh extractor yang tersedia."
@@ -2041,6 +2273,8 @@ def health():
         "youtubePoTokenServerUptimeSeconds": pot_provider["serverUptimeSeconds"],
         "youtubePoTokenExpectedVersion": pot_provider["expectedVersion"],
         "youtubePoTokenClient": "mweb" if pot_provider["ready"] else None,
+        "youtubeClientFallbacks": _youtube_client_candidates(bool(pot_provider["ready"])),
+        "youtubeDiagnostics": _youtube_diagnostics_snapshot(),
         "ytdlpVersion": _ytdlp_version(),
         "galleryDlAvailable": bool(_gallery_command()),
         "galleryDlVersion": _gallery_version(),
