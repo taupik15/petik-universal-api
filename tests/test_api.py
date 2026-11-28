@@ -48,7 +48,7 @@ def test_health_endpoint_and_version():
     response = client.get("/health")
     assert response.status_code == 200
     assert response.json()["status"] == "healthy"
-    assert response.json()["version"] == "1.17.0"
+    assert response.json()["version"] == "1.17.1"
     assert "javascriptRuntime" in response.json()
     assert response.json()["youtubePoTokenProvider"] == "bgutil-http"
     assert isinstance(response.json()["youtubePoTokenProviderReady"], bool)
@@ -818,7 +818,7 @@ def test_instagram_public_fallback_uses_anonymous_graphql_session(monkeypatch):
 
 def test_health_reports_gallery_and_public_fallback_capabilities():
     body = client.get("/health").json()
-    assert body["version"] == "1.17.0"
+    assert body["version"] == "1.17.1"
     assert body["youtubeClientFallbacks"] in (
         ["tv_samsung", "visionos", "web", "web_embedded"],
         ["tv_samsung", "visionos", "web", "mweb", "web_embedded"],
@@ -1533,7 +1533,7 @@ def test_bgutil_provider_status_rejects_version_mismatch(monkeypatch):
 
 def test_health_exposes_v111_youtube_diagnostics_without_sensitive_fields():
     payload = client.get("/health").json()
-    assert payload["version"] == "1.17.0"
+    assert payload["version"] == "1.17.1"
     assert "youtubePoTokenTelemetryAvailable" in payload
     assert payload["youtubeForceIPv4"] is True
     assert payload["youtubeWpc"]["runtimeEnabled"] is False
@@ -2353,3 +2353,41 @@ def test_youtube_rotation_does_not_retry_unrelated_errors(monkeypatch):
     with pytest.raises(RuntimeError):
         api._with_youtube_rotation(operation)
     assert len(calls) == 1
+
+
+def test_youtube_download_reuses_inspected_info_without_reextracting(monkeypatch, tmp_path):
+    monkeypatch.delenv("YOUTUBE_PROXY", raising=False)
+    monkeypatch.delenv("YOUTUBE_PROXY_POOL", raising=False)
+    monkeypatch.delenv("YOUTUBE_PROXY_POOL_FILE", raising=False)
+    calls = []
+
+    class FakeYDL:
+        def __init__(self, options):
+            self.options = options
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            return False
+
+        def _write(self, info):
+            path = Path(self.options["outtmpl"] % {"id": "abc", "ext": "mp4"})
+            path.write_bytes(b"x" * 2048)
+            return {**info, "id": "abc", "ext": "mp4"}
+
+        def process_ie_result(self, info, download=True):
+            calls.append("process")
+            return self._write(info)
+
+        def extract_info(self, url, download=True):
+            calls.append("extract")
+            return self._write({"title": "t"})
+
+    monkeypatch.setattr(api, "YoutubeDL", FakeYDL)
+    monkeypatch.setattr(api, "TEMP_ROOT", tmp_path)
+    url = "https://www.youtube.com/watch?v=abcdefghijk"
+    info = {"title": "t", "_petik_youtube_client": "mweb", "formats": []}
+    path, filename, _ = api._download_media_impl(url, "video", "720", reuse_info=info)
+    assert calls == ["process"]
+    assert path.exists()
