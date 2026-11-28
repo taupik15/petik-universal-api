@@ -29,7 +29,7 @@ def test_health_endpoint_and_version():
     response = client.get("/health")
     assert response.status_code == 200
     assert response.json()["status"] == "healthy"
-    assert response.json()["version"] == "1.11.0"
+    assert response.json()["version"] == "1.12.0"
     assert "javascriptRuntime" in response.json()
     assert response.json()["youtubePoTokenProvider"] == "bgutil-http"
     assert isinstance(response.json()["youtubePoTokenProviderReady"], bool)
@@ -794,8 +794,8 @@ def test_instagram_public_fallback_uses_anonymous_graphql_session(monkeypatch):
 
 def test_health_reports_gallery_and_public_fallback_capabilities():
     body = client.get("/health").json()
-    assert body["version"] == "1.11.0"
-    assert body["youtubeClientFallbacks"] == ["web_safari", "web_safari_hls", "web_embedded", "tv"] or body["youtubeClientFallbacks"] == ["mweb", "web_safari", "web_safari_hls", "web_embedded", "tv"]
+    assert body["version"] == "1.12.0"
+    assert body["youtubeClientFallbacks"] in (["web_safari", "web_safari_hls", "web_embedded", "tv"], ["mweb", "web_safari", "web_safari_hls", "web_embedded", "tv"])
     assert "youtubeDiagnostics" in body
     assert body["youtubeDiagnostics"]["tokenGenerationObserved"] in (True, False)
     assert "threads" in body["galleryPlatforms"]
@@ -1423,7 +1423,7 @@ def test_youtube_error_explains_po_token_and_ip_restrictions():
     response = api._extract_error(RuntimeError("Sign in to confirm you're not a bot"), "youtube")
     payload = json.loads(response.body.decode("utf-8"))
     assert payload["error"]["code"] == "error.api.youtube.restricted"
-    assert "IP server Petik" in payload["error"]["context"]["message"]
+    assert "penyebab pastinya belum dapat dipastikan" in payload["error"]["context"]["message"]
 
 
 
@@ -1469,14 +1469,16 @@ def test_bgutil_provider_status_rejects_version_mismatch(monkeypatch):
     assert status["ready"] is False
 
 
-# v1.11 YouTube diagnostics, explicit HLS strategy, and local telemetry proxy tests.
+# v1.11 compatibility tests plus v1.12 diagnostics, optional cookies, and telemetry event tests.
 
 def test_health_exposes_v111_youtube_diagnostics_without_sensitive_fields():
     payload = client.get("/health").json()
-    assert payload["version"] == "1.11.0"
+    assert payload["version"] == "1.12.0"
     assert "youtubePoTokenTelemetryAvailable" in payload
     assert payload["youtubeForceIPv4"] is True
     assert payload["youtubeWpc"]["runtimeEnabled"] is False
+    assert payload["youtubeCookiesConfigured"] is False or isinstance(payload["youtubeCookiesConfigured"], bool)
+    assert "youtubeDownloadFallbacks" in payload
     diagnostics = payload["youtubeDiagnostics"]
     for key in (
         "providerTelemetryAvailable", "providerRequestCount", "providerHttpSuccessCount",
@@ -1673,3 +1675,141 @@ def test_extract_info_runs_web_safari_hls_as_separate_strategy_after_regular_saf
         for item in diagnostics["clientOutcomes"]
     )
     assert "web_safari_hls" in diagnostics["attemptedClients"]
+
+
+# v1.12 stage-aware YouTube diagnostics and privacy-safe optional session support.
+
+def test_youtube_stage_classifier_uses_safe_stage_names_only():
+    assert api._classify_youtube_stage("[youtube] Downloading webpage") == "youtube_watch_page"
+    assert api._classify_youtube_stage("[youtube] Downloading mweb player API JSON") == "innertube_player_api"
+    assert api._classify_youtube_stage("[youtube] [pot] Generating a gvs PO Token") == "po_token_generation"
+    assert api._classify_youtube_stage("Sign in to confirm you're not a bot") is None
+    assert api._classify_youtube_stage("arbitrary text") is None
+
+
+def test_diagnostic_logger_records_stage_without_raw_urls_or_tokens():
+    logger = api._YtDlpDiagnosticLogger("mweb")
+    logger.debug("[youtube] Downloading webpage https://youtube.example/watch?v=secret")
+    logger.debug("[youtube] [pot] PO Token Providers: bgutil:http-2.0.2 (external)")
+    logger.error("Sign in to confirm you're not a bot")
+    state = api._youtube_diagnostics_snapshot()
+    assert logger.last_stage == "youtube_watch_page"
+    assert state["lastErrorStage"] == "youtube_watch_page"
+    assert state["lastErrorEvent"] == "youtube_bot_check"
+    assert state["providerAdvertised"] is True
+    serialized = __import__("json").dumps(state)
+    assert "secret" not in serialized
+    assert "youtube.example" not in serialized
+    assert "poToken" not in serialized
+
+
+def test_youtube_root_hint_can_identify_pre_token_stage():
+    hint = api._youtube_root_cause_hint({
+        "lastErrorCode": "bot_check",
+        "lastErrorStage": "innertube_player_api",
+        "providerTelemetryAvailable": True,
+        "providerTokenResponsesThisAttempt": 0,
+        "providerRequestsThisAttempt": 0,
+        "providerAdvertised": True,
+    })
+    assert hint == "bot_check_before_po_token_stage_innertube_player_api"
+
+
+def test_telemetry_metrics_keep_bounded_metadata_events_only():
+    import pot_telemetry
+    metrics = pot_telemetry.Metrics(max_events=10)
+    first = metrics.record(200, True, 37)
+    metrics.record(502, False, 11)
+    snapshot = metrics.snapshot(since=first["eventId"])
+    assert snapshot["requestCount"] == 2
+    assert len(snapshot["events"]) == 1
+    assert snapshot["events"][0]["statusCode"] == 502
+    assert snapshot["events"][0]["tokenPresent"] is False
+    assert "poToken" not in __import__("json").dumps(snapshot)
+    assert "content_binding" not in __import__("json").dumps(snapshot)
+
+
+def test_refresh_youtube_diagnostics_uses_attempt_event_ids(monkeypatch):
+    api._begin_youtube_diagnostics_attempt({
+        "telemetryAvailable": True,
+        "telemetry": {"requestCount": 4, "tokenResponseCount": 2, "lastEventId": 8},
+    }, "attempting")
+    api._refresh_youtube_provider_diagnostics({
+        "telemetryAvailable": True,
+        "telemetry": {
+            "requestCount": 6, "httpSuccessCount": 5, "httpFailureCount": 1,
+            "tokenResponseCount": 3, "lastEventId": 10,
+            "events": [
+                {"eventId": 9, "at": "2026-11-28T08:00:00Z", "statusCode": 200,
+                 "outcome": "http-success", "tokenPresent": True, "elapsedMs": 44},
+                {"eventId": 10, "at": "2026-11-28T08:00:01Z", "statusCode": 502,
+                 "outcome": "http-failure", "tokenPresent": False, "elapsedMs": 15},
+            ],
+        },
+    })
+    state = api._youtube_diagnostics_snapshot()
+    assert state["providerRequestsThisAttempt"] == 2
+    assert state["providerTokenResponsesThisAttempt"] == 1
+    assert [x["eventId"] for x in state["providerAttemptEvents"]] == [9, 10]
+
+
+def test_youtube_cookiefile_is_optional_and_private(monkeypatch, tmp_path):
+    import base64, os, stat
+    cookie_text = "# Netscape HTTP Cookie File\n.youtube.com\tTRUE\t/\tTRUE\t1893456000\tSID\ttest-cookie\n"
+    encoded = base64.b64encode(cookie_text.encode()).decode()
+    monkeypatch.setenv("YOUTUBE_COOKIES_B64", encoded[:20] + "\n" + encoded[20:])
+    monkeypatch.setattr(api, "YOUTUBE_COOKIE_PATH", tmp_path / "cookies.txt")
+    path = api._youtube_cookies_file()
+    assert path == str(tmp_path / "cookies.txt")
+    assert Path(path).read_text() == cookie_text
+    assert stat.S_IMODE(os.stat(path).st_mode) == 0o600
+    assert api._youtube_cookie_configured() is True
+
+
+def test_youtube_cookiefile_rejects_invalid_base64_without_leaking_value(monkeypatch):
+    monkeypatch.setenv("YOUTUBE_COOKIES_B64", "not-valid-base64%%%secret")
+    try:
+        api._youtube_cookies_file()
+    except RuntimeError as exc:
+        assert "not-valid-base64" not in str(exc)
+        assert "secret" not in str(exc)
+    else:
+        raise AssertionError("Invalid cookie environment variable must be rejected")
+
+
+def test_android_vr_client_does_not_attach_bgutil_provider(monkeypatch):
+    monkeypatch.setattr(api, "_bgutil_provider_status", lambda: {
+        "ready": True, "baseUrl": "http://127.0.0.1:4416",
+    })
+    options = api._yt_common_options("youtube", "android_vr")
+    assert options["extractor_args"]["youtube"]["player_client"] == ["android_vr"]
+    assert "youtubepot-bgutilhttp" not in options["extractor_args"]
+
+
+def test_youtube_attempt_facade_serializes_youtube_calls(monkeypatch):
+    import threading
+    called = []
+    def fake_impl(url):
+        called.append(api.YOUTUBE_ATTEMPT_LOCK.locked())
+        return {"id": "demo"}
+    monkeypatch.setattr(api, "_extract_info_impl", fake_impl)
+    assert api._extract_info("https://youtu.be/abcdefghijk") == {"id": "demo"}
+    assert called == [True]
+
+
+def test_youtube_common_options_attach_cookiefile_only_when_configured(monkeypatch, tmp_path):
+    import base64
+    cookie_text = "# Netscape HTTP Cookie File\n.youtube.com\tTRUE\t/\tTRUE\t1893456000\tSID\ttest-cookie\n"
+    monkeypatch.setenv("YOUTUBE_COOKIES_B64", base64.b64encode(cookie_text.encode()).decode())
+    monkeypatch.setattr(api, "YOUTUBE_COOKIE_PATH", tmp_path / "yt-cookies.txt")
+    monkeypatch.setattr(api, "_bgutil_provider_status", lambda: {
+        "ready": True, "baseUrl": "http://127.0.0.1:4416",
+    })
+    options = api._yt_common_options("youtube", "mweb")
+    assert options["cookiefile"] == str(tmp_path / "yt-cookies.txt")
+    assert "test-cookie" not in str({key: value for key, value in options.items() if key != "logger"})
+
+
+def test_android_vr_is_not_in_active_fallbacks():
+    assert "android_vr" not in api.YOUTUBE_CLIENT_FALLBACKS
+    assert "android_vr" not in api._youtube_client_candidates(provider_ready=True)
