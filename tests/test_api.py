@@ -48,7 +48,7 @@ def test_health_endpoint_and_version():
     response = client.get("/health")
     assert response.status_code == 200
     assert response.json()["status"] == "healthy"
-    assert response.json()["version"] == "1.16.0"
+    assert response.json()["version"] == "1.17.0"
     assert "javascriptRuntime" in response.json()
     assert response.json()["youtubePoTokenProvider"] == "bgutil-http"
     assert isinstance(response.json()["youtubePoTokenProviderReady"], bool)
@@ -818,7 +818,7 @@ def test_instagram_public_fallback_uses_anonymous_graphql_session(monkeypatch):
 
 def test_health_reports_gallery_and_public_fallback_capabilities():
     body = client.get("/health").json()
-    assert body["version"] == "1.16.0"
+    assert body["version"] == "1.17.0"
     assert body["youtubeClientFallbacks"] in (
         ["tv_samsung", "visionos", "web", "web_embedded"],
         ["tv_samsung", "visionos", "web", "mweb", "web_embedded"],
@@ -1533,7 +1533,7 @@ def test_bgutil_provider_status_rejects_version_mismatch(monkeypatch):
 
 def test_health_exposes_v111_youtube_diagnostics_without_sensitive_fields():
     payload = client.get("/health").json()
-    assert payload["version"] == "1.16.0"
+    assert payload["version"] == "1.17.0"
     assert "youtubePoTokenTelemetryAvailable" in payload
     assert payload["youtubeForceIPv4"] is True
     assert payload["youtubeWpc"]["runtimeEnabled"] is False
@@ -2299,3 +2299,57 @@ def test_youtube_proxy_rejects_bad_scheme(monkeypatch):
     assert api._youtube_proxy() is None
     monkeypatch.setenv("YOUTUBE_PROXY", "")
     assert api._youtube_proxy() is None
+
+
+def test_youtube_rotation_retries_on_another_proxy_without_global_cooldown(monkeypatch):
+    monkeypatch.setenv("YOUTUBE_PROXY_POOL", "socks5h://127.0.0.1:40000,socks5h://127.0.0.1:40001")
+    monkeypatch.delenv("YOUTUBE_PROXY", raising=False)
+    monkeypatch.delenv("YOUTUBE_PROXY_POOL_FILE", raising=False)
+    api.YOUTUBE_PROXY_BURNED.clear()
+    api.YOUTUBE_PROXY_USE_COUNT.clear()
+    monkeypatch.setattr(api.time, "sleep", lambda *_: None)
+    seen = []
+
+    def operation():
+        proxy = api._youtube_proxy()
+        seen.append(proxy)
+        if proxy.endswith(":40000"):
+            raise RuntimeError("YouTube HTTP Error 429: too many requests")
+        return "ok"
+
+    assert api._with_youtube_rotation(operation) == "ok"
+    assert len(seen) == 2 and seen[0] != seen[1]
+    health = api._youtube_proxy_health()
+    assert health["poolSize"] == 2 and health["healthy"] == 1
+
+
+def test_youtube_rotation_stops_when_every_proxy_is_blocked(monkeypatch):
+    monkeypatch.setenv("YOUTUBE_PROXY_POOL", "socks5h://127.0.0.1:40000,socks5h://127.0.0.1:40001")
+    monkeypatch.delenv("YOUTUBE_PROXY", raising=False)
+    api.YOUTUBE_PROXY_BURNED.clear()
+    api.YOUTUBE_PROXY_USE_COUNT.clear()
+    monkeypatch.setattr(api.time, "sleep", lambda *_: None)
+    calls = []
+
+    def operation():
+        calls.append(api._youtube_proxy())
+        raise RuntimeError("Sign in to confirm you're not a bot")
+
+    with pytest.raises(RuntimeError):
+        api._with_youtube_rotation(operation)
+    assert len(calls) == 2
+    api.YOUTUBE_PROXY_BURNED.clear()
+
+
+def test_youtube_rotation_does_not_retry_unrelated_errors(monkeypatch):
+    monkeypatch.setenv("YOUTUBE_PROXY_POOL", "socks5h://127.0.0.1:40000,socks5h://127.0.0.1:40001")
+    api.YOUTUBE_PROXY_BURNED.clear()
+    calls = []
+
+    def operation():
+        calls.append(1)
+        raise RuntimeError("Video unavailable")
+
+    with pytest.raises(RuntimeError):
+        api._with_youtube_rotation(operation)
+    assert len(calls) == 1
