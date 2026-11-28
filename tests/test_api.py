@@ -4,6 +4,9 @@ from __future__ import annotations
 import importlib
 import sys
 import types
+import json
+import pytest
+import urllib.error
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
@@ -21,6 +24,22 @@ from fastapi.testclient import TestClient
 client = TestClient(api.app)
 
 
+@pytest.fixture(autouse=True)
+def reset_youtube_transient_state():
+    # Keep offline tests deterministic and avoid carrying a cooldown/cache
+    # from one test into another. Live defaults remain configured in app.py.
+    api.YOUTUBE_MIN_ATTEMPT_INTERVAL_SECONDS = 0.0
+    api.YOUTUBE_CLIENT_FALLBACK_INTERVAL_SECONDS = 0.0
+    with api.YOUTUBE_RATE_LOCK:
+        api.youtube_last_attempt_monotonic = 0.0
+        api.youtube_cooldown_until_monotonic = 0.0
+        api.youtube_429_count = 0
+    with api.state_lock:
+        api.YOUTUBE_INFO_CACHE.clear()
+        api.youtube_client_cache.clear()
+    yield
+
+
 def no_rate_limit(monkeypatch):
     monkeypatch.setattr(api, "_rate_limited", lambda _key: False)
 
@@ -29,7 +48,7 @@ def test_health_endpoint_and_version():
     response = client.get("/health")
     assert response.status_code == 200
     assert response.json()["status"] == "healthy"
-    assert response.json()["version"] == "1.13.0"
+    assert response.json()["version"] == "1.14.0"
     assert "javascriptRuntime" in response.json()
     assert response.json()["youtubePoTokenProvider"] == "bgutil-http"
     assert isinstance(response.json()["youtubePoTokenProviderReady"], bool)
@@ -794,8 +813,12 @@ def test_instagram_public_fallback_uses_anonymous_graphql_session(monkeypatch):
 
 def test_health_reports_gallery_and_public_fallback_capabilities():
     body = client.get("/health").json()
-    assert body["version"] == "1.13.0"
-    assert body["youtubeClientFallbacks"] in (["web_safari", "web_safari_hls", "web_embedded", "tv"], ["mweb", "web_safari", "web_safari_hls", "web_embedded", "tv"])
+    assert body["version"] == "1.14.0"
+    assert body["youtubeClientFallbacks"] in (
+        ["tv_samsung", "visionos", "web", "web_embedded"],
+        ["tv_samsung", "visionos", "web", "mweb", "web_embedded"],
+    )
+    assert body["youtubeRateControl"]["cooldownSeconds"] >= 30
     assert "youtubeDiagnostics" in body
     assert body["youtubeDiagnostics"]["tokenGenerationObserved"] in (True, False)
     assert "threads" in body["galleryPlatforms"]
@@ -1257,17 +1280,28 @@ def test_youtube_uses_mweb_with_bgutil_and_safe_diagnostics_when_ready(monkeypat
 def test_youtube_fallback_clients_are_selected_from_provider_state(monkeypatch):
     ready = api._youtube_client_candidates(True)
     unavailable = api._youtube_client_candidates(False)
-    assert ready == ["mweb", "web_safari", "web_safari_hls", "web_embedded", "tv"]
-    assert unavailable == ["web_safari", "web_safari_hls", "web_embedded", "tv"]
+    assert ready == ["tv_samsung", "visionos", "web", "mweb", "web_embedded"]
+    assert unavailable == ["tv_samsung", "visionos", "web", "web_embedded"]
+    monkeypatch.setenv("YOUTUBE_EXTRA_CLIENTS", "tv_samsung,visionos,android_vr,unknown")
+    assert api._youtube_client_candidates(False) == ["tv_samsung", "visionos", "web", "web_embedded"]
 
 
-def test_youtube_safari_fallback_keeps_provider_available(monkeypatch):
+def test_youtube_uses_explicit_current_clients_to_control_fallback(monkeypatch):
+    monkeypatch.setattr(api, "_bgutil_provider_status", lambda: {
+        "ready": True, "baseUrl": "http://127.0.0.1:4416",
+    })
+    options = api._yt_common_options("youtube", "tv_samsung")
+    assert options["extractor_args"]["youtube"]["player_client"] == ["tv_samsung"]
+    assert "youtubepot-bgutilhttp" not in options.get("extractor_args", {})
+
+
+def test_only_mweb_gets_bgutil_provider_configuration(monkeypatch):
     monkeypatch.setattr(api, "_bgutil_provider_status", lambda: {
         "ready": True,
         "baseUrl": "http://127.0.0.1:4416",
     })
-    options = api._yt_common_options("youtube", "web_safari")
-    assert options["extractor_args"]["youtube"]["player_client"] == ["web_safari"]
+    options = api._yt_common_options("youtube", "mweb")
+    assert options["extractor_args"]["youtube"]["player_client"] == ["mweb"]
     assert options["extractor_args"]["youtubepot-bgutilhttp"]["base_url"] == ["http://127.0.0.1:4416"]
 
 
@@ -1281,14 +1315,14 @@ def test_youtube_embedded_fallback_does_not_request_bgutil_token(monkeypatch):
     assert "youtubepot-bgutilhttp" not in options["extractor_args"]
 
 
-def test_youtube_does_not_force_mweb_when_provider_is_unavailable(monkeypatch):
+def test_youtube_does_not_force_a_specific_client_without_provider(monkeypatch):
     monkeypatch.setattr(api, "_bgutil_provider_status", lambda: {
         "ready": False,
         "baseUrl": "http://127.0.0.1:4416",
     })
     options = api._yt_common_options("youtube")
-    assert options["extractor_args"]["youtube"]["player_client"] == ["web_safari"]
-    assert "youtubepot-bgutilhttp" not in options["extractor_args"]
+    assert options["extractor_args"]["youtube"]["player_client"] == ["tv_samsung"]
+    assert "youtubepot-bgutilhttp" not in options.get("extractor_args", {})
 
 
 def test_youtube_diagnostic_logger_records_provider_and_token_without_raw_data(monkeypatch):
@@ -1316,7 +1350,7 @@ def test_youtube_format_filter_rejects_drm_and_sabr_only():
     ]})
 
 
-def test_extract_info_retries_youtube_with_web_safari_after_mweb_bot_check(monkeypatch):
+def test_extract_info_tries_explicit_clients_sequentially_after_bot_check(monkeypatch):
     monkeypatch.setattr(api, "_bgutil_provider_status", lambda: {
         "ready": True,
         "baseUrl": "http://127.0.0.1:4416",
@@ -1331,9 +1365,9 @@ def test_extract_info_retries_youtube_with_web_safari_after_mweb_bot_check(monke
         def __exit__(self, *args):
             return False
         def extract_info(self, url, download=False):
-            client = self.options["extractor_args"]["youtube"]["player_client"][0]
+            client = self.options.get("extractor_args", {}).get("youtube", {}).get("player_client", ["tv_samsung"])[0]
             calls.append(client)
-            if client == "mweb":
+            if client == "tv_samsung":
                 raise RuntimeError("Sign in to confirm you're not a bot")
             return {"id": "demo", "title": "Demo", "formats": [
                 {"format_id": "18", "url": "https://media.example/demo.mp4", "ext": "mp4", "vcodec": "avc1", "acodec": "mp4a"}
@@ -1341,8 +1375,8 @@ def test_extract_info_retries_youtube_with_web_safari_after_mweb_bot_check(monke
 
     monkeypatch.setattr(api, "YoutubeDL", FakeYDL)
     info = api._extract_info("https://youtu.be/abcdefghijk")
-    assert calls == ["mweb", "web_safari"]
-    assert info["_petik_youtube_client"] == "web_safari"
+    assert calls == ["tv_samsung", "visionos"]
+    assert info["_petik_youtube_client"] == "visionos"
     assert api.YOUTUBE_DIAGNOSTICS["lastOutcome"] == "success"
 
 
@@ -1361,9 +1395,9 @@ def test_extract_info_retries_when_client_returns_only_drm_or_sabr_formats(monke
         def __exit__(self, *args):
             return False
         def extract_info(self, url, download=False):
-            client = self.options["extractor_args"]["youtube"]["player_client"][0]
+            client = self.options.get("extractor_args", {}).get("youtube", {}).get("player_client", ["tv_samsung"])[0]
             calls.append(client)
-            if client == "mweb":
+            if client == "tv_samsung":
                 return {"id": "demo", "title": "Demo", "formats": [
                     {"format_id": "sabr", "url": "https://media.example/sabr", "protocol": "sabr"},
                     {"format_id": "drm", "url": "https://media.example/drm", "has_drm": True},
@@ -1374,8 +1408,8 @@ def test_extract_info_retries_when_client_returns_only_drm_or_sabr_formats(monke
 
     monkeypatch.setattr(api, "YoutubeDL", FakeYDL)
     info = api._extract_info("https://youtu.be/formatfallback123")
-    assert calls == ["mweb", "web_safari"]
-    assert info["_petik_youtube_client"] == "web_safari"
+    assert calls == ["tv_samsung", "visionos"]
+    assert info["_petik_youtube_client"] == "visionos"
 
 
 def test_download_media_retries_youtube_with_next_client(monkeypatch, tmp_path):
@@ -1393,9 +1427,9 @@ def test_download_media_retries_youtube_with_next_client(monkeypatch, tmp_path):
         def __exit__(self, *args):
             return False
         def extract_info(self, url, download=False):
-            client = self.options["extractor_args"]["youtube"]["player_client"][0]
+            client = self.options.get("extractor_args", {}).get("youtube", {}).get("player_client", ["tv_samsung"])[0]
             calls.append(client)
-            if client == "mweb":
+            if client == "tv_samsung":
                 raise RuntimeError("Sign in to confirm you're not a bot")
             output = Path(self.options["outtmpl"].replace("%(id)s.%(ext)s", "demo.mp4"))
             output.write_bytes(b"demo-video")
@@ -1403,7 +1437,7 @@ def test_download_media_retries_youtube_with_next_client(monkeypatch, tmp_path):
 
     monkeypatch.setattr(api, "YoutubeDL", FakeYDL)
     path, filename, info = api._download_media("https://youtu.be/zyxwvutsrqp", "video", "max")
-    assert calls == ["mweb", "web_safari"]
+    assert calls == ["tv_samsung", "visionos"]
     assert path.exists() and path.read_bytes() == b"demo-video"
     assert filename == "Demo.mp4"
     assert info["id"] == "demo"
@@ -1473,7 +1507,7 @@ def test_bgutil_provider_status_rejects_version_mismatch(monkeypatch):
 
 def test_health_exposes_v111_youtube_diagnostics_without_sensitive_fields():
     payload = client.get("/health").json()
-    assert payload["version"] == "1.13.0"
+    assert payload["version"] == "1.14.0"
     assert "youtubePoTokenTelemetryAvailable" in payload
     assert payload["youtubeForceIPv4"] is True
     assert payload["youtubeWpc"]["runtimeEnabled"] is False
@@ -1498,7 +1532,7 @@ def test_youtube_hls_strategy_maps_to_web_safari_and_forces_ipv4(monkeypatch):
     monkeypatch.setenv("YOUTUBE_FORCE_IPV4", "1")
     options = api._yt_common_options("youtube", "web_safari_hls")
     assert options["extractor_args"]["youtube"]["player_client"] == ["web_safari"]
-    assert options["extractor_args"]["youtubepot-bgutilhttp"]["base_url"] == ["http://127.0.0.1:4417"]
+    assert "youtubepot-bgutilhttp" not in options["extractor_args"]
     assert options["source_address"] == "0.0.0.0"
 
 
@@ -1636,45 +1670,31 @@ def test_pot_telemetry_proxy_forwards_request_and_counts_token_response():
         upstream.shutdown(); upstream.server_close()
 
 
-def test_extract_info_runs_web_safari_hls_as_separate_strategy_after_regular_safari_fails(monkeypatch):
-    monkeypatch.setattr(api, "youtube_client_cache", {})
+def test_extract_info_does_not_repeat_redundant_safari_hls_strategy(monkeypatch):
     monkeypatch.setattr(api, "_bgutil_provider_status", lambda: {
         "ready": True, "baseUrl": "http://127.0.0.1:4416",
     })
     calls = []
 
     class FakeYDL:
-        def __init__(self, options):
-            self.options = options
-        def __enter__(self):
-            return self
-        def __exit__(self, *args):
-            return False
+        def __init__(self, options): self.options = options
+        def __enter__(self): return self
+        def __exit__(self, *args): return False
         def extract_info(self, url, download=False):
-            client = self.options["extractor_args"]["youtube"]["player_client"][0]
+            client = self.options.get("extractor_args", {}).get("youtube", {}).get("player_client", ["tv_samsung"])[0]
             calls.append(client)
-            if client == "mweb":
+            if client == "tv_samsung":
                 raise RuntimeError("Sign in to confirm you're not a bot")
-            if client == "web_safari":
-                return {"id": "demo", "title": "Demo", "formats": [
-                    {"format_id": "hls", "url": "https://media.example/manifest.m3u8",
-                     "protocol": "m3u8_native", "ext": "mp4", "vcodec": "avc1", "acodec": "mp4a"}
-                ]}
-            raise AssertionError("later fallback should not be reached")
+            return {"id": "demo", "title": "Demo", "formats": [
+                {"format_id": "18", "url": "https://media.example/demo.mp4", "ext": "mp4",
+                 "vcodec": "avc1", "acodec": "mp4a"}
+            ]}
 
     monkeypatch.setattr(api, "YoutubeDL", FakeYDL)
-    info = api._extract_info("https://youtu.be/abcdefghijk")
-    assert calls == ["mweb", "web_safari", "web_safari"]
-    assert info["_petik_youtube_client"] == "web_safari_hls"
-    diagnostics = api._youtube_diagnostics_snapshot()
-    assert diagnostics["lastStrategy"] == "web_safari_hls"
-    assert diagnostics["hlsFormatsObserved"] is True
-    assert any(
-        item["client"] == "web_safari" and item["outcome"] == "failed"
-        and item["errorCode"] == "no_downloadable_formats"
-        for item in diagnostics["clientOutcomes"]
-    )
-    assert "web_safari_hls" in diagnostics["attemptedClients"]
+    info = api._extract_info("https://youtu.be/hlsfallback123")
+    assert calls == ["tv_samsung", "visionos"]
+    assert info["_petik_youtube_client"] == "visionos"
+    assert "web_safari_hls" not in api._youtube_diagnostics_snapshot()["attemptedClients"]
 
 
 # v1.12 stage-aware YouTube diagnostics and privacy-safe optional session support.
@@ -1885,7 +1905,7 @@ def test_wpc_ready_enables_mweb_even_without_bgutil(monkeypatch):
     monkeypatch.setenv("YOUTUBE_POT_PROVIDER_MODE", "wpc")
     monkeypatch.setattr(api, "_wpc_status", lambda: {"runtimeEnabled": True})
     clients = api._youtube_client_candidates(False, wpc_ready=True)
-    assert clients[0] == "mweb"
+    assert clients == ["tv_samsung", "visionos", "web", "mweb", "web_embedded"]
 
 
 def test_error_events_are_correlation_tagged_and_do_not_store_raw_message():
@@ -2017,3 +2037,172 @@ def test_youtube_private_age_and_member_restriction_get_specific_message():
         body = __import__("json").loads(response.body)
         assert body["error"]["code"] == "error.api.youtube.restricted"
         assert "login" in body["error"]["context"]["message"].lower() or "dibatasi" in body["error"]["context"]["message"].lower()
+
+
+# v1.14.0 request safety, cache, experimental knobs and network diagnostics.
+
+def test_youtube_http_429_stops_fallback_and_activates_cooldown(monkeypatch):
+    monkeypatch.setattr(api, "_bgutil_provider_status", lambda: {
+        "ready": True, "baseUrl": "http://127.0.0.1:4416", "telemetryAvailable": False,
+    })
+    monkeypatch.setattr(api, "YOUTUBE_RATE_LIMIT_COOLDOWN_SECONDS", 120)
+    calls = []
+
+    class FakeYDL:
+        def __init__(self, options): self.options = options
+        def __enter__(self): return self
+        def __exit__(self, *args): return False
+        def extract_info(self, url, download=False):
+            client = self.options.get("extractor_args", {}).get("youtube", {}).get("player_client", ["tv_samsung"])[0]
+            calls.append(client)
+            self.options["logger"].warning("HTTP Error 429: Too Many Requests")
+            raise RuntimeError("Sign in to confirm you're not a bot")
+
+    monkeypatch.setattr(api, "YoutubeDL", FakeYDL)
+    with pytest.raises(RuntimeError, match="http_429"):
+        api._extract_info("https://youtu.be/429stoptest1")
+    assert calls == ["tv_samsung"]
+    snap = api._youtube_diagnostics_snapshot()
+    assert snap["lastErrorCode"] == "http_429"
+    assert snap["http429Observed"] is True
+    assert snap["rootCauseHint"] is None or "429" in api._youtube_root_cause_hint(snap)
+    assert api._youtube_rate_control_snapshot()["cooldownRemainingSeconds"] > 0
+
+
+def test_youtube_cooldown_blocks_new_extraction_without_calling_extractor(monkeypatch):
+    monkeypatch.setattr(api, "youtube_cooldown_until_monotonic", __import__("time").monotonic() + 90)
+    called = []
+    monkeypatch.setattr(api, "_extract_info_impl", lambda url: called.append(url) or {"id": "wrong"})
+    with pytest.raises(RuntimeError, match="cooldown"):
+        api._extract_info("https://youtu.be/cooldownblock1")
+    assert called == []
+    assert api._youtube_diagnostics_snapshot()["lastOutcome"] == "cooldown-blocked"
+
+
+def test_youtube_inspect_cache_returns_isolated_copy():
+    api._cache_youtube_info("https://youtu.be/cachecopy001", {"id": "cached", "nested": {"v": 1}})
+    cached = api._get_cached_youtube_info("https://youtu.be/cachecopy001")
+    cached["nested"]["v"] = 999
+    assert api._get_cached_youtube_info("https://youtu.be/cachecopy001")["nested"]["v"] == 1
+
+
+def test_optional_youtube_extractor_options_are_allowlisted_and_private(monkeypatch):
+    monkeypatch.setenv("YOUTUBE_INNERTUBE_HOST", "youtubei.googleapis.com")
+    monkeypatch.setenv("YOUTUBE_INNERTUBE_KEY", "test-public-api-key-123")
+    monkeypatch.setenv("YOUTUBE_PLAYER_SKIP", "webpage,configs,evil")
+    monkeypatch.setenv("YOUTUBE_VISITOR_DATA", "visitor_data_sample_123")
+    monkeypatch.setattr(api, "_youtube_cookie_configured", lambda: False)
+    configured = api._youtube_safe_extractor_overrides()
+    assert configured["innertube_host"] == ["youtubei.googleapis.com"]
+    assert configured["innertube_key"] == ["test-public-api-key-123"]
+    assert configured["player_skip"] == ["configs", "webpage"]
+    assert configured["visitor_data"] == ["visitor_data_sample_123"]
+    monkeypatch.setattr(api, "_youtube_cookie_configured", lambda: True)
+    assert "visitor_data" not in api._youtube_safe_extractor_overrides()
+    health_payload = client.get("/health").json()
+    assert "test-public-api-key-123" not in json.dumps(health_payload)
+    assert "visitor_data_sample_123" not in json.dumps(health_payload)
+
+
+def test_youtube_extra_client_allowlist_rejects_android_vr(monkeypatch):
+    monkeypatch.setenv("YOUTUBE_EXTRA_CLIENTS", "visionos,android_vr,tv_samsung,not-a-client")
+    clients = api._youtube_client_candidates(False)
+    assert "visionos" in clients and "tv_samsung" in clients
+    assert "android_vr" not in clients
+    assert "not-a-client" not in clients
+
+
+def test_youtube_network_probe_uses_fixed_hosts_and_reports_only_status(monkeypatch):
+    calls = []
+    api.youtube_network_probe_last_monotonic = 0.0
+    no_rate_limit(monkeypatch)
+
+    class Response:
+        status = 204
+        def __enter__(self): return self
+        def __exit__(self, *args): return False
+        def read(self, size=-1): return b""
+
+    def fake_urlopen(request, timeout=0):
+        calls.append(request.full_url)
+        return Response()
+
+    monkeypatch.setattr(api.urllib.request, "urlopen", fake_urlopen)
+    response = client.get("/api/diagnostics/youtube-network")
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["status"] == "reachable"
+    assert [item["outcome"] for item in payload["checks"]] == ["reachable", "reachable"]
+    assert calls == ["https://www.youtube.com/generate_204", "https://youtubei.googleapis.com/"]
+    serialized = json.dumps(payload)
+    assert "ip" not in serialized.lower() and "body" not in serialized.lower()
+
+
+def test_youtube_network_probe_429_is_classified_and_cooldown_applies(monkeypatch):
+    api.youtube_network_probe_last_monotonic = 0.0
+    no_rate_limit(monkeypatch)
+    class RateLimited(urllib.error.HTTPError):
+        def __init__(self, url): super().__init__(url, 429, "Too Many Requests", {}, None)
+    def fake_urlopen(request, timeout=0):
+        raise RateLimited(request.full_url)
+    calls = []
+    def counted_urlopen(request, timeout=0):
+        calls.append(request.full_url)
+        return fake_urlopen(request, timeout=timeout)
+    monkeypatch.setattr(api.urllib.request, "urlopen", counted_urlopen)
+    response = client.get("/api/diagnostics/youtube-network")
+    assert response.status_code == 503
+    assert response.json()["status"] == "rate_limited"
+    assert len(calls) == 1, "stop the probe after the first upstream HTTP 429"
+    assert api._youtube_rate_control_snapshot()["cooldownRemainingSeconds"] > 0
+
+
+def test_recent_inspect_allows_one_immediate_save_without_extra_wait(monkeypatch):
+    import time
+    monkeypatch.setattr(api, "YOUTUBE_MIN_ATTEMPT_INTERVAL_SECONDS", 20.0)
+    monkeypatch.setattr(api, "youtube_last_attempt_monotonic", time.monotonic())
+    api._cache_youtube_info("https://youtu.be/immediate-save1", {"id": "saved-preview"})
+    followup = api._consume_youtube_inspect_cache("https://youtu.be/immediate-save1")
+    assert followup is True
+    sleeps = []
+    monkeypatch.setattr(api.time, "sleep", lambda seconds: sleeps.append(seconds))
+    api._youtube_request_gate(allow_recent_inspect_followup=followup)
+    assert sleeps == []
+    assert api._consume_youtube_inspect_cache("https://youtu.be/immediate-save1") is False
+
+
+def test_youtube_fallback_pause_uses_configured_interval(monkeypatch):
+    monkeypatch.setattr(api, "YOUTUBE_CLIENT_FALLBACK_INTERVAL_SECONDS", 2.0)
+    sleeps = []
+    monkeypatch.setattr(api.time, "sleep", lambda seconds: sleeps.append(seconds))
+    api._youtube_fallback_pause()
+    assert sleeps == [2.0]
+
+
+def test_youtube_env_numeric_parsers_clamp_and_survive_invalid_values(monkeypatch):
+    monkeypatch.setenv("BAD_FLOAT", "nan")
+    monkeypatch.setenv("BAD_INT", "not-a-number")
+    assert api._bounded_env_float("BAD_FLOAT", 5.0, 0.0, 60.0) == 5.0
+    assert api._bounded_env_int("BAD_INT", 300, 30, 3600) == 300
+    monkeypatch.setenv("CLAMP_FLOAT", "999")
+    monkeypatch.setenv("CLAMP_INT", "-1")
+    assert api._bounded_env_float("CLAMP_FLOAT", 5.0, 0.0, 60.0) == 60.0
+    assert api._bounded_env_int("CLAMP_INT", 300, 30, 3600) == 30
+
+
+def test_youtube_http_impersonation_is_opt_in(monkeypatch):
+    monkeypatch.setattr(api, "HAS_CURL_CFFI", True)
+    monkeypatch.setenv("YOUTUBE_HTTP_IMPERSONATE", "chrome")
+    options = api._yt_common_options("youtube", "tv_samsung")
+    assert options["impersonate"] == "chrome"
+    monkeypatch.delenv("YOUTUBE_HTTP_IMPERSONATE")
+    assert api._youtube_impersonate_target() is None
+
+
+def test_youtube_network_probe_is_rate_limited_to_one_per_120_seconds(monkeypatch):
+    no_rate_limit(monkeypatch)
+    api.youtube_network_probe_last_monotonic = __import__("time").monotonic()
+    response = client.get("/api/diagnostics/youtube-network")
+    assert response.status_code == 429
+    assert response.json()["status"] == "cooldown"
+    assert response.json()["retryAfterSeconds"] > 0
