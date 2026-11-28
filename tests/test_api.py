@@ -48,12 +48,17 @@ def test_health_endpoint_and_version():
     response = client.get("/health")
     assert response.status_code == 200
     assert response.json()["status"] == "healthy"
-    assert response.json()["version"] == "1.14.0"
+    assert response.json()["version"] == "1.15.0"
     assert "javascriptRuntime" in response.json()
     assert response.json()["youtubePoTokenProvider"] == "bgutil-http"
     assert isinstance(response.json()["youtubePoTokenProviderReady"], bool)
     assert response.json()["mixedMediaAvailable"] is True
     assert response.json()["maxGalleryVideoMB"] >= 1
+    policy = response.json()["youtubeRequestPolicy"]
+    assert policy["retries"] == 0
+    assert policy["extractorRetries"] == 0
+    assert policy["fragmentRetries"] == 0
+    assert policy["concurrentFragments"] == 1
 
 
 def test_root_advertises_all_expected_platforms():
@@ -813,7 +818,7 @@ def test_instagram_public_fallback_uses_anonymous_graphql_session(monkeypatch):
 
 def test_health_reports_gallery_and_public_fallback_capabilities():
     body = client.get("/health").json()
-    assert body["version"] == "1.14.0"
+    assert body["version"] == "1.15.0"
     assert body["youtubeClientFallbacks"] in (
         ["tv_samsung", "visionos", "web", "web_embedded"],
         ["tv_samsung", "visionos", "web", "mweb", "web_embedded"],
@@ -1273,8 +1278,23 @@ def test_youtube_uses_mweb_with_bgutil_and_safe_diagnostics_when_ready(monkeypat
     options = api._yt_common_options("youtube", "mweb")
     assert options["extractor_args"]["youtube"]["player_client"] == ["mweb"]
     assert options["extractor_args"]["youtubepot-bgutilhttp"]["base_url"] == ["http://127.0.0.1:4416"]
+    assert options["retries"] == 0
+    assert options["extractor_retries"] == 0
+    assert options["fragment_retries"] == 0
+    assert options["file_access_retries"] == 0
+    assert options["concurrent_fragment_downloads"] == 1
     assert options["verbose"] is True
     assert isinstance(options["logger"], api._YtDlpDiagnosticLogger)
+
+
+def test_youtube_retry_policy_is_scoped_to_youtube_only():
+    youtube = api._yt_common_options("youtube", "tv_samsung")
+    instagram = api._yt_common_options("instagram")
+    assert youtube["retries"] == 0
+    assert youtube["extractor_retries"] == 0
+    assert youtube["fragment_retries"] == 0
+    assert instagram["retries"] == 2
+    assert instagram["extractor_retries"] == 2
 
 
 def test_youtube_fallback_clients_are_selected_from_provider_state(monkeypatch):
@@ -1418,10 +1438,12 @@ def test_download_media_retries_youtube_with_next_client(monkeypatch, tmp_path):
         "baseUrl": "http://127.0.0.1:4416",
     })
     calls = []
+    option_snapshots = []
 
     class FakeYDL:
         def __init__(self, options):
             self.options = options
+            option_snapshots.append({key: options.get(key) for key in ("retries", "extractor_retries", "fragment_retries", "file_access_retries", "concurrent_fragment_downloads")})
         def __enter__(self):
             return self
         def __exit__(self, *args):
@@ -1438,6 +1460,10 @@ def test_download_media_retries_youtube_with_next_client(monkeypatch, tmp_path):
     monkeypatch.setattr(api, "YoutubeDL", FakeYDL)
     path, filename, info = api._download_media("https://youtu.be/zyxwvutsrqp", "video", "max")
     assert calls == ["tv_samsung", "visionos"]
+    assert option_snapshots and all(item == {
+        "retries": 0, "extractor_retries": 0, "fragment_retries": 0,
+        "file_access_retries": 0, "concurrent_fragment_downloads": 1,
+    } for item in option_snapshots)
     assert path.exists() and path.read_bytes() == b"demo-video"
     assert filename == "Demo.mp4"
     assert info["id"] == "demo"
@@ -1507,7 +1533,7 @@ def test_bgutil_provider_status_rejects_version_mismatch(monkeypatch):
 
 def test_health_exposes_v111_youtube_diagnostics_without_sensitive_fields():
     payload = client.get("/health").json()
-    assert payload["version"] == "1.14.0"
+    assert payload["version"] == "1.15.0"
     assert "youtubePoTokenTelemetryAvailable" in payload
     assert payload["youtubeForceIPv4"] is True
     assert payload["youtubeWpc"]["runtimeEnabled"] is False
@@ -2039,7 +2065,7 @@ def test_youtube_private_age_and_member_restriction_get_specific_message():
         assert "login" in body["error"]["context"]["message"].lower() or "dibatasi" in body["error"]["context"]["message"].lower()
 
 
-# v1.14.0 request safety, cache, experimental knobs and network diagnostics.
+# Previous v1.14 request-safety, cache, experimental-option and network-diagnostic coverage.
 
 def test_youtube_http_429_stops_fallback_and_activates_cooldown(monkeypatch):
     monkeypatch.setattr(api, "_bgutil_provider_status", lambda: {
@@ -2059,7 +2085,7 @@ def test_youtube_http_429_stops_fallback_and_activates_cooldown(monkeypatch):
             raise RuntimeError("Sign in to confirm you're not a bot")
 
     monkeypatch.setattr(api, "YoutubeDL", FakeYDL)
-    with pytest.raises(RuntimeError, match="http_429"):
+    with pytest.raises(RuntimeError, match="HTTP Error 429"):
         api._extract_info("https://youtu.be/429stoptest1")
     assert calls == ["tv_samsung"]
     snap = api._youtube_diagnostics_snapshot()
@@ -2067,6 +2093,57 @@ def test_youtube_http_429_stops_fallback_and_activates_cooldown(monkeypatch):
     assert snap["http429Observed"] is True
     assert snap["rootCauseHint"] is None or "429" in api._youtube_root_cause_hint(snap)
     assert api._youtube_rate_control_snapshot()["cooldownRemainingSeconds"] > 0
+
+
+def test_youtube_http_429_takes_priority_over_later_bot_check_and_returns_retry_after(monkeypatch):
+    monkeypatch.setattr(api, "YOUTUBE_RATE_LIMIT_COOLDOWN_SECONDS", 180)
+    response = api._extract_error(
+        RuntimeError("YouTube gagal pada client yang diuji (tv_samsung:http_429). Sign in to confirm you're not a bot"),
+        "youtube",
+    )
+    body = json.loads(response.body)
+    assert response.status_code == 429
+    assert response.headers.get("retry-after") == "180"
+    assert body["error"]["code"] == "error.api.rate.limit"
+    assert body["error"]["context"]["service"] == "youtube"
+
+
+def test_youtube_inspect_route_preserves_upstream_429_and_retry_after(monkeypatch):
+    no_rate_limit(monkeypatch)
+    monkeypatch.setattr(api, "YOUTUBE_RATE_LIMIT_COOLDOWN_SECONDS", 210)
+    monkeypatch.setattr(
+        api, "_inspect_payload",
+        lambda _url, _platform: (_ for _ in ()).throw(RuntimeError("YouTube HTTP Error 429: Too Many Requests")),
+    )
+    response = client.post(
+        "/api/inspect", json={"url": "https://youtu.be/route429test"},
+        headers={"Origin": "https://taupik15.github.io"},
+    )
+    assert response.status_code == 429
+    assert response.headers.get("retry-after") == "210"
+    assert "retry-after" in response.headers.get("access-control-expose-headers", "").lower()
+    payload = response.json()
+    assert payload["error"]["code"] == "error.api.rate.limit"
+    assert payload["error"]["context"]["service"] == "youtube"
+
+
+def test_youtube_download_route_preserves_upstream_429_and_retry_after(monkeypatch):
+    no_rate_limit(monkeypatch)
+    monkeypatch.setattr(api, "YOUTUBE_RATE_LIMIT_COOLDOWN_SECONDS", 240)
+    monkeypatch.setattr(
+        api, "_download_media",
+        lambda *_args: (_ for _ in ()).throw(RuntimeError("YouTube HTTP Error 429: Too Many Requests")),
+    )
+    response = client.post(
+        "/api/download", json={"url": "https://youtu.be/down429test", "mode": "video"},
+        headers={"Origin": "https://taupik15.github.io"},
+    )
+    assert response.status_code == 429
+    assert response.headers.get("retry-after") == "240"
+    assert "retry-after" in response.headers.get("access-control-expose-headers", "").lower()
+    payload = response.json()
+    assert payload["error"]["code"] == "error.api.rate.limit"
+    assert payload["error"]["context"]["service"] == "youtube"
 
 
 def test_youtube_cooldown_blocks_new_extraction_without_calling_extractor(monkeypatch):
